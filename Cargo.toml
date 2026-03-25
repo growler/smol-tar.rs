@@ -1,0 +1,36 @@
+[package]
+name = "smol-tar"
+version = "0.1.0"
+edition = "2021"
+authors = ["Alexey Naidyonov <alexey.naidyonov@gmail.com>"]
+description = "Minimal async tar reader/writer for smol or tokio I/O"
+homepage = "https://github.com/growler/smol-tar.rs"
+repository = "https://github.com/growler/smol-tar.rs"
+documentation = "https://docs.rs/smol-tar"
+license = "MIT"
+keywords = ["tar", "tarfile", "async"]
+readme = "README.md"
+include = [
+    "src/**",
+    "Cargo.toml",
+    "README.md",
+]
+rust-version = "1.85"
+
+[features]
+default = ["smol"]
+smol = []
+tokio = ["dep:tokio", "dep:tokio-stream"]
+
+[dependencies]
+async-lock = "3.4"
+futures-lite = "2.6"
+futures-sink = "0.3"
+pin-project-lite = "0.2"
+tokio = { version = "1", optional = true, features = ["fs", "io-util", "rt"] }
+tokio-stream = { version = "0.1", optional = true }
+
+[dev-dependencies]
+smol = "2.0"
+futures = "0.3"
+static_assertions = "1.1"

@@ -1,0 +1,25 @@
+[package]
+name = "smol-tar-bin"
+version = "0.0.0"
+edition = "2021"
+description = "Feature-gated example tar CLI built on top of smol-tar"
+publish = false
+
+[[bin]]
+name = "smol-tar"
+path = "src/main.rs"
+
+[features]
+default = ["smol"]
+smol = ["dep:smol", "smol-tar/smol"]
+tokio = ["dep:tokio", "dep:tokio-stream", "smol-tar/tokio"]
+
+[dependencies]
+futures = "0.3"
+smol = { version = "2.0", optional = true }
+smol-tar = { path = "../..", default-features = false }
+tokio = { version = "1", optional = true, features = ["fs", "io-std", "io-util", "rt"] }
+tokio-stream = { version = "0.1", optional = true }
+
+[dev-dependencies]
+futures-lite = "2.6"

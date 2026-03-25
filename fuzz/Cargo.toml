@@ -1,0 +1,22 @@
+[package]
+name = "smol-tar-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+smol = "2"
+libfuzzer-sys = "0.4"
+
+[dependencies.smol-tar]
+path = ".."
+
+[[bin]]
+name = "tar"
+path = "fuzz_targets/tar.rs"
+test = false
+doc = false
+bench = false
