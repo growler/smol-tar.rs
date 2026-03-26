@@ -1,11 +1,8 @@
 # smol-tar
 [![Tests](https://github.com/growler/smol-tar.rs/actions/workflows/test.yml/badge.svg)](https://github.com/growler/smol-tar.rs/actions/workflows/test.yml) ![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/growler/afe6b562550658e432029a3999ff9a8d/raw/smol-tar.rs-coverage.json) [![Docs](https://docs.rs/smol-tar/badge.svg)](https://docs.rs/smol-tar) [![Crates.io](https://img.shields.io/crates/v/smol-tar.svg?maxAge=2592000)](https://crates.io/crates/smol-tar)
 
-A minimal async streaming tar reader/writer for smol or tokio I/O.
-
-Reading uses a streaming state machine, so the archive never needs to be fully
-buffered, while writing uses a compact staging buffer with backpressure via
-`Sink`.
+A minimal async streaming tar reader/writer. It does not perform filesystem 
+operations itself; it works with async readers, writers, and streams.
 
 ## Supported formats
 
@@ -23,7 +20,13 @@ Writes:
 - PAX records for long paths, long link targets, timestamps, numeric ids,
   symbolic names, sizes, and extended attributes
 
+## Not supported
+
+- Sparse files and multi-volume archives (the reader returns an error)
+
 ## Installation
+
+Runtime selection:
 
 ```toml
 [dependencies]
@@ -38,7 +41,10 @@ smol-tar = { version = "0.1", default-features = false, features = ["tokio"] }
 ## Reading archives
 
 ```rust
-use futures_lite::{io::Cursor, StreamExt};
+use smol::{
+    io::{copy, sink, Cursor},
+    stream::StreamExt,
+};
 use smol_tar::{TarEntry, TarReader};
 
 let data = Cursor::new(vec![0; 1024]);
@@ -46,8 +52,9 @@ let mut tar = TarReader::new(data);
 
 while let Some(entry) = tar.next().await {
     match entry? {
-        TarEntry::File(file) => {
+        TarEntry::File(mut file) => {
             println!("file: {} ({} bytes)", file.path(), file.size());
+            copy(&mut file, &mut sink()).await?;
         }
         TarEntry::Directory(dir) => {
             println!("dir: {}", dir.path());
@@ -59,45 +66,38 @@ while let Some(entry) = tar.next().await {
 }
 ```
 
-Regular file bodies are streamed. To continue to the next entry, either consume
-the file body fully or drop the file reader.
+Regular file bodies are streamed. To move on to the next entry, either read the
+file body to the end or drop the file reader.
 
 ## Writing archives
 
 ```rust
-use futures::io::Cursor;
+use smol::io::Cursor;
 use smol_tar::{TarDirectory, TarEntry, TarRegularFile, TarWriter};
 
 let sink = Cursor::new(Vec::<u8>::new());
 let mut tar = TarWriter::new(sink);
 
-tar.write(TarEntry::from(TarDirectory::new("bin/"))).await?;
+tar.write(TarDirectory::new("bin/").into()).await?;
 
-let body = Cursor::new(b"hello\n".to_vec());
-tar.write(TarEntry::from(TarRegularFile::new(
-    "bin/hello.txt",
-    6,
-    body,
-)))
-.await?;
+let body = Cursor::new(b"hello\n");
+tar.write(
+    TarRegularFile::new(
+        "bin/hello.txt", 6, body,
+    ).into()
+).await?;
 
 tar.finish().await?;
 ```
 
-Finishing the writer emits the two zero blocks required to terminate a tar
-archive. The `Sink` implementation remains available when you want to compose a
-writer with `Stream`/`TryStream` adapters.
-
-`TarWriter::new(...)` usually infers its file-reader type from the file entries
-you send later. If you only send metadata-only entries such as directories, you
-may need an explicit type annotation; the rustdoc for `TarWriter` shows that
-form.
+Alongside the direct API, the writer also implements the composable
+`futures_sink::Sink` interface:
 
 ## Filtering one archive into another sink
 
 ```rust
 use futures::{future, SinkExt, StreamExt, TryStreamExt};
-use futures::io::Cursor;
+use smol::io::Cursor;
 use smol_tar::{TarDirectory, TarEntry, TarReader, TarRegularFile, TarWriter};
 
 let mut input = Cursor::new(Vec::<u8>::new());
@@ -106,16 +106,23 @@ source
     .send(TarDirectory::new("bin/").into())
     .await?;
 source
-    .send(TarRegularFile::new("bin/keep.txt", 5, Cursor::new(b"keep\n".to_vec()))
-            .into())
+    .send(
+        TarRegularFile::new("bin/keep.txt", 5, Cursor::new(b"keep\n".as_ref()))
+            .into(),
+    )
     .await?;
 source
-    .send(TarRegularFile::new("share/skip.txt", 5, Cursor::new(b"skip\n".to_vec()))
-            .into())
+    .send(
+        TarRegularFile::new("share/skip.txt", 5, Cursor::new(b"skip\n".as_ref()))
+            .into(),
+    )
     .await?;
 source
-    .send(TarRegularFile::new("bin/run.sh", 8, Cursor::new(b"echo hi\n".to_vec()))
-            .with_mode(0o755).into())
+    .send(
+        TarRegularFile::new("bin/run.sh", 8, Cursor::new(b"echo hi\n".as_ref()))
+            .with_mode(0o755)
+            .into(),
+    )
     .await?;
 source.close().await?;
 input.set_position(0);
@@ -124,7 +131,9 @@ let mut output = Cursor::new(Vec::<u8>::new());
 let mut filtered = TarWriter::new(&mut output);
 
 TarReader::new(&mut input)
-    .try_filter(|entry| std::future::ready(entry.path().starts_with("bin/")))
+    .try_filter(|entry| {
+        future::ready(entry.path().starts_with("bin/"))
+    })
     .forward(&mut filtered)
     .await?;
 
@@ -141,29 +150,29 @@ assert_eq!(paths, vec!["bin/", "bin/keep.txt", "bin/run.sh"]);
 
 ## Example CLI
 
-The repository also ships a feature-gated example CLI in
+The repository also includes a feature-gated example CLI in
 [`examples/smol-tar-bin`](examples/smol-tar-bin/README.md).
 
 # Rationale
 
 For one of my projects, I needed an asynchronous streaming library for reading
-and writing tar archives. Since the project was based on `async-std` (now
-[`smol`](https://crates.io/crates/smol)),
-[`tokio-tar`](https://crates.io/crates/tokio-tar) was out of scope, so I
-started using [`async-tar`](https://crates.io/crates/async-tar). Later, I
-needed to add some functionality, but the depth and number of abstractions in
-`async-tar` exceeded my cognitive capacity, so I quickly put together a simple,
-manageable state machine.
+and writing tar archives. The project was based on `async-std` (now
+[`smol`](https://crates.io/crates/smol)), so
+[`tokio-tar`](https://crates.io/crates/tokio-tar) was not a sensible fit and I
+started with [`async-tar`](https://crates.io/crates/async-tar). Later on I
+needed a bit more functionality, but the depth and number of abstractions in
+`async-tar` became rather a lot to hold in my head, so I put together a small,
+manageable state machine instead.
 
-The library is properly fuzzed and covered by tests. It has also seen heavy use
-in a real internal CI/CD pipeline for a while, and now seems ready to be
-released.
+The library is properly fuzzed and well covered by tests. It has also seen
+heavy use in a real internal CI/CD pipeline for some time, and now seems ready
+for release.
 
 ## Caveats
 
-- Regular file bodies are streamed. To advance to the next entry, fully consume
-  the file body or drop the file reader.
-- Library paths and example-CLI paths are UTF-8 only.
+- Regular file bodies are streamed. To advance to the next entry, either read
+  the file body to the end or drop the file reader.
+- Library paths and example-CLI paths must be valid UTF-8.
 
 # LICENSE
 

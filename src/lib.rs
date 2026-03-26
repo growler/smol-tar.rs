@@ -2,35 +2,19 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(rustdoc::invalid_rust_codeblocks)]
 
-//! A minimal async streaming TAR reader and writer for smol or tokio I/O.
+//! A minimal async streaming TAR reader and writer.
 //!
-//! # Supported formats
-//!
-//! Reads:
-//! 
-//! - Old tar
-//! - GNU tar
-//! - POSIX ustar/pax
-//! - GNU long names and long links
-//! - PAX path metadata, timestamps, numeric ids, sizes, and extended attributes
-//! 
-//! Writes:
-//! 
-//! - POSIX ustar/pax
-//! - PAX records for long paths, long link targets, timestamps, numeric ids,
-//!   symbolic names, sizes, and extended attributes
-//!
-//! The reader is fully streaming: a [`TarReader`] yields [`TarEntry`] values
-//! from any [`AsyncRead`] source with minimal buffering.
-//! Regular file entries expose their payload through [`TarRegularFile`], which
-//! also implements [`AsyncRead`]. To advance to the next entry, either read the
-//! file body fully or drop the file reader.
+//! The reader is fully streaming: [`TarReader`] yields [`TarEntry`] values from
+//! any [`AsyncRead`] source with very little buffering. Regular file entries
+//! expose their payload through [`TarRegularFile`], which also implements
+//! [`AsyncRead`]. To move on to the next entry, either read the file body to
+//! the end or drop the file reader.
 //!
 //! The writer is a [`futures_sink::Sink`] of [`TarEntry`] values and also
 //! provides inherent [`TarWriter::write`] and [`TarWriter::finish`] helpers for
-//! sequential writing without `SinkExt`. Finish the archive with
-//! [`TarWriter::finish`] or `SinkExt::close()` so the trailing zero blocks are
-//! emitted.
+//! straightforward sequential writing without [`futures::SinkExt`]. Finish 
+//! the archive with [`TarWriter::finish`] or [`futures::SinkExt::close`] 
+//! so the trailing zero blocks are emitted.
 //!
 //! # Examples
 //!
@@ -50,13 +34,13 @@
 //!
 //! ```rust
 //! # #[cfg(feature = "smol")]
-//! # use futures::{StreamExt, io::Cursor};
+//! # use smol::{stream::StreamExt, io::{copy, sink, Cursor}};
 //! # #[cfg(feature = "tokio")]
-//! # use { std::io::Cursor, tokio_stream::StreamExt };
+//! # use { std::io::Cursor, tokio_stream::StreamExt, tokio::io::{copy, sink} };
 //! use smol_tar::{TarEntry, TarReader};
 //! # #[cfg(feature = "smol")]
 //! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-//! #   futures_lite::future::block_on(fut)
+//! #   smol::block_on(fut)
 //! # }
 //! # #[cfg(feature = "tokio")]
 //! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -69,8 +53,9 @@
 //!
 //! while let Some(entry) = tar.next().await {
 //!     match entry? {
-//!         TarEntry::File(file) => {
+//!         TarEntry::File(mut file) => {
 //!             println!("file: {} ({} bytes)", file.path(), file.size());
+//!             copy(&mut file, &mut sink()).await?;
 //!         }
 //!         TarEntry::Directory(dir) => {
 //!             println!("dir: {}", dir.path());
@@ -94,7 +79,7 @@
 //! use smol_tar::{TarDirectory, TarEntry, TarRegularFile, TarWriter};
 //! # #[cfg(feature = "smol")]
 //! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-//! #   futures_lite::future::block_on(fut)
+//! #   smol::future::block_on(fut)
 //! # }
 //! # #[cfg(feature = "tokio")]
 //! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -108,28 +93,32 @@
 //! tar.write(TarDirectory::new("bin/").into()).await?;
 //!
 //! let body = Cursor::new(b"hello\n");
-//! tar.write(TarRegularFile::new("bin/hello.txt", 6, body).into())
-//!     .await?;
+//! tar.write(
+//!     TarRegularFile::new(
+//!         "bin/hello.txt", 6, body,
+//!     ).into()
+//! ).await?;
 //!
 //! tar.finish().await?;
 //! # std::io::Result::Ok(())
 //! # }).unwrap();
 //! ```
 //!
-//! Filtering one archive into another sink:
+//! Alongside the direct API, the writer also implements the composable
+//! [`futures_sink::Sink`] interface:
 //!
 //! ```rust
 //! # #[cfg(feature = "smol")]
-//! # use futures::io::Cursor;
+//! # use smol::io::Cursor;
 //! # #[cfg(feature = "tokio")]
 //! # use std::io::Cursor;
 //! use {
 //!     smol_tar::{TarDirectory, TarEntry, TarReader, TarRegularFile, TarWriter},
-//!     futures::{SinkExt, StreamExt, TryStreamExt},
+//!     futures::{future, SinkExt, StreamExt, TryStreamExt},
 //! };
 //! # #[cfg(feature = "smol")]
 //! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-//! #   futures_lite::future::block_on(fut)
+//! #   smol::future::block_on(fut)
 //! # }
 //! # #[cfg(feature = "tokio")]
 //! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -139,21 +128,24 @@
 //!
 //! let mut input = Cursor::new(Vec::<u8>::new());
 //! let mut source = TarWriter::new(&mut input);
-//! source
-//!     .send(TarDirectory::new("bin/").into())
-//!     .await?;
-//! source
-//!     .send(TarRegularFile::new("bin/keep.txt", 5, Cursor::new(b"keep\n".as_ref()))
-//!             .into())
-//!     .await?;
-//! source
-//!     .send(TarRegularFile::new("share/skip.txt", 5, Cursor::new(b"skip\n".as_ref()))
-//!             .into())
-//!     .await?;
-//! source
-//!     .send(TarRegularFile::new("bin/run.sh", 8, Cursor::new(b"echo hi\n".as_ref()))
-//!             .with_mode(0o755).into())
-//!     .await?;
+//! source.send(
+//!     TarDirectory::new("bin/").into()
+//! ).await?;
+//! source.send(
+//!     TarRegularFile::new(
+//!         "bin/keep.txt", 5, Cursor::new(b"keep\n".as_ref())
+//!     ).into()
+//! ).await?;
+//! source.send(
+//!     TarRegularFile::new(
+//!         "share/skip.txt", 5, Cursor::new(b"skip\n".as_ref())
+//!     ).into()
+//! ).await?;
+//! source.send(
+//!     TarRegularFile::new(
+//!         "bin/run.sh", 8, Cursor::new(b"echo hi\n".as_ref())
+//!     ).with_mode(0o755).into()
+//! ).await?;
 //! source.close().await?;
 //! input.set_position(0);
 //!
@@ -161,7 +153,9 @@
 //! let mut filtered = TarWriter::new(&mut output);
 //!
 //! TarReader::new(&mut input)
-//!     .try_filter(|entry| std::future::ready(entry.path().starts_with("bin/")))
+//!     .try_filter(|entry| {
+//!         future::ready(entry.path().starts_with("bin/"))
+//!     })
 //!     .forward(&mut filtered)
 //!     .await?;
 //!
@@ -177,6 +171,27 @@
 //! # std::io::Result::Ok(())
 //! # }).unwrap();
 //! ```
+//!
+//! # Supported formats
+//!
+//! Reads:
+//! 
+//! - Old tar
+//! - GNU tar
+//! - POSIX ustar/pax
+//! - GNU long names and long links
+//! - PAX path metadata, timestamps, numeric ids, sizes, and extended attributes
+//! 
+//! Writes:
+//! 
+//! - POSIX ustar/pax
+//! - PAX records for long paths, long link targets, timestamps, numeric ids,
+//!   symbolic names, sizes, and extended attributes
+//!
+//! # Not supported
+//!
+//! - Sparse files and multi-volume archives
+//!
 
 #[cfg(all(feature = "smol", feature = "tokio"))]
 compile_error!("features `smol` and `tokio` are mutually exclusive");
@@ -967,10 +982,10 @@ pin_project! {
 
 /// Async reader for the body of the current regular-file entry.
 ///
-/// Instances are produced by [`TarReader`] while iterating [`TarEntry::File`]
-/// values. Dropping the reader before reaching EOF causes the archive reader to
-/// skip the remaining bytes for that file so iteration can continue at the next
-/// entry.
+/// Instances are produced by [`TarReader`] while iterating
+/// [`TarEntry::File`] values. If you drop the reader before reaching EOF, the
+/// archive reader skips the remaining bytes for that file so iteration can
+/// carry on with the next entry.
 pub struct TarRegularFileReader<'a, R: AsyncRead + 'a> {
     eof: u64,
     inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
@@ -1031,19 +1046,19 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 ///
 /// The reader implements [`Stream`] and yields [`TarEntry`] values one at a
 /// time. File entries remain streaming; to continue past a
-/// [`TarEntry::File`] entry, fully consume the file body or drop it.
+/// [`TarEntry::File`] entry, either read the file body to the end or drop it.
 ///
 /// # Example
 ///
 /// ```rust
 /// # #[cfg(feature = "smol")] 
-/// # use { futures::StreamExt, smol::io::Cursor };
+/// # use { smol::{ stream::StreamExt, io::{copy, sink, Cursor} } };
 /// # #[cfg(feature = "tokio")] 
-/// # use { std::io::Cursor, tokio_stream::StreamExt };
+/// # use { std::io::Cursor, tokio_stream::StreamExt, tokio::io::{copy, sink} };
 /// use smol_tar::{TarEntry, TarReader};
 /// # #[cfg(feature = "smol")]
 /// # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-/// #   futures_lite::future::block_on(fut)
+/// #   smol::block_on(fut)
 /// # }
 /// # #[cfg(feature = "tokio")]
 /// # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -1056,7 +1071,10 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 ///
 /// while let Some(entry) = tar.next().await {
 ///     match entry? {
-///         TarEntry::File(file) => println!("file: {}", file.path()),
+///         TarEntry::File(mut file) => {
+///             println!("file: {}", file.path());
+///             copy(&mut file, &mut sink()).await?;
+///         },
 ///         other => println!("entry: {}", other.path()),
 ///     }
 /// }
@@ -3278,16 +3296,18 @@ fn format_octal(val: u64, field: &mut [u8]) -> std::io::Result<()> {
 }
 
 pin_project! {
-    /// Streaming TAR writer that implements `Sink<TarEntry<...>>`.
+    /// Streaming tar writer that implements `future_sink::Sink<TarEntry<...>>`.
     ///
     /// Headers and file payloads are staged inside `buf` until downstream I/O
     /// makes progress, which keeps memory usage predictable while preserving
     /// proper block alignment.
     ///
-    /// Use [`TarWriter::finish`] when all entries have been written so the
-    /// terminating zero blocks required by the TAR format are emitted. The
-    /// writer also remains usable as a `Sink`, in which case `close()` performs
-    /// the same operation.
+    /// The composable `Sink` interface is handy, but if bringing in the
+    /// `futures` crate feels a bit much, the writer also provides inherent
+    /// methods. Use [`TarWriter::write`] to send entries to the tar stream, and
+    /// [`TarWriter::finish`] once all entries have been written so the
+    /// terminating zero blocks required by the format are emitted.
+    /// [`future_sink::Sink::close`] performs the same operation.
     ///
     /// Type inference usually determines `R` from the file entries you send. If
     /// you only send metadata-only entries such as directories, you may need an
@@ -3309,7 +3329,7 @@ pin_project! {
     ///
     /// # #[cfg(feature = "smol")]
     /// # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    /// #   futures_lite::future::block_on(fut)
+    /// #   smol::future::block_on(fut)
     /// # }
     /// # #[cfg(feature = "tokio")]
     /// # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
