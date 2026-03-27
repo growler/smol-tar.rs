@@ -1,6 +1,6 @@
 [package]
 name = "smol-tar"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Alexey Naidyonov <alexey.naidyonov@gmail.com>"]
 description = "Minimal async tar reader/writer for smol or tokio I/O"
