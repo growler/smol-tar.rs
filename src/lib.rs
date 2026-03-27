@@ -2,7 +2,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(rustdoc::invalid_rust_codeblocks)]
 
-//! A minimal async streaming TAR reader and writer.
+//! A minimal async streaming tar reader and writer.
 //!
 //! The reader is fully streaming: [`TarReader`] yields [`TarEntry`] values from
 //! any [`AsyncRead`] source with very little buffering. Regular file entries
@@ -10,10 +10,10 @@
 //! [`AsyncRead`]. To move on to the next entry, either read the file body to
 //! the end or drop the file reader.
 //!
-//! The writer is a [`futures_sink::Sink`] of [`TarEntry`] values and also
+//! The writer is a [`Sink`] of [`TarEntry`] values and also
 //! provides inherent [`TarWriter::write`] and [`TarWriter::finish`] helpers for
-//! straightforward sequential writing without [`futures::SinkExt`]. Finish 
-//! the archive with [`TarWriter::finish`] or [`futures::SinkExt::close`] 
+//! straightforward sequential writing without [`futures::sink::SinkExt`]. Finish
+//! the archive with [`TarWriter::finish`] or [`futures::sink::SinkExt::close`]
 //! so the trailing zero blocks are emitted.
 //!
 //! # Examples
@@ -105,7 +105,7 @@
 //! ```
 //!
 //! Alongside the direct API, the writer also implements the composable
-//! [`futures_sink::Sink`] interface:
+//! [`Sink`] interface:
 //!
 //! ```rust
 //! # #[cfg(feature = "smol")]
@@ -175,15 +175,15 @@
 //! # Supported formats
 //!
 //! Reads:
-//! 
+//!
 //! - Old tar
 //! - GNU tar
 //! - POSIX ustar/pax
 //! - GNU long names and long links
 //! - PAX path metadata, timestamps, numeric ids, sizes, and extended attributes
-//! 
+//!
 //! Writes:
-//! 
+//!
 //! - POSIX ustar/pax
 //! - PAX records for long paths, long link targets, timestamps, numeric ids,
 //!   symbolic names, sizes, and extended attributes
@@ -204,7 +204,7 @@ use {
     futures_sink::Sink,
     pin_project_lite::pin_project,
     std::{
-        future::{Future, poll_fn},
+        future::{poll_fn, Future},
         io::{Error, ErrorKind, Result},
         pin::{pin, Pin},
         str::from_utf8,
@@ -217,9 +217,7 @@ use {
 #[cfg(feature = "smol")]
 use futures_lite::io::{AsyncRead, AsyncWrite};
 #[cfg(feature = "tokio")]
-use {
-    tokio::io::{AsyncRead, AsyncWrite, ReadBuf},
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const BLOCK_SIZE: usize = 512;
 const SKIP_BUFFER_SIZE: usize = 64 * 1024;
@@ -1051,9 +1049,9 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 /// # Example
 ///
 /// ```rust
-/// # #[cfg(feature = "smol")] 
+/// # #[cfg(feature = "smol")]
 /// # use { smol::{ stream::StreamExt, io::{copy, sink, Cursor} } };
-/// # #[cfg(feature = "tokio")] 
+/// # #[cfg(feature = "tokio")]
 /// # use { std::io::Cursor, tokio_stream::StreamExt, tokio::io::{copy, sink} };
 /// use smol_tar::{TarEntry, TarReader};
 /// # #[cfg(feature = "smol")]
@@ -1154,7 +1152,7 @@ fn header_mtime_value(time: SystemTime) -> Option<u64> {
     Some(duration.as_secs())
 }
 
-/// Hard-link entry stored in a TAR archive.
+/// Hard-link entry stored in a tar archive.
 pub struct TarLink {
     path_name: Box<str>,
     link_name: Box<str>,
@@ -1209,7 +1207,7 @@ pub enum DeviceKind {
     Block,
 }
 
-/// Device-node metadata stored in a TAR archive.
+/// Device-node metadata stored in a tar archive.
 pub struct TarDevice {
     path_name: Box<str>,
     mode: u32,
@@ -1265,7 +1263,7 @@ impl TarDevice {
     pub fn path(&'_ self) -> &'_ str {
         &self.path_name
     }
-    /// Return the raw permission bits stored in the TAR header.
+    /// Return the raw permission bits stored in the tar header.
     pub fn mode(&self) -> u32 {
         self.mode
     }
@@ -1281,38 +1279,38 @@ impl TarDevice {
     pub fn ctime(&self) -> Option<SystemTime> {
         self.times.ctime
     }
-    /// Return the raw user id stored in the TAR header.
+    /// Return the raw user id stored in the tar header.
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the TAR header, if present.
+    /// Return the symbolic user name stored in the tar header, if present.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
-    /// Replace the raw user id stored in the TAR header.
+    /// Replace the raw user id stored in the tar header.
     pub fn with_uid(mut self, uid: u32) -> Self {
         self.uid = uid;
         self
     }
-    /// Replace the symbolic user name stored in the TAR header.
+    /// Replace the symbolic user name stored in the tar header.
     pub fn with_uname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.uname = Some(name.into());
         self
     }
-    /// Return the raw group id stored in the TAR header.
+    /// Return the raw group id stored in the tar header.
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the TAR header, if present.
+    /// Return the symbolic group name stored in the tar header, if present.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
-    /// Replace the raw group id stored in the TAR header.
+    /// Replace the raw group id stored in the tar header.
     pub fn with_gid(mut self, gid: u32) -> Self {
         self.gid = gid;
         self
     }
-    /// Replace the symbolic group name stored in the TAR header.
+    /// Replace the symbolic group name stored in the tar header.
     pub fn with_gname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.gname = Some(name.into());
         self
@@ -1325,15 +1323,15 @@ impl TarDevice {
     pub fn is_block(&self) -> bool {
         matches!(self.kind, DeviceKind::Block)
     }
-    /// Return the raw major device number stored in the TAR header.
+    /// Return the raw major device number stored in the tar header.
     pub fn major(&self) -> u32 {
         self.major
     }
-    /// Return the raw minor device number stored in the TAR header.
+    /// Return the raw minor device number stored in the tar header.
     pub fn minor(&self) -> u32 {
         self.minor
     }
-    /// Replace the raw permission bits stored in the TAR header.
+    /// Replace the raw permission bits stored in the tar header.
     pub fn with_mode(mut self, mode: u32) -> Self {
         self.mode = mode;
         self
@@ -1388,7 +1386,7 @@ impl TarDevice {
     }
 }
 
-/// FIFO (named pipe) metadata stored in a TAR archive.
+/// FIFO (named pipe) metadata stored in a tar archive.
 pub struct TarFifo {
     path_name: Box<str>,
     mode: u32,
@@ -1422,7 +1420,7 @@ impl TarFifo {
     pub fn path(&'_ self) -> &'_ str {
         &self.path_name
     }
-    /// Return the raw permission bits stored in the TAR header.
+    /// Return the raw permission bits stored in the tar header.
     pub fn mode(&self) -> u32 {
         self.mode
     }
@@ -1438,43 +1436,43 @@ impl TarFifo {
     pub fn ctime(&self) -> Option<SystemTime> {
         self.times.ctime
     }
-    /// Return the raw user id stored in the TAR header.
+    /// Return the raw user id stored in the tar header.
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the TAR header, if present.
+    /// Return the symbolic user name stored in the tar header, if present.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
-    /// Replace the raw user id stored in the TAR header.
+    /// Replace the raw user id stored in the tar header.
     pub fn with_uid(mut self, uid: u32) -> Self {
         self.uid = uid;
         self
     }
-    /// Replace the symbolic user name stored in the TAR header.
+    /// Replace the symbolic user name stored in the tar header.
     pub fn with_uname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.uname = Some(name.into());
         self
     }
-    /// Return the raw group id stored in the TAR header.
+    /// Return the raw group id stored in the tar header.
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the TAR header, if present.
+    /// Return the symbolic group name stored in the tar header, if present.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
-    /// Replace the raw group id stored in the TAR header.
+    /// Replace the raw group id stored in the tar header.
     pub fn with_gid(mut self, gid: u32) -> Self {
         self.gid = gid;
         self
     }
-    /// Replace the symbolic group name stored in the TAR header.
+    /// Replace the symbolic group name stored in the tar header.
     pub fn with_gname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.gname = Some(name.into());
         self
     }
-    /// Replace the raw permission bits stored in the TAR header.
+    /// Replace the raw permission bits stored in the tar header.
     pub fn with_mode(mut self, mode: u32) -> Self {
         self.mode = mode;
         self
@@ -1526,7 +1524,7 @@ impl TarFifo {
     }
 }
 
-/// Symbolic-link metadata stored in a TAR archive.
+/// Symbolic-link metadata stored in a tar archive.
 pub struct TarSymlink {
     path_name: Box<str>,
     link_name: Box<str>,
@@ -1569,7 +1567,7 @@ impl TarSymlink {
     pub fn link(&'_ self) -> &'_ str {
         &self.link_name
     }
-    /// Return the raw permission bits stored in the TAR header.
+    /// Return the raw permission bits stored in the tar header.
     pub fn mode(&self) -> u32 {
         self.mode
     }
@@ -1585,43 +1583,43 @@ impl TarSymlink {
     pub fn ctime(&self) -> Option<SystemTime> {
         self.times.ctime
     }
-    /// Return the raw user id stored in the TAR header.
+    /// Return the raw user id stored in the tar header.
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the TAR header, if present.
+    /// Return the symbolic user name stored in the tar header, if present.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
-    /// Replace the raw user id stored in the TAR header.
+    /// Replace the raw user id stored in the tar header.
     pub fn with_uid(mut self, uid: u32) -> Self {
         self.uid = uid;
         self
     }
-    /// Replace the symbolic user name stored in the TAR header.
+    /// Replace the symbolic user name stored in the tar header.
     pub fn with_uname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.uname = Some(name.into());
         self
     }
-    /// Return the raw group id stored in the TAR header.
+    /// Return the raw group id stored in the tar header.
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the TAR header, if present.
+    /// Return the symbolic group name stored in the tar header, if present.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
-    /// Replace the raw group id stored in the TAR header.
+    /// Replace the raw group id stored in the tar header.
     pub fn with_gid(mut self, gid: u32) -> Self {
         self.gid = gid;
         self
     }
-    /// Replace the symbolic group name stored in the TAR header.
+    /// Replace the symbolic group name stored in the tar header.
     pub fn with_gname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.gname = Some(name.into());
         self
     }
-    /// Replace the raw permission bits stored in the TAR header.
+    /// Replace the raw permission bits stored in the tar header.
     pub fn with_mode(mut self, mode: u32) -> Self {
         self.mode = mode;
         self
@@ -1673,7 +1671,7 @@ impl TarSymlink {
     }
 }
 
-/// Directory metadata stored in a TAR archive.
+/// Directory metadata stored in a tar archive.
 pub struct TarDirectory {
     path_name: Box<str>,
     mode: u32,
@@ -1711,11 +1709,11 @@ impl TarDirectory {
     pub fn path(&'_ self) -> &'_ str {
         &self.path_name
     }
-    /// Return the size stored in the TAR header.
+    /// Return the size stored in the tar header.
     pub fn size(&self) -> u64 {
         self.size
     }
-    /// Return the raw permission bits stored in the TAR header.
+    /// Return the raw permission bits stored in the tar header.
     pub fn mode(&self) -> u32 {
         self.mode
     }
@@ -1731,43 +1729,43 @@ impl TarDirectory {
     pub fn ctime(&self) -> Option<SystemTime> {
         self.times.ctime
     }
-    /// Return the raw user id stored in the TAR header.
+    /// Return the raw user id stored in the tar header.
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the TAR header, if present.
+    /// Return the symbolic user name stored in the tar header, if present.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
-    /// Replace the raw user id stored in the TAR header.
+    /// Replace the raw user id stored in the tar header.
     pub fn with_uid(mut self, uid: u32) -> Self {
         self.uid = uid;
         self
     }
-    /// Replace the symbolic user name stored in the TAR header.
+    /// Replace the symbolic user name stored in the tar header.
     pub fn with_uname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.uname = Some(name.into());
         self
     }
-    /// Return the raw group id stored in the TAR header.
+    /// Return the raw group id stored in the tar header.
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the TAR header, if present.
+    /// Return the symbolic group name stored in the tar header, if present.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
-    /// Replace the raw group id stored in the TAR header.
+    /// Replace the raw group id stored in the tar header.
     pub fn with_gid(mut self, gid: u32) -> Self {
         self.gid = gid;
         self
     }
-    /// Replace the symbolic group name stored in the TAR header.
+    /// Replace the symbolic group name stored in the tar header.
     pub fn with_gname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.gname = Some(name.into());
         self
     }
-    /// Replace the raw permission bits stored in the TAR header.
+    /// Replace the raw permission bits stored in the tar header.
     pub fn with_mode(mut self, mode: u32) -> Self {
         self.mode = mode;
         self
@@ -1787,7 +1785,7 @@ impl TarDirectory {
         self.times = self.times.with_ctime(ctime);
         self
     }
-    /// Replace the size stored in the TAR header.
+    /// Replace the size stored in the tar header.
     pub fn with_size(mut self, size: u64) -> Self {
         self.size = size;
         self
@@ -1880,7 +1878,7 @@ pin_project! {
     ///
     /// Values of this type are yielded by [`TarReader`] and can also be built
     /// manually for [`TarWriter`]. The type implements [`AsyncRead`] so callers
-    /// can stream file contents without buffering the full file in memory.
+    /// can stream file contents.
     pub struct TarRegularFile<'a, R> {
         path_name: Box<str>,
         size: u64,
@@ -1915,7 +1913,7 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
             marker: std::marker::PhantomData,
         }
     }
-    /// Return the size stored in the TAR header.
+    /// Return the size stored in the tar header.
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -1923,7 +1921,7 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
     pub fn path(&'_ self) -> &'_ str {
         &self.path_name
     }
-    /// Return the raw permission bits stored in the TAR header.
+    /// Return the raw permission bits stored in the tar header.
     pub fn mode(&self) -> u32 {
         self.mode
     }
@@ -1939,43 +1937,43 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
     pub fn ctime(&self) -> Option<SystemTime> {
         self.times.ctime
     }
-    /// Return the raw user id stored in the TAR header.
+    /// Return the raw user id stored in the tar header.
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the TAR header, if present.
+    /// Return the symbolic user name stored in the tar header, if present.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
-    /// Replace the raw user id stored in the TAR header.
+    /// Replace the raw user id stored in the tar header.
     pub fn with_uid(mut self, uid: u32) -> Self {
         self.uid = uid;
         self
     }
-    /// Replace the symbolic user name stored in the TAR header.
+    /// Replace the symbolic user name stored in the tar header.
     pub fn with_uname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.uname = Some(name.into());
         self
     }
-    /// Return the raw group id stored in the TAR header.
+    /// Return the raw group id stored in the tar header.
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the TAR header, if present.
+    /// Return the symbolic group name stored in the tar header, if present.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
-    /// Replace the raw group id stored in the TAR header.
+    /// Replace the raw group id stored in the tar header.
     pub fn with_gid(mut self, gid: u32) -> Self {
         self.gid = gid;
         self
     }
-    /// Replace the symbolic group name stored in the TAR header.
+    /// Replace the symbolic group name stored in the tar header.
     pub fn with_gname<S: Into<Box<str>>>(mut self, name: S) -> Self {
         self.gname = Some(name.into());
         self
     }
-    /// Replace the raw permission bits stored in the TAR header.
+    /// Replace the raw permission bits stored in the tar header.
     pub fn with_mode(mut self, mode: u32) -> Self {
         self.mode = mode;
         self
@@ -2031,7 +2029,7 @@ impl<'a, R: AsyncRead + 'a> From<TarRegularFile<'a, R>> for TarEntry<'a, R> {
         Self::File(file)
     }
 }
-/// High-level TAR entry representation used by [`TarReader`] and [`TarWriter`].
+/// High-level tar entry representation used by [`TarReader`] and [`TarWriter`].
 pub enum TarEntry<'a, R: AsyncRead + 'a> {
     /// A regular file entry with a streaming body reader.
     File(TarRegularFile<'a, R>),
@@ -3307,7 +3305,7 @@ pin_project! {
     /// methods. Use [`TarWriter::write`] to send entries to the tar stream, and
     /// [`TarWriter::finish`] once all entries have been written so the
     /// terminating zero blocks required by the format are emitted.
-    /// [`future_sink::Sink::close`] performs the same operation.
+    /// [`futures::sink:SinkExt::close`] performs the same operation.
     ///
     /// Type inference usually determines `R` from the file entries you send. If
     /// you only send metadata-only entries such as directories, you may need an
@@ -3384,7 +3382,7 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> TarWriter<'a, 'b, W,
         }
     }
 
-    /// Write a single TAR entry and flush it to the underlying writer.
+    /// Write a single tar entry and flush it to the underlying writer.
     pub async fn write(&mut self, entry: TarEntry<'b, R>) -> std::io::Result<()> {
         poll_fn(|cx| {
             // SAFETY: the mutable borrow of `self` is held for the duration of

@@ -11,9 +11,9 @@ use std::{
 use futures::Sink;
 use futures::{future, SinkExt, TryStreamExt};
 #[cfg(feature = "smol")]
-use futures::{StreamExt, io::Cursor};
-#[cfg(feature = "smol")]
 use futures_lite::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+#[cfg(feature = "smol")]
+use smol::{io::Cursor, stream::StreamExt};
 use smol_tar::{
     AttrList, TarDevice, TarDirectory, TarEntry, TarFifo, TarLink, TarReader, TarRegularFile,
     TarSymlink, TarWriter,

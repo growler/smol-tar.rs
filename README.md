@@ -73,7 +73,9 @@ file body to the end or drop the file reader.
 
 ```rust
 use smol::io::Cursor;
-use smol_tar::{TarDirectory, TarEntry, TarRegularFile, TarWriter};
+use smol_tar::{
+    TarDirectory, TarEntry, TarRegularFile, TarWriter
+};
 
 let sink = Cursor::new(Vec::<u8>::new());
 let mut tar = TarWriter::new(sink);
@@ -98,32 +100,27 @@ Alongside the direct API, the writer also implements the composable
 ```rust
 use futures::{future, SinkExt, StreamExt, TryStreamExt};
 use smol::io::Cursor;
-use smol_tar::{TarDirectory, TarEntry, TarReader, TarRegularFile, TarWriter};
+use smol_tar::*;
 
 let mut input = Cursor::new(Vec::<u8>::new());
 let mut source = TarWriter::new(&mut input);
-source
-    .send(TarDirectory::new("bin/").into())
-    .await?;
-source
-    .send(
-        TarRegularFile::new("bin/keep.txt", 5, Cursor::new(b"keep\n".as_ref()))
-            .into(),
-    )
-    .await?;
-source
-    .send(
-        TarRegularFile::new("share/skip.txt", 5, Cursor::new(b"skip\n".as_ref()))
-            .into(),
-    )
-    .await?;
-source
-    .send(
-        TarRegularFile::new("bin/run.sh", 8, Cursor::new(b"echo hi\n".as_ref()))
-            .with_mode(0o755)
-            .into(),
-    )
-    .await?;
+source.send(
+    TarDirectory::new("bin/").into()
+).await?;
+source.send(TarRegularFile::new(
+        "bin/keep.txt", 5, Cursor::new(b"keep\n".as_ref())
+    ).into(),
+).await?;
+source.send(
+    TarRegularFile::new(
+        "share/skip.txt", 5, Cursor::new(b"skip\n".as_ref())
+    ).into(),
+).await?;
+source.send(
+    TarRegularFile::new(
+        "bin/run.sh", 8, Cursor::new(b"echo hi\n".as_ref())
+    ).with_mode(0o755).into(),
+).await?;
 source.close().await?;
 input.set_position(0);
 
@@ -173,6 +170,10 @@ for release.
 - Regular file bodies are streamed. To advance to the next entry, either read
   the file body to the end or drop the file reader.
 - Library paths and example-CLI paths must be valid UTF-8.
+
+## Specail thanks
+
+To authors of [`async-tar`](https://crates.io/crates/async-tar) for the inspiration.
 
 # LICENSE
 
