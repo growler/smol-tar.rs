@@ -3307,7 +3307,7 @@ pin_project! {
     /// methods. Use [`TarWriter::write`] to send entries to the tar stream, and
     /// [`TarWriter::finish`] once all entries have been written so the
     /// terminating zero blocks required by the format are emitted.
-    /// [`futures::sink:SinkExt::close`] performs the same operation.
+    /// [`futures::sink::SinkExt::close`] performs the same operation.
     ///
     /// Type inference usually determines `R` from the file entries you send. If
     /// you only send metadata-only entries such as directories, you may need an
