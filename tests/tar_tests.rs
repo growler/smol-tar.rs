@@ -479,6 +479,36 @@ fn append_pax_entry(archive: &mut Vec<u8>, typeflag: u8, payload: &[u8]) {
     );
 }
 
+fn cve_2025_62518_archive() -> ([u8; BLOCK_SIZE], Vec<u8>) {
+    let mut archive = Vec::new();
+    append_entry(
+        &mut archive,
+        build_header(b"normal.txt", b'0', 6, HeaderFlavor::Ustar),
+        b"normal",
+    );
+
+    let pax = pax_record_bytes("size", b"1024");
+    append_pax_entry(&mut archive, b'x', &pax);
+
+    let fake_header = build_header(b"smuggled.txt", b'0', 4, HeaderFlavor::Ustar);
+    let mut payload = vec![0; 1024];
+    payload[..BLOCK_SIZE].copy_from_slice(&fake_header);
+    payload[BLOCK_SIZE..BLOCK_SIZE + 4].copy_from_slice(b"EVIL");
+
+    append_entry(
+        &mut archive,
+        build_header(b"blob.bin", b'0', 0, HeaderFlavor::Ustar),
+        &payload,
+    );
+    append_entry(
+        &mut archive,
+        build_header(b"marker.txt", b'0', 6, HeaderFlavor::Ustar),
+        b"marker",
+    );
+    append_eof(&mut archive);
+    (fake_header, archive)
+}
+
 #[test]
 fn read_simple_archive() -> Result<()> {
     block_on_test(async {
@@ -755,7 +785,8 @@ fn tar_writer_inherent_write_and_finish_round_trip() -> Result<()> {
 
         writer.finish().await?;
 
-        let entries = collect_entries_async(Cursor::new(shared.lock().unwrap().clone())).await?;
+        let buffer = shared.lock().unwrap().clone();
+        let entries = collect_entries_async(Cursor::new(buffer)).await?;
         assert_eq!(
             entries,
             vec![
@@ -1906,6 +1937,92 @@ fn reader_applies_extended_pax_metadata() -> Result<()> {
             }
             other => panic!("expected file entry, got {:?}", other),
         }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn reader_does_not_surface_smuggled_entries_from_pax_size_override() -> Result<()> {
+    block_on_test(async {
+        let (fake_header, archive) = cve_2025_62518_archive();
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "normal.txt");
+                assert_eq!(data, b"normal");
+            }
+            other => panic!("expected leading file, got {:?}", other),
+        }
+
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "blob.bin");
+                assert_eq!(file.size(), 1024);
+                assert_eq!(data.len(), 1024);
+                assert_eq!(&data[..BLOCK_SIZE], &fake_header);
+                assert_eq!(&data[BLOCK_SIZE..BLOCK_SIZE + 4], b"EVIL");
+            }
+            other => panic!("expected CVE regression file, got {:?}", other),
+        }
+
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "marker.txt");
+                assert_eq!(data, b"marker");
+            }
+            other => panic!("expected trailing marker file, got {:?}", other),
+        }
+
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn dropping_pax_sized_file_skips_over_embedded_tar_headers() -> Result<()> {
+    block_on_test(async {
+        let (_, archive) = cve_2025_62518_archive();
+        let reader = ChunkedReader::new(Cursor::new(archive), 17);
+        let mut stream = Box::pin(TarReader::new(reader));
+
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "normal.txt");
+                assert_eq!(data, b"normal");
+            }
+            other => panic!("expected leading file, got {:?}", other),
+        }
+
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                assert_eq!(file.path(), "blob.bin");
+                assert_eq!(file.size(), 1024);
+                let mut byte = [0u8; 1];
+                file.read_exact(&mut byte).await?;
+            }
+            other => panic!("expected CVE regression file, got {:?}", other),
+        }
+
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "marker.txt");
+                assert_eq!(data, b"marker");
+            }
+            other => panic!("expected trailing marker file, got {:?}", other),
+        }
+
         assert!(stream.next().await.is_none());
         Ok(())
     })

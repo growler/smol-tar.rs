@@ -12,8 +12,10 @@
 //!
 //! The writer is a [`Sink`] of [`TarEntry`] values and also
 //! provides inherent [`TarWriter::write`] and [`TarWriter::finish`] helpers for
-//! straightforward sequential writing without [`futures::sink::SinkExt`]. Finish
-//! the archive with [`TarWriter::finish`] or [`futures::sink::SinkExt::close`]
+//! straightforward sequential writing without [`futures::sink::SinkExt`].
+//!
+//! Write entries to archive with [`TarWriter::write`] or [`futures::sink::SinkExt::send`].
+//! Finish the archive with [`TarWriter::finish`] or [`futures::sink::SinkExt::close`]
 //! so the trailing zero blocks are emitted.
 //!
 //! # Examples
