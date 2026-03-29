@@ -200,9 +200,10 @@ compile_error!("features `smol` and `tokio` are mutually exclusive");
 #[cfg(not(any(feature = "smol", feature = "tokio")))]
 compile_error!("either feature `smol` or `tokio` must be enabled");
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use {
-    async_lock::Mutex,
-    futures_lite::Stream,
+    futures_core::stream::Stream,
     futures_sink::Sink,
     pin_project_lite::pin_project,
     std::{
@@ -217,9 +218,15 @@ use {
 };
 
 #[cfg(feature = "smol")]
-use futures_lite::io::{AsyncRead, AsyncWrite};
+use {
+    async_lock::Mutex,
+    futures_io::{AsyncRead, AsyncWrite},
+};
 #[cfg(feature = "tokio")]
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use {
+    tokio::io::{AsyncRead, AsyncWrite, ReadBuf},
+    tokio::sync::Mutex,
+};
 
 const BLOCK_SIZE: usize = 512;
 const SKIP_BUFFER_SIZE: usize = 64 * 1024;
@@ -272,7 +279,7 @@ fn poll_regular_file_reader<'a, R: AsyncRead>(
 ) -> Poll<Result<usize>> {
     let this = this.get_mut();
     let eof = this.eof;
-    let fut = this.inner.lock();
+    let fut = this.inner.rdr.lock();
     let mut g = task::ready!(pin!(fut).poll(ctx));
     let inner_pin: Pin<&mut TarReaderInner<'a, R>> = g.as_mut();
     let inner = inner_pin.project();
@@ -980,6 +987,11 @@ pin_project! {
     }
 }
 
+struct TarReaderGuard<'a, R: AsyncRead + 'a> {
+    pos: AtomicU64,
+    rdr: Mutex<Pin<Box<TarReaderInner<'a, R>>>>,
+}
+
 /// Async reader for the body of the current regular-file entry.
 ///
 /// Instances are produced by [`TarReader`] while iterating
@@ -988,28 +1000,13 @@ pin_project! {
 /// carry on with the next entry.
 pub struct TarRegularFileReader<'a, R: AsyncRead + 'a> {
     eof: u64,
-    inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
+    inner: Arc<TarReaderGuard<'a, R>>,
 }
 
 impl<R: AsyncRead> Drop for TarRegularFileReader<'_, R> {
     fn drop(&mut self) {
         let inner = self.inner.clone();
-        let eof = self.eof;
-        let mut g = inner.lock_blocking();
-        let this_pin = g.as_mut();
-        let this = this_pin.project();
-        if *this.pos < eof {
-            *this.state = SkipEntry;
-        } else if *this.pos == eof && matches!(*this.state, Entry) {
-            let nxt = padded_size(*this.nxt);
-            if *this.pos == nxt {
-                *this.nxt = nxt + BLOCK_SIZE as u64;
-                *this.state = Header;
-            } else {
-                *this.nxt = nxt;
-                *this.state = Padding;
-            }
-        }
+        inner.pos.fetch_max(self.eof + 1, Ordering::Release);
     }
 }
 
@@ -1082,14 +1079,17 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 /// # }).unwrap();
 /// ```
 pub struct TarReader<'a, R: AsyncRead + 'a> {
-    inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
+    inner: Arc<TarReaderGuard<'a, R>>,
 }
 
 impl<'a, R: AsyncRead + 'a> TarReader<'a, R> {
     /// Construct a streaming reader that yields [`TarEntry`] values.
     pub fn new(r: R) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Box::pin(TarReaderInner::new(r)))),
+            inner: Arc::new(TarReaderGuard {
+                pos: AtomicU64::new(0),
+                rdr: Mutex::new(Box::pin(TarReaderInner::new(r))),
+            }),
         }
     }
 }
@@ -2436,7 +2436,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
     fn poll_read_header(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Entry>>> {
+    ) -> Poll<Option<Result<(Entry, u64)>>> {
         let mut this = self.project();
         loop {
             match this.state {
@@ -2485,32 +2485,38 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             Ok(if path_name.ends_with('/') && this.header.is_old() {
                                 *this.nxt += BLOCK_SIZE as u64;
                                 *this.state = Header;
-                                Entry::Directory(TarDirectory {
-                                    size,
-                                    mode: this.header.mode()?,
-                                    uid,
-                                    gid,
-                                    uname,
-                                    gname,
-                                    times,
-                                    path_name,
-                                    attrs: info.attrs,
-                                })
+                                (
+                                    Entry::Directory(TarDirectory {
+                                        size,
+                                        mode: this.header.mode()?,
+                                        uid,
+                                        gid,
+                                        uname,
+                                        gname,
+                                        times,
+                                        path_name,
+                                        attrs: info.attrs,
+                                    }),
+                                    *this.pos,
+                                )
                             } else {
                                 *this.nxt += size;
                                 *this.state = Entry;
-                                Entry::File {
-                                    size,
-                                    mode: this.header.mode()?,
-                                    uid,
-                                    gid,
-                                    uname,
-                                    gname,
-                                    times,
-                                    eof: *this.nxt,
-                                    path_name,
-                                    attrs: info.attrs,
-                                }
+                                (
+                                    Entry::File {
+                                        size,
+                                        mode: this.header.mode()?,
+                                        uid,
+                                        gid,
+                                        uname,
+                                        gname,
+                                        times,
+                                        eof: *this.nxt,
+                                        path_name,
+                                        attrs: info.attrs,
+                                    },
+                                    *this.pos,
+                                )
                             })
                         }
                         Kind::Directory => {
@@ -2524,17 +2530,20 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
                             let path_name = entry_path(this.header, info.path)?;
-                            Ok(Entry::Directory(TarDirectory {
-                                size,
-                                mode: this.header.mode()?,
-                                uid,
-                                gid,
-                                uname,
-                                gname,
-                                times,
-                                path_name,
-                                attrs: info.attrs,
-                            }))
+                            Ok((
+                                Entry::Directory(TarDirectory {
+                                    size,
+                                    mode: this.header.mode()?,
+                                    uid,
+                                    gid,
+                                    uname,
+                                    gname,
+                                    times,
+                                    path_name,
+                                    attrs: info.attrs,
+                                }),
+                                *this.pos,
+                            ))
                         }
                         Kind::Fifo => {
                             let info = take_pax_info(this.exts, this.globs)?;
@@ -2546,16 +2555,19 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
                             let path_name = entry_path(this.header, info.path)?;
-                            Ok(Entry::Fifo(TarFifo {
-                                path_name,
-                                mode: this.header.mode()?,
-                                uid,
-                                gid,
-                                uname,
-                                gname,
-                                times,
-                                attrs: info.attrs,
-                            }))
+                            Ok((
+                                Entry::Fifo(TarFifo {
+                                    path_name,
+                                    mode: this.header.mode()?,
+                                    uid,
+                                    gid,
+                                    uname,
+                                    gname,
+                                    times,
+                                    attrs: info.attrs,
+                                }),
+                                *this.pos,
+                            ))
                         }
                         Kind::CharDevice | Kind::BlockDevice => {
                             let info = take_pax_info(this.exts, this.globs)?;
@@ -2567,23 +2579,26 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
                             let path_name = entry_path(this.header, info.path)?;
-                            Ok(Entry::Device(TarDevice {
-                                path_name,
-                                mode: this.header.mode()?,
-                                uid,
-                                gid,
-                                uname,
-                                gname,
-                                times,
-                                kind: match kind {
-                                    Kind::CharDevice => DeviceKind::Char,
-                                    Kind::BlockDevice => DeviceKind::Block,
-                                    _ => unreachable!(),
-                                },
-                                major: this.header.dev_major()?,
-                                minor: this.header.dev_minor()?,
-                                attrs: info.attrs,
-                            }))
+                            Ok((
+                                Entry::Device(TarDevice {
+                                    path_name,
+                                    mode: this.header.mode()?,
+                                    uid,
+                                    gid,
+                                    uname,
+                                    gname,
+                                    times,
+                                    kind: match kind {
+                                        Kind::CharDevice => DeviceKind::Char,
+                                        Kind::BlockDevice => DeviceKind::Block,
+                                        _ => unreachable!(),
+                                    },
+                                    major: this.header.dev_major()?,
+                                    minor: this.header.dev_minor()?,
+                                    attrs: info.attrs,
+                                }),
+                                *this.pos,
+                            ))
                         }
                         Kind::Link => {
                             let info = take_pax_info(this.exts, this.globs)?;
@@ -2592,10 +2607,13 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             let (path_name, link_name) =
                                 entry_path_link(this.header, info.path, info.linkpath)?;
                             let _ = info.attrs;
-                            Ok(Entry::Link(TarLink {
-                                path_name,
-                                link_name,
-                            }))
+                            Ok((
+                                Entry::Link(TarLink {
+                                    path_name,
+                                    link_name,
+                                }),
+                                *this.pos,
+                            ))
                         }
                         Kind::Symlink => {
                             let info = take_pax_info(this.exts, this.globs)?;
@@ -2608,17 +2626,20 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             *this.state = Header;
                             let (path_name, link_name) =
                                 entry_path_link(this.header, info.path, info.linkpath)?;
-                            Ok(Entry::Symlink(TarSymlink {
-                                mode: this.header.mode()?,
-                                uid,
-                                gid,
-                                uname,
-                                gname,
-                                times,
-                                path_name,
-                                link_name,
-                                attrs: info.attrs,
-                            }))
+                            Ok((
+                                Entry::Symlink(TarSymlink {
+                                    mode: this.header.mode()?,
+                                    uid,
+                                    gid,
+                                    uname,
+                                    gname,
+                                    times,
+                                    path_name,
+                                    link_name,
+                                    attrs: info.attrs,
+                                }),
+                                *this.pos,
+                            ))
                         }
                         Kind::PAXLocal | Kind::PAXGlobal if this.header.is_ustar() => {
                             let size = this.header.size().and_then(|size| {
@@ -2819,11 +2840,19 @@ impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
     type Item = Result<TarEntry<'a, TarRegularFileReader<'a, R>>>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut();
-        let fut = this.inner.lock();
+        let fut = this.inner.rdr.lock();
         let mut g = task::ready!(pin!(fut).poll(ctx));
-        let inner: Pin<&mut TarReaderInner<R>> = g.as_mut();
-        let entry = {
-            match inner.poll_next(ctx) {
+        let mut inner: Pin<&mut TarReaderInner<R>> = g.as_mut();
+        // this may hit badly if someone ever try to use TarReader and
+        // TarRegularFileReader in different treads. hopefully, no one
+        // in sane mind would ever do that
+        let guard_pos = this.inner.pos.load(Ordering::Relaxed);
+        if matches!(inner.state, Entry) && inner.pos < guard_pos {
+            let this = inner.as_mut().project();
+            *this.state = SkipEntry;
+        }
+        let (entry, pos) = {
+            match inner.poll_read_header(ctx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
@@ -2842,22 +2871,25 @@ impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
                 eof,
                 path_name,
                 attrs,
-            } => TarEntry::File(TarRegularFile {
-                path_name,
-                size,
-                mode,
-                uid,
-                gid,
-                uname,
-                gname,
-                times,
-                attrs,
-                inner: TarRegularFileReader {
-                    eof,
-                    inner: Arc::clone(&this.inner),
-                },
-                marker: std::marker::PhantomData,
-            }),
+            } => {
+                this.inner.pos.store(pos, Ordering::Release);
+                TarEntry::File(TarRegularFile {
+                    path_name,
+                    size,
+                    mode,
+                    uid,
+                    gid,
+                    uname,
+                    gname,
+                    times,
+                    attrs,
+                    inner: TarRegularFileReader {
+                        eof,
+                        inner: Arc::clone(&this.inner),
+                    },
+                    marker: std::marker::PhantomData,
+                })
+            }
             Entry::Directory(d) => TarEntry::Directory(d),
             Entry::Link(l) => TarEntry::Link(l),
             Entry::Symlink(l) => TarEntry::Symlink(l),
@@ -2867,12 +2899,6 @@ impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
     }
 }
 
-impl<'a, R: AsyncRead + 'a> Stream for TarReaderInner<'a, R> {
-    type Item = Result<Entry>;
-    fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.as_mut().poll_read_header(ctx)
-    }
-}
 impl<'a, R: AsyncRead + 'a> TarEntry<'a, R> {
     /// Path of the entry regardless of concrete variant.
     pub fn path(&'_ self) -> &'_ str {

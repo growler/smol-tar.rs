@@ -1,6 +1,6 @@
 [package]
 name = "smol-tar"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Alexey Naidyonov <alexey.naidyonov@gmail.com>"]
 description = "Minimal async tar reader/writer for smol or tokio I/O"
@@ -22,15 +22,16 @@ features = ["futures"]
 
 [features]
 default = ["smol"]
-smol = []
+smol = ["dep:async-lock", "dep:futures-io"]
 tokio = ["dep:tokio", "dep:tokio-stream"]
 futures = ["dep:futures"]
 
 [dependencies]
-async-lock = "3.4"
-futures-lite = "2.6"
+futures-core = "0.3"
 futures-sink = "0.3"
 pin-project-lite = "0.2"
+async-lock = { version = "3.4", optional = true }
+futures-io = { version = "0.3", optional = true }
 tokio = { version = "1", optional = true, features = ["fs", "io-util", "rt"] }
 tokio-stream = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }

@@ -167,6 +167,10 @@ for release.
 
 ## Caveats
 
+- Although TarReader and the TarRegularFileReader values it yields are 
+  Send + Sync, they still share a single underlying archive stream and are 
+  intended for sequential, non-concurrent use. Read each file body to completion 
+  or drop it before advancing to the next entry. 
 - Regular file bodies are streamed. To advance to the next entry, either read
   the file body to the end or drop the file reader.
 - Library paths and example-CLI paths must be valid UTF-8.
