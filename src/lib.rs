@@ -232,6 +232,7 @@ const BLOCK_SIZE: usize = 512;
 const SKIP_BUFFER_SIZE: usize = 64 * 1024;
 const PATH_MAX: usize = 4096;
 const PAX_HEADER_MAX_SIZE: usize = 1024 * 1024;
+const PAX_GLOBAL_MAX_COUNT: usize = 256;
 
 #[cfg(feature = "smol")]
 fn poll_read_compat<R: AsyncRead + ?Sized>(
@@ -2500,7 +2501,12 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                     *this.pos,
                                 )
                             } else {
-                                *this.nxt += size;
+                                *this.nxt = this.nxt.checked_add(size).ok_or_else(|| {
+                                    Error::new(
+                                        ErrorKind::InvalidData,
+                                        "file size overflows archive position",
+                                    )
+                                })?;
                                 *this.state = Entry;
                                 (
                                     Entry::File {
@@ -2656,7 +2662,12 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             })?;
                             *this.state = Extension((size as u32, kind));
                             let padded = padded_size(size as u64);
-                            *this.nxt += padded;
+                            *this.nxt = this.nxt.checked_add(padded).ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::InvalidData,
+                                    "extension size overflows archive position",
+                                )
+                            })?;
                             if size > BLOCK_SIZE {
                                 this.ext.replace(ExtensionBuffer::new(padded as usize));
                             }
@@ -2675,7 +2686,12 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             })?;
                             *this.state = Extension((size as u32, kind));
                             let padded = padded_size(size as u64);
-                            *this.nxt += padded;
+                            *this.nxt = this.nxt.checked_add(padded).ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::InvalidData,
+                                    "extension size overflows archive position",
+                                )
+                            })?;
                             if size > BLOCK_SIZE {
                                 this.ext.replace(ExtensionBuffer::new(padded as usize));
                             }
@@ -2724,6 +2740,14 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                 this.exts.push(ExtensionHeader::PosixExtension(ext.into()));
                             }
                             Kind::PAXGlobal => {
+                                if this.globs.len() >= PAX_GLOBAL_MAX_COUNT {
+                                    return Poll::Ready(Some(Err(Error::new(
+                                        ErrorKind::InvalidData,
+                                        format!(
+                                            "too many global PAX extensions (max {PAX_GLOBAL_MAX_COUNT})"
+                                        ),
+                                    ))));
+                                }
                                 let ext = ext_as_str(this.header, *size as usize, ext)?;
                                 PosixExtension::validate(&ext)?;
                                 this.globs.push(ext.into());
@@ -2846,7 +2870,7 @@ impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
         // this may hit badly if someone ever try to use TarReader and
         // TarRegularFileReader in different treads. hopefully, no one
         // in sane mind would ever do that
-        let guard_pos = this.inner.pos.load(Ordering::Relaxed);
+        let guard_pos = this.inner.pos.load(Ordering::Acquire);
         if matches!(inner.state, Entry) && inner.pos < guard_pos {
             let this = inner.as_mut().project();
             *this.state = SkipEntry;
@@ -2985,7 +3009,7 @@ fn parse_name_field(bytes: &[u8]) -> Result<Option<Box<str>>> {
 }
 
 fn ustar_name_fits(name: &str) -> bool {
-    name.len() < 31
+    name.len() < 32
 }
 
 fn parse_octal(field: &'_ [u8]) -> std::result::Result<u64, &'_ [u8]> {

@@ -269,6 +269,27 @@ pub(crate) fn sanitize_archive_member(path: &str) -> io::Result<PathBuf> {
     Ok(PathBuf::from(normalize_relative_path(Path::new(path))?))
 }
 
+pub(crate) fn sanitize_symlink_target(target: &str) -> io::Result<&str> {
+    for component in Path::new(target).components() {
+        match component {
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("symlink target escapes destination: {target}"),
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("absolute symlink target is not allowed: {target}"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(target)
+}
+
 fn normalize_relative_path(path: &Path) -> io::Result<String> {
     let mut parts = Vec::new();
     let mut saw_cur_dir = false;
@@ -501,7 +522,8 @@ async fn run_extract(cli: Cli) -> io::Result<()> {
                 let full_path = destination.join(&relative);
                 create_parent_directories(&full_path).await?;
                 remove_existing_non_directory(&full_path).await?;
-                create_symlink(link.link(), &full_path).await?;
+                let target = sanitize_symlink_target(link.link())?;
+                create_symlink(target, &full_path).await?;
             }
             TarEntry::Link(link) => {
                 if !matches_filter(link.path(), filter.as_deref()) {

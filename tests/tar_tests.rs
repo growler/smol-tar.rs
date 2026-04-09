@@ -1377,10 +1377,57 @@ fn tar_writer_uses_ustar_symbolic_names_when_they_fit() -> Result<()> {
 }
 
 #[test]
-fn tar_writer_uses_pax_symbolic_names_when_they_do_not_fit() -> Result<()> {
+fn tar_writer_uses_ustar_symbolic_names_at_max_boundary() -> Result<()> {
     block_on_test(async {
         let uname = "u".repeat(31);
         let gname = "g".repeat(31);
+        let (writer_sink, shared) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
+        writer
+            .send(TarEntry::File(
+                TarRegularFile::new("file.txt", 0, Cursor::new(&[][..]))
+                    .with_uname(uname.clone())
+                    .with_gname(gname.clone()),
+            ))
+            .await?;
+        writer.close().await?;
+
+        let buffer = shared.lock().unwrap().clone();
+        assert!(
+            !buffer.windows(6).any(|window| window == b"uname="),
+            "31-char uname should fit in ustar header without PAX"
+        );
+        assert!(
+            !buffer.windows(6).any(|window| window == b"gname="),
+            "31-char gname should fit in ustar header without PAX"
+        );
+        assert_eq!(
+            &buffer[UNAME_START..UNAME_START + 31],
+            uname.as_bytes()
+        );
+        assert_eq!(
+            &buffer[GNAME_START..GNAME_START + 31],
+            gname.as_bytes()
+        );
+
+        let mut stream = Box::pin(TarReader::new(Cursor::new(buffer)));
+        match stream.next().await.unwrap()? {
+            TarEntry::File(file) => {
+                assert_eq!(file.uname(), uname);
+                assert_eq!(file.gname(), gname);
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn tar_writer_uses_pax_symbolic_names_when_they_do_not_fit() -> Result<()> {
+    block_on_test(async {
+        let uname = "u".repeat(32);
+        let gname = "g".repeat(32);
         let (writer_sink, shared) = VecAsyncWriter::new();
         let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
         writer
@@ -1790,6 +1837,27 @@ fn reader_rejects_oversized_pax_extension() {
         Cursor::new(archive),
         ErrorKind::InvalidData,
         "PAX extension exceeds",
+    );
+}
+
+#[test]
+fn reader_rejects_too_many_global_pax_extensions() {
+    let mut archive = Vec::new();
+    let record = pax_record_bytes("SCHILY.xattr.user.x", b"val");
+    for _ in 0..257 {
+        append_pax_entry(&mut archive, b'g', &record);
+    }
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+
+    assert_archive_error(
+        Cursor::new(archive),
+        ErrorKind::InvalidData,
+        "too many global PAX extensions",
     );
 }
 
@@ -2412,6 +2480,25 @@ fn reader_rejects_invalid_pax_numeric_metadata() {
         Cursor::new(archive),
         ErrorKind::InvalidData,
         "PAX uid value out of range",
+    );
+}
+
+#[test]
+fn reader_rejects_pax_size_causing_position_overflow() {
+    let mut archive = Vec::new();
+    let payload = pax_record_bytes("size", u64::MAX.to_string().as_bytes());
+    append_pax_entry(&mut archive, b'x', &payload);
+    append_entry(
+        &mut archive,
+        build_header(b"overflow.bin", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+
+    assert_archive_error(
+        Cursor::new(archive),
+        ErrorKind::InvalidData,
+        "file size overflows archive position",
     );
 }
 

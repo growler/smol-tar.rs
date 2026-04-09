@@ -9,7 +9,9 @@ use std::{
 };
 
 use futures::SinkExt;
-use smol_tar::{TarDirectory, TarEntry, TarLink, TarReader, TarRegularFile, TarWriter};
+use smol_tar::{
+    TarDirectory, TarEntry, TarLink, TarReader, TarRegularFile, TarSymlink, TarWriter,
+};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -464,5 +466,98 @@ fn list_continues_after_zero_length_file() -> io::Result<()> {
     assert!(stdout.contains("tree/\n"));
     assert!(stdout.contains("tree/.lock\n"));
     assert!(stdout.contains("tree/after.txt\n"));
+    Ok(())
+}
+
+fn build_symlink_escape_archive(path: &Path) -> io::Result<()> {
+    run_async(async move {
+        let file = create_archive_file(path).await?;
+        let mut writer: TarWriter<'_, '_, _, ArchiveCursor> = TarWriter::new(file);
+        writer
+            .send(TarEntry::from(TarDirectory::new("tree/")))
+            .await?;
+        writer
+            .send(TarEntry::from(TarSymlink::new(
+                "tree/escape",
+                "../../../etc/passwd",
+            )))
+            .await?;
+        writer.close().await?;
+        Ok::<_, io::Error>(())
+    })?
+}
+
+#[test]
+fn extract_rejects_symlink_with_parent_traversal_target() -> io::Result<()> {
+    let temp = TempDir::new()?;
+    let archive = temp.path().join("symlink-escape.tar");
+    build_symlink_escape_archive(&archive)?;
+
+    let dest = temp.path().join("dest");
+    fs::create_dir_all(&dest)?;
+    let output = run_command(
+        temp.path(),
+        &[
+            "-xf",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert!(
+        !output.status.success(),
+        "extraction should fail for symlink with parent traversal target"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("symlink target escapes destination"),
+        "expected symlink escape error, got: {stderr}"
+    );
+    Ok(())
+}
+
+fn build_absolute_symlink_archive(path: &Path) -> io::Result<()> {
+    run_async(async move {
+        let file = create_archive_file(path).await?;
+        let mut writer: TarWriter<'_, '_, _, ArchiveCursor> = TarWriter::new(file);
+        writer
+            .send(TarEntry::from(TarDirectory::new("tree/")))
+            .await?;
+        writer
+            .send(TarEntry::from(TarSymlink::new("tree/abs", "/etc/passwd")))
+            .await?;
+        writer.close().await?;
+        Ok::<_, io::Error>(())
+    })?
+}
+
+#[test]
+fn extract_rejects_symlink_with_absolute_target() -> io::Result<()> {
+    let temp = TempDir::new()?;
+    let archive = temp.path().join("symlink-abs.tar");
+    build_absolute_symlink_archive(&archive)?;
+
+    let dest = temp.path().join("dest");
+    fs::create_dir_all(&dest)?;
+    let output = run_command(
+        temp.path(),
+        &[
+            "-xf",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert!(
+        !output.status.success(),
+        "extraction should fail for symlink with absolute target"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("absolute symlink target is not allowed"),
+        "expected absolute symlink error, got: {stderr}"
+    );
     Ok(())
 }
