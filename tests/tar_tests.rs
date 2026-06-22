@@ -1809,6 +1809,73 @@ fn reader_rejects_data_after_first_zero_block() {
 }
 
 #[test]
+fn reader_drains_trailing_zero_padding_to_eof() -> Result<()> {
+    block_on_test(async {
+        let mut archive = Vec::new();
+        append_entry(
+            &mut archive,
+            build_header(b"file.txt", b'0', 5, HeaderFlavor::Ustar),
+            b"hello",
+        );
+        append_eof(&mut archive);
+        // Trailing zero padding past the two-block marker (e.g. record padding).
+        archive.extend_from_slice(&[0u8; BLOCK_SIZE * 4]);
+        let total = archive.len();
+
+        let mut cursor = Cursor::new(archive);
+        {
+            let mut stream = Box::pin(TarReader::new(&mut cursor));
+            match stream.next().await.unwrap()? {
+                TarEntry::File(mut file) => {
+                    assert_eq!(file.path(), "file.txt");
+                    let mut data = Vec::new();
+                    file.read_to_end(&mut data).await?;
+                    assert_eq!(data, b"hello");
+                }
+                other => panic!("expected file entry, got {:?}", other),
+            }
+            assert!(stream.next().await.is_none());
+        }
+        // The reader must consume the whole stream, not stop at the marker.
+        assert_eq!(cursor.position() as usize, total);
+        Ok(())
+    })
+}
+
+#[test]
+fn reader_drains_trailing_garbage_to_eof() -> Result<()> {
+    block_on_test(async {
+        let mut archive = Vec::new();
+        append_entry(
+            &mut archive,
+            build_header(b"file.txt", b'0', 5, HeaderFlavor::Ustar),
+            b"hello",
+        );
+        append_eof(&mut archive);
+        // Non-zero trailing bytes past the marker are discarded, not rejected.
+        archive.extend_from_slice(&[0xABu8; 100]);
+        let total = archive.len();
+
+        let mut cursor = Cursor::new(archive);
+        {
+            let mut stream = Box::pin(TarReader::new(&mut cursor));
+            match stream.next().await.unwrap()? {
+                TarEntry::File(mut file) => {
+                    assert_eq!(file.path(), "file.txt");
+                    let mut data = Vec::new();
+                    file.read_to_end(&mut data).await?;
+                    assert_eq!(data, b"hello");
+                }
+                other => panic!("expected file entry, got {:?}", other),
+            }
+            assert!(stream.next().await.is_none());
+        }
+        assert_eq!(cursor.position() as usize, total);
+        Ok(())
+    })
+}
+
+#[test]
 fn reader_rejects_oversized_gnu_long_name() {
     let mut archive = Vec::new();
     archive.extend_from_slice(&build_header(

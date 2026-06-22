@@ -877,6 +877,7 @@ enum State {
     Padding,
     Eof,
     Eoff,
+    Done,
 }
 use State::*;
 
@@ -2838,23 +2839,29 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                     if remaining > n {
                         continue;
                     }
-                    return Poll::Ready(if hdr.is_zero() {
+                    if hdr.is_zero() {
+                        // Two zero blocks confirm end of archive; drain the
+                        // rest of the source before signalling EOF.
                         *this.state = Eoff;
-                        None
-                    } else {
-                        *this.state = Eoff;
-                        Some(Err(Error::new(
-                            ErrorKind::InvalidData,
-                            "unexpected data after first zero block",
-                        )))
-                    });
-                }
-                Eoff => {
+                        continue;
+                    }
                     return Poll::Ready(Some(Err(Error::new(
                         ErrorKind::InvalidData,
-                        "unexpected read after EOF",
+                        "unexpected data after first zero block",
                     ))));
                 }
+                Eoff => {
+                    // Discard everything after the end-of-archive marker until
+                    // the underlying reader reaches a real EOF.
+                    let (hdr, reader) = (&mut this.header, &mut this.reader);
+                    let n = ready_opt!(poll_read_compat(pin!(reader), ctx, hdr.buf_mut(..)));
+                    if n == 0 {
+                        *this.state = Done;
+                        return Poll::Ready(None);
+                    }
+                    continue;
+                }
+                Done => return Poll::Ready(None),
             }
         }
     }
