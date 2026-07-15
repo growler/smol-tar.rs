@@ -77,17 +77,17 @@ fn write_text(path: &Path, text: &str) -> io::Result<()> {
     fs::write(path, text)
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 type ArchiveFile = smol::fs::File;
 #[cfg(feature = "tokio")]
 type ArchiveFile = tokio::fs::File;
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 type ArchiveCursor = futures_lite::io::Cursor<Vec<u8>>;
 #[cfg(feature = "tokio")]
 type ArchiveCursor = std::io::Cursor<Vec<u8>>;
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 fn run_async<F>(future: F) -> io::Result<F::Output>
 where
     F: std::future::Future,
@@ -107,7 +107,7 @@ where
         .block_on(future))
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 async fn open_archive_file(path: &Path) -> io::Result<ArchiveFile> {
     smol::fs::File::open(path).await
 }
@@ -117,7 +117,7 @@ async fn open_archive_file(path: &Path) -> io::Result<ArchiveFile> {
     tokio::fs::File::open(path).await
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 async fn create_archive_file(path: &Path) -> io::Result<ArchiveFile> {
     smol::fs::File::create(path).await
 }
@@ -127,7 +127,7 @@ async fn create_archive_file(path: &Path) -> io::Result<ArchiveFile> {
     tokio::fs::File::create(path).await
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 use futures_lite::StreamExt as _;
 #[cfg(feature = "tokio")]
 use tokio_stream::StreamExt as _;

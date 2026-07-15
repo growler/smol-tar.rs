@@ -3,7 +3,7 @@ compile_error!("features `smol` and `tokio` are mutually exclusive");
 #[cfg(not(any(feature = "smol", feature = "tokio")))]
 compile_error!("either feature `smol` or `tokio` must be enabled");
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 use ::smol::fs::{
     self,
     unix::{symlink, FileTypeExt, MetadataExt, PermissionsExt},
@@ -20,7 +20,7 @@ use ::tokio::{
 };
 #[cfg(feature = "tokio")]
 use futures::SinkExt;
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 use futures::{
     executor::block_on,
     io::{copy, AllowStdIo, AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -365,7 +365,7 @@ pub(crate) fn matches_filter(path: &str, filter: Option<&str>) -> bool {
 }
 
 fn run(cli: Cli) -> io::Result<()> {
-    #[cfg(feature = "smol")]
+    #[cfg(all(feature = "smol", not(feature = "tokio")))]
     {
         return block_on(run_async(cli));
     }
@@ -680,12 +680,12 @@ async fn open_archive_writer(archive: &OsString) -> io::Result<Box<dyn AsyncWrit
     Ok(Box::new(File::create(PathBuf::from(archive)).await?))
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 fn stdin_archive_reader() -> Box<dyn AsyncRead + Unpin + Send> {
     Box::new(AllowStdIo::new(io::stdin()))
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 fn stdout_archive_writer() -> Box<dyn AsyncWrite + Unpin + Send> {
     Box::new(AllowStdIo::new(io::stdout()))
 }
@@ -700,7 +700,7 @@ fn stdout_archive_writer() -> Box<dyn AsyncWrite + Unpin + Send> {
     Box::new(::tokio::io::stdout())
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 async fn collect_directory_children(fs_path: &Path) -> io::Result<Vec<(String, PathBuf)>> {
     let mut children = Vec::new();
     let mut read_dir = fs::read_dir(fs_path).await?;
@@ -735,7 +735,7 @@ async fn collect_directory_children(fs_path: &Path) -> io::Result<Vec<(String, P
     Ok(children)
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 fn unix_meta(metadata: &fs::Metadata) -> UnixMeta {
     let raw_mtime = metadata.mtime();
     let mtime = if raw_mtime < 0 {
@@ -814,7 +814,7 @@ async fn remove_existing_non_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 async fn create_symlink(target: &str, path: &Path) -> io::Result<()> {
     symlink(target, path).await
 }
@@ -824,7 +824,7 @@ async fn create_symlink(target: &str, path: &Path) -> io::Result<()> {
     fs::symlink(target, path).await
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 async fn finalize_extracted_file<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
     writer.close().await
 }
@@ -841,7 +841,7 @@ async fn set_mode_and_mtime(path: &Path, mode: u32, mtime: SystemTime) -> io::Re
     Ok(())
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 fn permissions_from_mode(mode: u32) -> fs::Permissions {
     fs::Permissions::from_mode(mode)
 }

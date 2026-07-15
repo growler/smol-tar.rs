@@ -10,9 +10,9 @@ use std::{
 
 use futures::Sink;
 use futures::{future, SinkExt, TryStreamExt};
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 use smol::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 use smol::{io::Cursor, stream::StreamExt};
 use smol_tar::{
     AttrList, TarDevice, TarDirectory, TarEntry, TarFifo, TarLink, TarReader, TarRegularFile,
@@ -40,7 +40,7 @@ fn ts(secs: i64, nanos: u32) -> SystemTime {
     }
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 fn block_on_test<F: Future>(fut: F) -> F::Output {
     smol::block_on(fut)
 }
@@ -53,16 +53,16 @@ fn block_on_test<F: Future>(fut: F) -> F::Output {
         .block_on(fut)
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 type FixtureFile = smol::fs::File;
 #[cfg(feature = "tokio")]
 type FixtureFile = tokio::fs::File;
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 type TestCursor<T> = futures::io::Cursor<T>;
 #[cfg(feature = "tokio")]
 type TestCursor<T> = std::io::Cursor<T>;
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 async fn open_fixture_file(name: &str) -> Result<FixtureFile> {
     smol::fs::File::open(fixture(name)).await
 }
@@ -129,7 +129,7 @@ impl<R> ChunkedReader<R> {
     }
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 impl<R: AsyncRead + Unpin> AsyncRead for ChunkedReader<R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -186,7 +186,7 @@ impl ChunkedAsyncWriter {
 
 struct ZeroWriter;
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 impl AsyncWrite for ZeroWriter {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -224,7 +224,7 @@ impl AsyncWrite for ZeroWriter {
     }
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 impl AsyncWrite for ChunkedAsyncWriter {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -634,7 +634,7 @@ impl VecAsyncWriter {
     }
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 impl AsyncWrite for VecAsyncWriter {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,

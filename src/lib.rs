@@ -35,12 +35,12 @@
 //! Reading an archive:
 //!
 //! ```rust
-//! # #[cfg(feature = "smol")]
+//! # #[cfg(all(feature = "smol", not(feature = "tokio")))]
 //! # use smol::{stream::StreamExt, io::{copy, sink, Cursor}};
 //! # #[cfg(feature = "tokio")]
 //! # use { std::io::Cursor, tokio_stream::StreamExt, tokio::io::{copy, sink} };
 //! use smol_tar::{TarEntry, TarReader};
-//! # #[cfg(feature = "smol")]
+//! # #[cfg(all(feature = "smol", not(feature = "tokio")))]
 //! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 //! #   smol::block_on(fut)
 //! # }
@@ -74,12 +74,12 @@
 //! Writing an archive:
 //!
 //! ```rust
-//! # #[cfg(feature = "smol")]
+//! # #[cfg(all(feature = "smol", not(feature = "tokio")))]
 //! # use smol::io::Cursor;
 //! # #[cfg(feature = "tokio")]
 //! # use { std::io::Cursor, tokio_stream::StreamExt };
 //! use smol_tar::{TarDirectory, TarEntry, TarRegularFile, TarWriter};
-//! # #[cfg(feature = "smol")]
+//! # #[cfg(all(feature = "smol", not(feature = "tokio")))]
 //! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 //! #   smol::future::block_on(fut)
 //! # }
@@ -110,7 +110,7 @@
 //! [`Sink`] interface:
 //!
 //! ```rust
-//! # #[cfg(feature = "smol")]
+//! # #[cfg(all(feature = "smol", not(feature = "tokio")))]
 //! # use smol::io::Cursor;
 //! # #[cfg(feature = "tokio")]
 //! # use std::io::Cursor;
@@ -118,7 +118,7 @@
 //!     smol_tar::{TarDirectory, TarEntry, TarReader, TarRegularFile, TarWriter},
 //!     futures::{future, SinkExt, StreamExt, TryStreamExt},
 //! };
-//! # #[cfg(feature = "smol")]
+//! # #[cfg(all(feature = "smol", not(feature = "tokio")))]
 //! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 //! #   smol::future::block_on(fut)
 //! # }
@@ -195,8 +195,6 @@
 //! - Sparse files and multi-volume archives
 //!
 
-#[cfg(all(feature = "smol", feature = "tokio"))]
-compile_error!("features `smol` and `tokio` are mutually exclusive");
 #[cfg(not(any(feature = "smol", feature = "tokio")))]
 compile_error!("either feature `smol` or `tokio` must be enabled");
 
@@ -217,7 +215,7 @@ use {
     },
 };
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 use {
     async_lock::Mutex,
     futures_io::{AsyncRead, AsyncWrite},
@@ -234,7 +232,7 @@ const PATH_MAX: usize = 4096;
 const PAX_HEADER_MAX_SIZE: usize = 1024 * 1024;
 const PAX_GLOBAL_MAX_COUNT: usize = 256;
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 fn poll_read_compat<R: AsyncRead + ?Sized>(
     reader: Pin<&mut R>,
     cx: &mut Context<'_>,
@@ -257,7 +255,7 @@ fn poll_read_compat<R: AsyncRead + ?Sized>(
     }
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 fn poll_close_compat<W: AsyncWrite + ?Sized>(
     writer: Pin<&mut W>,
     cx: &mut Context<'_>,
@@ -1012,7 +1010,7 @@ impl<R: AsyncRead> Drop for TarRegularFileReader<'_, R> {
     }
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -1050,12 +1048,12 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 /// # Example
 ///
 /// ```rust
-/// # #[cfg(feature = "smol")]
+/// # #[cfg(all(feature = "smol", not(feature = "tokio")))]
 /// # use { smol::{ stream::StreamExt, io::{copy, sink, Cursor} } };
 /// # #[cfg(feature = "tokio")]
 /// # use { std::io::Cursor, tokio_stream::StreamExt, tokio::io::{copy, sink} };
 /// use smol_tar::{TarEntry, TarReader};
-/// # #[cfg(feature = "smol")]
+/// # #[cfg(all(feature = "smol", not(feature = "tokio")))]
 /// # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 /// #   smol::block_on(fut)
 /// # }
@@ -2944,7 +2942,7 @@ impl<'a, R: AsyncRead + 'a> TarEntry<'a, R> {
     }
 }
 
-#[cfg(feature = "smol")]
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 impl<'a, R: AsyncRead + 'a> AsyncRead for TarRegularFile<'a, R> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -3373,7 +3371,7 @@ pin_project! {
     /// # Example
     ///
     /// ```rust
-    /// # #[cfg(feature = "smol")]
+    /// # #[cfg(all(feature = "smol", not(feature = "tokio")))]
     /// # use {
     /// #     smol::io::{Cursor, Empty},
     /// # };
@@ -3384,7 +3382,7 @@ pin_project! {
     /// # };
     /// use smol_tar::{TarDirectory, TarEntry, TarWriter};
     ///
-    /// # #[cfg(feature = "smol")]
+    /// # #[cfg(all(feature = "smol", not(feature = "tokio")))]
     /// # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     /// #   smol::future::block_on(fut)
     /// # }
@@ -3587,7 +3585,7 @@ mod tests {
     use super::*;
     use static_assertions::{assert_eq_align, assert_eq_size, assert_impl_all, assert_obj_safe};
 
-    #[cfg(feature = "smol")]
+    #[cfg(all(feature = "smol", not(feature = "tokio")))]
     type AssertFile = smol::fs::File;
     #[cfg(feature = "tokio")]
     type AssertFile = tokio::fs::File;
