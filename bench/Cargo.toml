@@ -1,0 +1,33 @@
+[package]
+name = "smol-tar-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["smol"]
+smol = ["smol-tar/smol", "dep:smol", "dep:async-tar", "async-tar/runtime-async-std"]
+tokio = [
+    "smol-tar/tokio",
+    "dep:tokio",
+    "dep:async-tar",
+    "async-tar/runtime-tokio",
+    "dep:astral-tokio-tar",
+]
+
+[dependencies]
+smol-tar = { path = "..", default-features = false }
+futures = "0.3"
+tar = { version = "0.4.46", default-features = false }
+smol = { version = "2", optional = true }
+async-tar = { version = "0.6.1", default-features = false, optional = true }
+tokio = { version = "1", optional = true, features = ["io-util", "rt"] }
+astral-tokio-tar = { version = "0.7.0", default-features = false, optional = true }
+
+[dev-dependencies]
+divan = "0.1.21"
+dhat = "0.3.3"
+
+[[bench]]
+name = "tar"
+harness = false
