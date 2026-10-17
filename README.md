@@ -77,7 +77,8 @@ you enable both features, the crate uses the `tokio` traits.
    body, such as directories, set `R` explicitly, for example with the
    `Empty` type of `smol::io` or `tokio::io`:
    `TarWriter::<_, Empty>::new(destination)`.
-6. Paths, link targets, and user and group names are UTF-8 strings.
+6. Paths, link targets, and user and group names are UTF-8 strings. Extended
+   attribute names are UTF-8 strings. Extended attribute values are bytes.
 
 ## Errors
 

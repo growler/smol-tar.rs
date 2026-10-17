@@ -239,6 +239,8 @@
 //!
 //! Entry paths, link targets, and user and group names are UTF-8 strings. The
 //! reader returns an [`InvalidData`] error for a name that is not valid UTF-8.
+//! Extended attribute names are UTF-8 strings. Extended attribute values are
+//! bytes.
 //!
 //! # Limits
 //!
@@ -423,14 +425,6 @@ impl Header {
         I: core::slice::SliceIndex<[u8], Output = [u8]>,
     {
         &self.record[range]
-    }
-    fn as_str<I>(&self, range: I) -> Result<Box<str>>
-    where
-        I: core::slice::SliceIndex<[u8], Output = [u8]>,
-    {
-        from_utf8(self.buf(range))
-            .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
-            .map(|p| p.to_string().into_boxed_str())
     }
     fn as_null_terminated_str<I>(&self, range: I) -> Result<Box<str>>
     where
@@ -940,26 +934,20 @@ enum State {
 use State::*;
 
 struct PosixExtension {
-    inner: Box<str>,
+    inner: Box<[u8]>,
 }
 impl PosixExtension {
-    fn validate(ext: &str) -> Result<()> {
+    fn validate(ext: &[u8]) -> Result<()> {
         parse_pax_records(ext, |_, _| Ok(()))
     }
-    fn for_each_record(&self, cb: impl FnMut(&str, &str) -> Result<()>) -> Result<()> {
+    fn for_each_record(&self, cb: impl FnMut(&str, &[u8]) -> Result<()>) -> Result<()> {
         parse_pax_records(&self.inner, cb)
     }
 }
 
-impl From<Box<str>> for PosixExtension {
-    fn from(s: Box<str>) -> Self {
+impl From<Box<[u8]>> for PosixExtension {
+    fn from(s: Box<[u8]>) -> Self {
         Self { inner: s }
-    }
-}
-impl std::ops::Deref for PosixExtension {
-    type Target = str;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
     }
 }
 
@@ -967,17 +955,6 @@ enum ExtensionHeader {
     LongName(Box<str>),
     LongLink(Box<str>),
     PosixExtension(PosixExtension),
-}
-
-impl std::ops::Deref for ExtensionHeader {
-    type Target = str;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            ExtensionHeader::LongName(name) => name,
-            ExtensionHeader::LongLink(name) => name,
-            ExtensionHeader::PosixExtension(pax) => pax,
-        }
-    }
 }
 
 struct ExtensionBuffer {
@@ -990,13 +967,9 @@ impl ExtensionBuffer {
             buf: Vec::<u8>::with_capacity(size),
         }
     }
-    fn as_str<I>(&self, range: I) -> Result<Box<str>>
-    where
-        I: core::slice::SliceIndex<[u8], Output = [u8]>,
-    {
-        from_utf8(&self.buf[range])
-            .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
-            .map(|p| p.to_string().into_boxed_str())
+    fn into_bytes(mut self, size: usize) -> Box<[u8]> {
+        self.buf.truncate(size);
+        self.buf.into_boxed_slice()
     }
     fn as_null_terminated_str<I>(&self, range: I) -> Result<Box<str>>
     where
@@ -2299,11 +2272,18 @@ fn ext_as_path(hdr: &Header, size: usize, ext: &Option<ExtensionBuffer>) -> Resu
         ext.as_ref().unwrap().as_null_terminated_str(..size)
     }
 }
-fn ext_as_str(hdr: &Header, size: usize, ext: &Option<ExtensionBuffer>) -> Result<Box<str>> {
+fn ext_bytes<'a>(hdr: &'a Header, size: usize, ext: &'a Option<ExtensionBuffer>) -> &'a [u8] {
     if size <= BLOCK_SIZE {
-        hdr.as_str(..size)
+        hdr.buf(..size)
     } else {
-        ext.as_ref().unwrap().as_str(..size)
+        &ext.as_ref().unwrap().buf[..size]
+    }
+}
+fn ext_as_bytes(hdr: &Header, size: usize, ext: &mut Option<ExtensionBuffer>) -> Box<[u8]> {
+    if size <= BLOCK_SIZE {
+        hdr.buf(..size).into()
+    } else {
+        ext.take().unwrap().into_bytes(size)
     }
 }
 
@@ -2336,31 +2316,35 @@ fn take_pax_info(exts: &mut Vec<ExtensionHeader>, globs: &[PosixExtension]) -> R
 
 fn apply_pax_extension(ext: &PosixExtension, info: &mut PaxInfo) -> Result<()> {
     ext.for_each_record(|key, val| {
-        if key == "path" {
-            info.path = Some(val.to_string().into_boxed_str());
+        if let Some(name) = key.strip_prefix("SCHILY.xattr.") {
+            attr_set(&mut info.attrs, name, val);
+        } else if key == "path" {
+            info.path = Some(pax_str(val)?.to_string().into_boxed_str());
         } else if key == "linkpath" {
-            info.linkpath = Some(val.to_string().into_boxed_str());
+            info.linkpath = Some(pax_str(val)?.to_string().into_boxed_str());
         } else if key == "atime" {
-            info.atime = Some(parse_pax_time(val)?);
+            info.atime = Some(parse_pax_time(pax_str(val)?)?);
         } else if key == "ctime" {
-            info.ctime = Some(parse_pax_time(val)?);
+            info.ctime = Some(parse_pax_time(pax_str(val)?)?);
         } else if key == "mtime" {
-            info.mtime = Some(parse_pax_time(val)?);
+            info.mtime = Some(parse_pax_time(pax_str(val)?)?);
         } else if key == "size" {
-            info.size = Some(parse_pax_u64(val, "size")?);
+            info.size = Some(parse_pax_u64(pax_str(val)?, "size")?);
         } else if key == "uid" {
-            info.uid = Some(parse_pax_u32(val, "uid")?);
+            info.uid = Some(parse_pax_u32(pax_str(val)?, "uid")?);
         } else if key == "gid" {
-            info.gid = Some(parse_pax_u32(val, "gid")?);
+            info.gid = Some(parse_pax_u32(pax_str(val)?, "gid")?);
         } else if key == "uname" {
-            info.uname = Some(val.to_string().into_boxed_str());
+            info.uname = Some(pax_str(val)?.to_string().into_boxed_str());
         } else if key == "gname" {
-            info.gname = Some(val.to_string().into_boxed_str());
-        } else if let Some(name) = key.strip_prefix("SCHILY.xattr.") {
-            attr_set(&mut info.attrs, name, val.as_bytes());
+            info.gname = Some(pax_str(val)?.to_string().into_boxed_str());
         }
         Ok(())
     })
+}
+
+fn pax_str(val: &[u8]) -> Result<&str> {
+    from_utf8(val).map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
 }
 
 fn parse_pax_u64(val: &str, key: &str) -> Result<u64> {
@@ -2464,23 +2448,26 @@ fn format_pax_time(time: SystemTime) -> String {
 }
 
 fn parse_pax_records<'a>(
-    mut ext: &'a str,
-    mut cb: impl FnMut(&'a str, &'a str) -> Result<()>,
+    mut ext: &'a [u8],
+    mut cb: impl FnMut(&'a str, &'a [u8]) -> Result<()>,
 ) -> Result<()> {
     while !ext.is_empty() {
-        let space_pos = ext.find(' ').ok_or_else(|| {
+        let space_pos = ext.iter().position(|&b| b == b' ').ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidData,
                 "malformed PAX record: missing length separator",
             )
         })?;
-        let len = ext[..space_pos].parse::<usize>().map_err(|_| {
-            Error::new(
-                ErrorKind::InvalidData,
-                "malformed PAX record: invalid length",
-            )
-        })?;
-        if len == 0 || len > ext.len() || len <= space_pos + 2 || !ext.is_char_boundary(len) {
+        let len = from_utf8(&ext[..space_pos])
+            .ok()
+            .and_then(|len| len.parse::<usize>().ok())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "malformed PAX record: invalid length",
+                )
+            })?;
+        if len == 0 || len > ext.len() || len <= space_pos + 2 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "malformed PAX record: invalid length",
@@ -2488,17 +2475,19 @@ fn parse_pax_records<'a>(
         }
         let record = &ext[..len];
         ext = &ext[len..];
-        if !record.ends_with('\n') {
+        if !record.ends_with(b"\n") {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "malformed PAX record: missing trailing newline",
             ));
         }
         let payload = &record[space_pos + 1..len - 1];
-        let eq_pos = payload.find('=').ok_or_else(|| {
+        let eq_pos = payload.iter().position(|&b| b == b'=').ok_or_else(|| {
             Error::new(ErrorKind::InvalidData, "malformed PAX record: missing '='")
         })?;
-        cb(&payload[..eq_pos], &payload[eq_pos + 1..])?;
+        let key = from_utf8(&payload[..eq_pos])
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "malformed PAX record: invalid key"))?;
+        cb(key, &payload[eq_pos + 1..])?;
     }
     Ok(())
 }
@@ -2776,7 +2765,16 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                         }
                         Kind::GNULongName | Kind::GNULongLink if this.header.is_gnu() => {
                             let size = this.header.size().and_then(|size| {
-                                if size > PATH_MAX as u64 {
+                                if size == 0 {
+                                    Err(Error::new(
+                                        ErrorKind::InvalidData,
+                                        if kind == Kind::GNULongName {
+                                            "empty GNU long name"
+                                        } else {
+                                            "empty GNU long link"
+                                        },
+                                    ))
+                                } else if size > PATH_MAX as u64 {
                                     Err(Error::new(
                                         ErrorKind::InvalidData,
                                         format!("long filename exceeds {PATH_MAX} bytes"),
@@ -2806,27 +2804,30 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                 }
                 Extension((size, kind)) => {
                     let (ext, reader) = (&mut this.ext, &mut this.reader);
-                    let n = if *size as usize <= BLOCK_SIZE {
-                        let remaining = *this.nxt - *this.pos;
-                        let filled = BLOCK_SIZE - remaining as usize;
-                        let (hdr, reader) = (&mut this.header, &mut this.reader);
-                        ready_opt!(poll_read_compat(pin!(reader), ctx, hdr.buf_mut(filled..)))
-                    } else {
-                        let buf = ext.as_mut().unwrap();
-                        let n = ready_opt!(poll_read_compat(pin!(reader), ctx, unsafe {
-                            buf.remaining_buf()
-                        }));
-                        unsafe { buf.advance(n) };
-                        n
-                    };
-                    *this.pos += if n == 0 {
-                        Err(Error::new(
-                            ErrorKind::UnexpectedEof,
-                            "unexpected end of tar file",
-                        ))
-                    } else {
-                        Ok(n as u64)
-                    }?;
+                    // An extension with size 0 has no data blocks to read.
+                    if *this.pos < *this.nxt {
+                        let n = if *size as usize <= BLOCK_SIZE {
+                            let remaining = *this.nxt - *this.pos;
+                            let filled = BLOCK_SIZE - remaining as usize;
+                            let (hdr, reader) = (&mut this.header, &mut this.reader);
+                            ready_opt!(poll_read_compat(pin!(reader), ctx, hdr.buf_mut(filled..)))
+                        } else {
+                            let buf = ext.as_mut().unwrap();
+                            let n = ready_opt!(poll_read_compat(pin!(reader), ctx, unsafe {
+                                buf.remaining_buf()
+                            }));
+                            unsafe { buf.advance(n) };
+                            n
+                        };
+                        *this.pos += if n == 0 {
+                            Err(Error::new(
+                                ErrorKind::UnexpectedEof,
+                                "unexpected end of tar file",
+                            ))
+                        } else {
+                            Ok(n as u64)
+                        }?;
+                    }
                     if *this.pos == *this.nxt {
                         match kind {
                             Kind::GNULongName => this.exts.push(ExtensionHeader::LongName(
@@ -2836,8 +2837,12 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                 ext_as_path(this.header, *size as usize, ext)?,
                             )),
                             Kind::PAXLocal => {
-                                let ext = ext_as_str(this.header, *size as usize, ext)?;
-                                PosixExtension::validate(&ext)?;
+                                PosixExtension::validate(ext_bytes(
+                                    this.header,
+                                    *size as usize,
+                                    ext,
+                                ))?;
+                                let ext = ext_as_bytes(this.header, *size as usize, ext);
                                 this.exts.push(ExtensionHeader::PosixExtension(ext.into()));
                             }
                             Kind::PAXGlobal => {
@@ -2849,8 +2854,12 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                         ),
                                     ))));
                                 }
-                                let ext = ext_as_str(this.header, *size as usize, ext)?;
-                                PosixExtension::validate(&ext)?;
+                                PosixExtension::validate(ext_bytes(
+                                    this.header,
+                                    *size as usize,
+                                    ext,
+                                ))?;
+                                let ext = ext_as_bytes(this.header, *size as usize, ext);
                                 this.globs.push(ext.into());
                             }
                             _ => unreachable!(),
@@ -3781,17 +3790,19 @@ mod tests {
 
     #[test]
     fn posix_extension_and_kind_helpers_are_exercised() {
-        let ext = PosixExtension::from("13 path=file\n".to_string().into_boxed_str());
-        assert_eq!(&*ext, "13 path=file\n");
-
-        let long_name = ExtensionHeader::LongName("name".to_string().into_boxed_str());
-        assert_eq!(&*long_name, "name");
-
-        let long_link = ExtensionHeader::LongLink("link".to_string().into_boxed_str());
-        assert_eq!(&*long_link, "link");
+        let ext = PosixExtension::from(b"13 path=file\n".to_vec().into_boxed_slice());
+        let mut records = Vec::new();
+        ext.for_each_record(|key, val| {
+            records.push((key.to_string(), val.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(records, [("path".to_string(), b"file".to_vec())]);
 
         let pax = ExtensionHeader::PosixExtension(ext);
-        assert_eq!(&*pax, "13 path=file\n");
+        assert!(
+            matches!(&pax, ExtensionHeader::PosixExtension(ext) if &*ext.inner == b"13 path=file\n")
+        );
 
         for (kind, expected) in [
             (Kind::File, "regular file"),

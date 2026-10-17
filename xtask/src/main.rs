@@ -78,6 +78,11 @@ fn gen_fuzz_seeds() -> io::Result<()> {
     )?;
     write_seed(
         &out_dir,
+        "seed_pax_binary_xattr.tar",
+        seed_pax_binary_xattr(),
+    )?;
+    write_seed(
+        &out_dir,
         "seed_pax_overrides_gnu_times.tar",
         seed_pax_overrides_gnu_times(),
     )?;
@@ -220,6 +225,19 @@ fn seed_pax_xattr_precedence() -> Vec<u8> {
     append_entry(
         &mut archive,
         build_header(b"second.txt", b'0', 0, HeaderFlavor::Ustar),
+        b"",
+    );
+    append_eof(&mut archive);
+    archive
+}
+
+fn seed_pax_binary_xattr() -> Vec<u8> {
+    let mut archive = Vec::new();
+    let local = pax_record_bytes("SCHILY.xattr.user.binary", b"\x00\xff\x80\n");
+    append_pax_entry(&mut archive, b'x', &local);
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
         b"",
     );
     append_eof(&mut archive);

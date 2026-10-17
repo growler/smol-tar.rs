@@ -1205,6 +1205,35 @@ fn tar_reader_reads_xattrs() -> Result<()> {
 }
 
 #[test]
+fn reader_accepts_binary_xattr_value() -> Result<()> {
+    block_on_test(async {
+        let (writer_sink, shared) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
+        let attrs = AttrList::new().with("user.binary", b"\x00\xff\x80\n".as_slice());
+        writer
+            .send(TarEntry::File(
+                TarRegularFile::new("file.txt", 0, Cursor::new(&[][..]))
+                    .with_mtime(ts(1, 0))
+                    .with_attrs(attrs),
+            ))
+            .await?;
+        writer.close().await?;
+
+        let buffer = shared.lock().unwrap().clone();
+        let cursor = Cursor::new(buffer);
+        let reader = TarReader::new(cursor);
+        let mut stream = Box::pin(reader);
+        match stream.next().await.unwrap()? {
+            TarEntry::File(file) => {
+                assert_attrs_eq(file.attrs(), &[("user.binary", b"\x00\xff\x80\n")]);
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn tar_writer_round_trip_extended_pax_metadata() -> Result<()> {
     block_on_test(async {
         let (writer_sink, shared) = VecAsyncWriter::new();
@@ -1962,6 +1991,25 @@ fn reader_rejects_oversized_gnu_long_name() {
 }
 
 #[test]
+fn reader_rejects_empty_gnu_long_name_and_link() {
+    for (typeflag, expected) in [(b'L', "empty GNU long name"), (b'K', "empty GNU long link")] {
+        let mut archive = Vec::new();
+        append_entry(
+            &mut archive,
+            build_header(b"././@LongLink", typeflag, 0, HeaderFlavor::Gnu),
+            &[],
+        );
+        append_entry(
+            &mut archive,
+            build_header(b"file.txt", b'0', 0, HeaderFlavor::Gnu),
+            &[],
+        );
+        append_eof(&mut archive);
+        assert_archive_error(Cursor::new(archive), ErrorKind::InvalidData, expected);
+    }
+}
+
+#[test]
 fn reader_rejects_oversized_pax_extension() {
     let mut archive = Vec::new();
     archive.extend_from_slice(&build_header(
@@ -2033,6 +2081,7 @@ fn reader_rejects_malformed_pax_records() {
         (b"x path=a\n".as_slice(), "invalid length"),
         (b"10 path=aX".as_slice(), "missing trailing newline"),
         (b"11 pathabc\n".as_slice(), "missing '='"),
+        (b"10 p\xffth=a\n".as_slice(), "invalid key"),
         (b"16 path=broken".as_slice(), "malformed PAX record"),
     ] {
         let mut archive = Vec::new();
@@ -2060,8 +2109,96 @@ fn reader_rejects_pax_record_length_inside_utf8_codepoint() {
     assert_archive_error(
         Cursor::new(archive),
         ErrorKind::InvalidData,
-        "malformed PAX record: invalid length",
+        "malformed PAX record: missing trailing newline",
     );
+}
+
+#[test]
+fn reader_rejects_non_utf8_pax_path() {
+    let mut archive = Vec::new();
+    append_pax_entry(&mut archive, b'x', &pax_record_bytes("path", b"\xff"));
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+    assert_archive_error(
+        Cursor::new(archive),
+        ErrorKind::InvalidData,
+        "invalid UTF-8",
+    );
+}
+
+#[test]
+fn reader_ignores_binary_value_of_unknown_pax_key() -> Result<()> {
+    let mut archive = Vec::new();
+    append_pax_entry(&mut archive, b'x', &pax_record_bytes("comment", b"\xff"));
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 5, HeaderFlavor::Ustar),
+        b"hello",
+    );
+    append_eof(&mut archive);
+    let entries = collect_entries(Cursor::new(archive))?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, "file");
+    assert_eq!(entries[0].path, "file.txt");
+    assert_eq!(entries[0].data, b"hello");
+    Ok(())
+}
+
+#[test]
+fn reader_reads_binary_xattr_value_from_large_pax_extensions() -> Result<()> {
+    let mut value = vec![0xff; 700];
+    value.extend_from_slice(b"\0\n=");
+    let mut archive = Vec::new();
+    append_pax_entry(
+        &mut archive,
+        b'g',
+        &pax_record_bytes("SCHILY.xattr.user.global", &value),
+    );
+    append_pax_entry(
+        &mut archive,
+        b'x',
+        &pax_record_bytes("SCHILY.xattr.user.local", &value),
+    );
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+    let entries = collect_entries(ChunkedReader::new(Cursor::new(archive), 7))?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].attrs,
+        vec![
+            ("user.global".to_string(), value.clone()),
+            ("user.local".to_string(), value),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_accepts_empty_pax_extension() -> Result<()> {
+    for typeflag in [b'x', b'g'] {
+        let mut archive = Vec::new();
+        append_pax_entry(&mut archive, typeflag, &[]);
+        append_entry(
+            &mut archive,
+            build_header(b"file.txt", b'0', 5, HeaderFlavor::Ustar),
+            b"hello",
+        );
+        append_eof(&mut archive);
+        let entries = collect_entries(Cursor::new(archive))?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "file");
+        assert_eq!(entries[0].path, "file.txt");
+        assert_eq!(entries[0].data, b"hello");
+    }
+    Ok(())
 }
 
 #[test]
