@@ -947,6 +947,7 @@ impl ExtensionBuffer {
             .map(|p| p.to_string().into_boxed_str())
     }
     unsafe fn upto(&mut self, n: usize) -> &mut [u8] {
+        assert!(n <= self.buf.capacity());
         std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), n)
     }
     unsafe fn remaining_buf(&mut self) -> &mut [u8] {
@@ -2753,6 +2754,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             }
                             _ => unreachable!(),
                         };
+                        this.ext.take();
                         *this.nxt += BLOCK_SIZE as u64;
                         *this.state = Header;
                     }

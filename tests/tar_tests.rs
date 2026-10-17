@@ -1701,6 +1701,82 @@ fn dropping_zero_length_regular_file_reader_skips_entry() -> Result<()> {
     })
 }
 
+fn assert_dropped_large_file_is_skipped(archive: Vec<u8>, path: &str) -> Result<()> {
+    block_on_test(async {
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+        match stream.next().await.unwrap()? {
+            TarEntry::File(file) => {
+                assert_eq!(file.path(), path);
+                assert_eq!(file.size(), 200_000);
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "next.txt");
+                assert_eq!(data, b"next");
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn dropping_large_file_after_large_pax_header_skips_entry() -> Result<()> {
+    let path = format!("{}/big.bin", "d".repeat(595));
+    let local = pax_record_bytes("path", path.as_bytes());
+    assert_eq!(local.len(), 613);
+    let mut archive = Vec::new();
+    append_pax_entry(&mut archive, b'x', &local);
+    append_entry(
+        &mut archive,
+        build_header(b"big.bin", b'0', 200_000, HeaderFlavor::Ustar),
+        &vec![0x5a; 200_000],
+    );
+    append_entry(
+        &mut archive,
+        build_header(b"next.txt", b'0', 4, HeaderFlavor::Ustar),
+        b"next",
+    );
+    append_eof(&mut archive);
+    assert_dropped_large_file_is_skipped(archive, &path)
+}
+
+#[test]
+fn dropping_large_file_after_large_gnu_long_name_skips_entry() -> Result<()> {
+    let path = format!("{}/big.bin", "d".repeat(592));
+    assert_eq!(path.len(), 600);
+    let mut long_name = path.as_bytes().to_vec();
+    long_name.push(0);
+    let mut archive = Vec::new();
+    append_entry(
+        &mut archive,
+        build_header(
+            b"././@LongLink",
+            b'L',
+            long_name.len() as u64,
+            HeaderFlavor::Gnu,
+        ),
+        &long_name,
+    );
+    append_entry(
+        &mut archive,
+        build_header(b"big.bin", b'0', 200_000, HeaderFlavor::Gnu),
+        &vec![0x5a; 200_000],
+    );
+    append_entry(
+        &mut archive,
+        build_header(b"next.txt", b'0', 4, HeaderFlavor::Gnu),
+        b"next",
+    );
+    append_eof(&mut archive);
+    assert_dropped_large_file_is_skipped(archive, &path)
+}
+
 #[test]
 fn reader_rejects_invalid_header_checksum() {
     for flavor in [HeaderFlavor::Old, HeaderFlavor::Ustar, HeaderFlavor::Gnu] {
