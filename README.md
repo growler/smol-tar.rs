@@ -166,6 +166,96 @@ assert_eq!(paths, vec!["bin/", "bin/keep.txt", "bin/run.sh"]);
 The repository also includes a feature-gated example CLI in
 [`examples/smol-tar-bin`](examples/smol-tar-bin/README.md).
 
+## Benchmarks
+
+The [`bench`](bench/README.md) crate compares smol-tar with async-tar,
+astral-tokio-tar, and the synchronous `tar` crate. All archives are in
+memory, so the results do not include disk I/O. Refer to
+[`bench/README.md`](bench/README.md) for the corpora, the benchmarks, and the
+commands.
+
+In short, the differences between these libraries are a few milliseconds
+for archives that hold thousands of entries and live entirely in memory. The
+first real disk or network read will hide them. Pick the library whose API
+you find the most pleasing to look at. Performance will not make the
+decision for you.
+
+Test environment: Intel Core i9-14900KF, Linux 6.18 x86_64, Rust 1.89.0.
+
+The numbers in the lists below come from the smol build.
+
+Results:
+
+- With the large corpus (4 files of 64 MiB), all libraries have the same
+  time within 5%. The memory copy sets the time.
+- In `read_all` and `read_skip`, smol-tar has the lowest time for the pax,
+  gnu-long, and mixed corpora in both builds. For pax, smol-tar reads the
+  archive in 9.9 ms and `tar` reads it in 21.0 ms.
+- In `read_all` with the small corpus, `tar` has the lowest time: 3.9 ms.
+  smol-tar takes 4.5 ms.
+- In `write` with the small corpus, smol-tar takes 1.9 ms, `tar` takes
+  3.2 ms, and async-tar takes 4.2 ms.
+- In `filter` with the small corpus, `tar` has the lowest time: 4.6 ms.
+  smol-tar takes 5.1 ms. With the mixed corpus, smol-tar and `tar` both take
+  10.9 ms.
+
+Allocations:
+
+- `read_all`: smol-tar makes 1 allocation for each ustar entry, 2 for each
+  GNU long-name entry, and 8 for each PAX entry. The other libraries make 2
+  for each ustar entry, 5 for each GNU long-name entry, and 5 or 6 for each
+  PAX entry.
+- `write` with the small corpus: smol-tar makes 1 allocation for each entry,
+  `tar` makes 5, and async-tar and astral-tokio-tar make 6.
+- `filter` with the small corpus: smol-tar allocates 206 KB in each
+  iteration, `tar` allocates 400 KB, and async-tar and astral-tokio-tar
+  allocate 41 MB.
+- The peak live heap of smol-tar is less than 1.5 KB in `read_all` and
+  approximately 66 KB in `read_skip` and `filter`. The 66 KB include the
+  64 KiB skip buffer.
+
+The tables show the median time in milliseconds for 100 samples.
+
+smol build (`--features smol`):
+
+| Benchmark | Corpus   | smol-tar | async-tar | tar   |
+| --------- | -------- | -------: | --------: | ----: |
+| read_all  | small    |     4.46 |      4.89 |  3.91 |
+| read_all  | large    |    13.82 |     13.78 | 13.80 |
+| read_all  | pax      |     9.90 |     14.74 | 20.99 |
+| read_all  | gnu-long |     7.44 |     10.84 |  7.81 |
+| read_all  | mixed    |     7.52 |     10.55 |  9.36 |
+| read_skip | small    |     3.61 |      4.56 |  3.73 |
+| read_skip | large    |    13.73 |     13.77 | 13.77 |
+| read_skip | pax      |     9.03 |     14.11 | 20.86 |
+| read_skip | gnu-long |     6.64 |     10.15 |  7.67 |
+| read_skip | mixed    |     6.79 |      8.21 |  7.41 |
+| write     | small    |     1.85 |      4.22 |  3.19 |
+| write     | large    |    25.78 |     25.17 | 25.47 |
+| write     | mixed    |     6.55 |      9.17 |  8.01 |
+| filter    | small    |     5.13 |      6.95 |  4.60 |
+| filter    | mixed    |    10.86 |     12.65 | 10.93 |
+
+tokio build (`--no-default-features --features tokio`):
+
+| Benchmark | Corpus   | smol-tar | async-tar | astral-tokio-tar | tar   |
+| --------- | -------- | -------: | --------: | ---------------: | ----: |
+| read_all  | small    |     4.91 |      4.72 |             5.75 |  4.15 |
+| read_all  | large    |    14.09 |     13.89 |            13.94 | 13.88 |
+| read_all  | pax      |    10.17 |     15.12 |            14.65 | 19.64 |
+| read_all  | gnu-long |     7.76 |     10.42 |            12.52 |  8.09 |
+| read_all  | mixed    |     8.14 |     10.65 |            11.57 |  9.54 |
+| read_skip | small    |     3.73 |      4.69 |             5.27 |  3.80 |
+| read_skip | large    |    13.87 |     13.93 |            13.95 | 13.97 |
+| read_skip | pax      |     9.04 |     14.62 |            14.33 | 19.22 |
+| read_skip | gnu-long |     6.55 |     10.08 |            12.05 |  7.69 |
+| read_skip | mixed    |     6.86 |      8.58 |             9.04 |  7.49 |
+| write     | small    |     1.91 |      4.21 |             4.18 |  3.37 |
+| write     | large    |    25.32 |     26.31 |            25.44 | 25.12 |
+| write     | mixed    |     6.59 |      9.25 |             9.47 |  8.12 |
+| filter    | small    |     5.99 |      6.91 |             8.06 |  4.62 |
+| filter    | mixed    |    11.73 |     12.76 |            13.76 | 10.92 |
+
 # Rationale
 
 For one of my projects, I needed an asynchronous streaming library for reading
