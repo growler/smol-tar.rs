@@ -201,6 +201,19 @@
 //! - Sparse files and multi-volume archives. The reader returns an error for
 //!   these entries.
 //!
+//! # Compressed archives
+//!
+//! The crate reads and writes uncompressed tar data. To read a `.tar.gz`
+//! archive, give [`TarReader`] a decoder from the `async-compression` crate,
+//! for example `async_compression::futures::bufread::GzipDecoder`. To write
+//! one, give [`TarWriter`] an encoder from the same crate.
+//!
+//! # Buffering
+//!
+//! [`TarReader`] does not buffer the source. Wrap a file or a socket in a
+//! `BufReader`. [`TarWriter`] has an output buffer, so a `BufWriter` is not
+//! necessary.
+//!
 //! # Feature flags
 //!
 //! - `smol` (default): use the `futures-io` traits `AsyncRead` and
@@ -1141,6 +1154,7 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 /// # std::io::Result::Ok(())
 /// # }).unwrap();
 /// ```
+#[doc(alias = "Archive")]
 pub struct TarReader<'a, R: AsyncRead + 'a> {
     inner: Arc<TarReaderGuard<'a, R>>,
 }
@@ -3516,6 +3530,7 @@ pin_project! {
     /// # std::io::Result::Ok(())
     /// # }).unwrap();
     /// ```
+    #[doc(alias = "Builder")]
     pub struct TarWriter<'a, 'b, W, R> {
         // internal buffer for writing headers and file data
         buf: [u8; BLOCK_SIZE * 32],

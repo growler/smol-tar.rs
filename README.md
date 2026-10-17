@@ -1,9 +1,353 @@
 # smol-tar
 [![Tests](https://github.com/growler/smol-tar.rs/actions/workflows/test.yml/badge.svg)](https://github.com/growler/smol-tar.rs/actions/workflows/test.yml) ![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/growler/afe6b562550658e432029a3999ff9a8d/raw/smol-tar.rs-coverage.json) [![Docs](https://docs.rs/smol-tar/badge.svg)](https://docs.rs/smol-tar) [![Crates.io](https://img.shields.io/crates/v/smol-tar.svg?maxAge=2592000)](https://crates.io/crates/smol-tar)
 
-A minimal async streaming tar reader and writer. It does not access the
-filesystem. It reads archives from async readers and writes archives to async
-writers.
+smol-tar is an async streaming tar reader and writer for Rust. `TarReader` is
+a `Stream` of tar entries from an `AsyncRead` source. `TarWriter` is a `Sink`
+of tar entries to an `AsyncWrite` destination. The crate works with smol and
+other `futures-io` runtimes, and with tokio. It does not access the
+filesystem.
+
+- Reads old tar, GNU tar, and POSIX ustar/pax archives.
+- Writes POSIX ustar archives with pax extension records.
+- Streams file bodies. The reader does not keep file bodies in memory.
+- Makes 1 heap allocation for each ustar entry when it reads or writes.
+- Has a fuzz target for the reader. The tests run on Rust 1.85, stable, and
+  nightly, with the smol traits and with the tokio traits.
+
+## Choose a crate
+
+- Use smol-tar to read or write tar data as a stream in async code. The
+  source or destination can be a file, a socket, an HTTP body, a
+  decompressor, or memory. Your code decides what goes to disk.
+- Use [`tar`](https://crates.io/crates/tar) for synchronous code.
+- Use [`async-tar`](https://crates.io/crates/async-tar) or
+  [`astral-tokio-tar`](https://crates.io/crates/astral-tokio-tar) to unpack
+  an archive into a directory with one call (`unpack`), or to add a
+  directory tree from disk with one call (`append_dir_all`). smol-tar has no
+  filesystem functions.
+
+## Installation
+
+For smol and other `futures-io` runtimes:
+
+```toml
+[dependencies]
+smol-tar = "0.1"
+```
+
+For tokio:
+
+```toml
+[dependencies]
+smol-tar = { version = "0.1", default-features = false, features = ["tokio"] }
+```
+
+The minimum supported Rust version is 1.85.
+
+## Feature flags
+
+- `smol` (default): use the `futures-io` traits `AsyncRead` and `AsyncWrite`.
+  `smol` and other `futures`-based runtimes use these traits.
+- `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`.
+- `futures`: add the `futures` crate as a dependency. The library code does
+  not use it.
+
+Enable `smol` or `tokio`. If you enable neither feature, the build fails. If
+you enable both features, the crate uses the `tokio` traits.
+
+## Usage rules
+
+1. Use the entries in sequence. `TarReader` and the file entries that it
+   yields share one archive stream. Read each file body to the end or drop
+   it before you get the next entry. The types are `Send` and `Sync`, but do
+   not read two of them at the same time.
+2. Wrap a file or a socket in a `BufReader` before you give it to
+   `TarReader`. The reader does not buffer the source. `TarWriter` has a
+   16 KiB output buffer, so a `BufWriter` is not necessary.
+3. Give `TarRegularFile::new` the exact size of the body. If the body is
+   shorter, the write fails with `ErrorKind::UnexpectedEof`. If the body is
+   longer, the writer does not read the remaining bytes.
+4. Call `TarWriter::finish` or `SinkExt::close` after the last entry. These
+   methods write the two zero blocks that end a tar archive and close the
+   destination. `StreamExt::forward` closes the writer at the end of the
+   stream.
+5. All file entries of one `TarWriter` use the same body type `R`. To write
+   bodies of different types, box them as
+   `Box<dyn AsyncRead + Unpin + Send>`. If you write only entries without a
+   body, such as directories, set `R` explicitly, for example with the
+   `Empty` type of `smol::io` or `tokio::io`:
+   `TarWriter::<_, Empty>::new(destination)`.
+6. Paths, link targets, and user and group names are UTF-8 strings.
+
+## Errors
+
+All functions return `std::io::Error`. The reader uses these error kinds:
+
+- `ErrorKind::InvalidData`: a header is malformed, has a bad checksum, has an
+  unsupported entry type (for example, a sparse file), has a name that is not
+  valid UTF-8, or is larger than a [limit](#limits).
+- `ErrorKind::UnexpectedEof`: the source ends before the end of the archive
+  or before the end of a file body.
+- Errors from the source reader pass through without change.
+
+## Examples
+
+Each example is a program in the [`examples`](examples) directory. The test
+suite makes sure that the code below is equal to these programs, and
+`cargo test` compiles them.
+
+### Read an archive with smol
+
+Dependencies: `smol-tar`, `smol`.
+
+<!-- example: examples/read.rs -->
+```rust
+//! List the entries of a tar archive with smol.
+//!
+//! Run: cargo run --example read -- ARCHIVE.tar
+
+use smol::{
+    fs::File,
+    io::{copy, sink, BufReader},
+    stream::StreamExt,
+};
+use smol_tar::{TarEntry, TarReader};
+
+fn main() -> std::io::Result<()> {
+    let path = std::env::args().nth(1).expect("usage: read ARCHIVE.tar");
+    smol::block_on(async {
+        // TarReader does not buffer the source. Wrap a file in a BufReader.
+        let mut tar = TarReader::new(BufReader::new(File::open(path).await?));
+        while let Some(entry) = tar.next().await {
+            match entry? {
+                TarEntry::File(mut file) => {
+                    // Read the body to the end or drop it before the next entry.
+                    let size = copy(&mut file, &mut sink()).await?;
+                    println!("file {} ({size} bytes)", file.path());
+                }
+                TarEntry::Directory(dir) => println!("dir {}", dir.path()),
+                TarEntry::Symlink(link) => println!("symlink {} -> {}", link.path(), link.link()),
+                other => println!("other {}", other.path()),
+            }
+        }
+        Ok(())
+    })
+}
+```
+
+### Read an archive with tokio
+
+Dependencies: `smol-tar` with the `tokio` feature, `tokio` with the `fs`,
+`io-util`, `macros`, and `rt-multi-thread` features, `tokio-stream`.
+
+<!-- example: examples/read_tokio.rs -->
+```rust
+//! List the entries of a tar archive with tokio.
+//!
+//! Run: cargo run --example read_tokio --no-default-features --features tokio -- ARCHIVE.tar
+
+use smol_tar::{TarEntry, TarReader};
+use tokio::{
+    fs::File,
+    io::{copy, sink, BufReader},
+};
+use tokio_stream::StreamExt;
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: read_tokio ARCHIVE.tar");
+    // TarReader does not buffer the source. Wrap a file in a BufReader.
+    let mut tar = TarReader::new(BufReader::new(File::open(path).await?));
+    while let Some(entry) = tar.next().await {
+        match entry? {
+            TarEntry::File(mut file) => {
+                // Read the body to the end or drop it before the next entry.
+                let size = copy(&mut file, &mut sink()).await?;
+                println!("file {} ({size} bytes)", file.path());
+            }
+            TarEntry::Directory(dir) => println!("dir {}", dir.path()),
+            other => println!("other {}", other.path()),
+        }
+    }
+    Ok(())
+}
+```
+
+### Read a .tar.gz archive
+
+Dependencies: `smol-tar`, `smol`, `async-compression` with the `futures-io`
+and `gzip` features. With tokio, use the `tokio` feature of
+`async-compression` and `async_compression::tokio::bufread::GzipDecoder`.
+
+<!-- example: examples/read_gz.rs -->
+```rust
+//! List the files of a gzip-compressed tar archive with smol.
+//!
+//! Run: cargo run --example read_gz -- ARCHIVE.tar.gz
+
+use async_compression::futures::bufread::GzipDecoder;
+use smol::{
+    fs::File,
+    io::{copy, sink, BufReader},
+    stream::StreamExt,
+};
+use smol_tar::{TarEntry, TarReader};
+
+fn main() -> std::io::Result<()> {
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: read_gz ARCHIVE.tar.gz");
+    smol::block_on(async {
+        let gz = GzipDecoder::new(BufReader::new(File::open(path).await?));
+        let mut tar = TarReader::new(gz);
+        while let Some(entry) = tar.next().await {
+            if let TarEntry::File(mut file) = entry? {
+                let size = copy(&mut file, &mut sink()).await?;
+                println!("{} ({size} bytes)", file.path());
+            }
+        }
+        Ok(())
+    })
+}
+```
+
+### Write an archive
+
+Dependencies: `smol-tar`, `smol`.
+
+<!-- example: examples/write.rs -->
+```rust
+//! Write files from disk into a new tar archive with smol.
+//!
+//! Run: cargo run --example write -- OUT.tar FILE...
+
+use smol::fs::File;
+use smol_tar::{TarDirectory, TarRegularFile, TarWriter};
+
+fn main() -> std::io::Result<()> {
+    let mut args = std::env::args().skip(1);
+    let out = args.next().expect("usage: write OUT.tar FILE...");
+    smol::block_on(async {
+        // TarWriter buffers its output. A BufWriter is not necessary.
+        let mut tar = TarWriter::new(File::create(out).await?);
+        tar.write(TarDirectory::new("files/").with_mode(0o755).into())
+            .await?;
+        for path in args {
+            let file = File::open(&path).await?;
+            let meta = file.metadata().await?;
+            let name = format!("files/{}", path.trim_start_matches('/'));
+            // The size must be equal to the number of bytes in the body.
+            let entry = TarRegularFile::new(name, meta.len(), file)
+                .with_mode(0o644)
+                .with_mtime(meta.modified()?);
+            tar.write(entry.into()).await?;
+        }
+        // Write the two zero blocks that end the archive and close the file.
+        tar.finish().await
+    })
+}
+```
+
+### Filter one archive into another
+
+`TarReader` is a `Stream` and `TarWriter` is a `Sink` of the same entry type.
+Thus the stream combinators of the `futures` crate connect them.
+
+Dependencies: `smol-tar`, `smol`, `futures`.
+
+<!-- example: examples/filter.rs -->
+```rust
+//! Copy the entries whose path starts with PREFIX into a new archive.
+//!
+//! Run: cargo run --example filter -- IN.tar OUT.tar PREFIX
+
+use futures::{future, StreamExt, TryStreamExt};
+use smol::{fs::File, io::BufReader};
+use smol_tar::{TarReader, TarWriter};
+
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let [input, output, prefix] = args.as_slice() else {
+        panic!("usage: filter IN.tar OUT.tar PREFIX");
+    };
+    smol::block_on(async {
+        let mut out = TarWriter::new(File::create(output).await?);
+        // TarReader is a Stream and TarWriter is a Sink of the same entry type.
+        // forward() closes the writer at the end of the stream.
+        TarReader::new(BufReader::new(File::open(input).await?))
+            .try_filter(|entry| future::ready(entry.path().starts_with(prefix.as_str())))
+            .forward(&mut out)
+            .await
+    })
+}
+```
+
+## API summary
+
+Refer to [docs.rs](https://docs.rs/smol-tar) for the full API.
+
+`TarReader::new(source)`
+: A `Stream` of `std::io::Result<TarEntry>`.
+
+`TarWriter::new(destination)`
+: A `Sink` of `TarEntry`. It also has the methods `write(entry)` and
+  `finish()`.
+
+`TarEntry`
+: An enum with the variants `File`, `Link`, `Symlink`, `Directory`,
+  `Device`, and `Fifo`. `TarEntry::path()` returns the path of each variant.
+  Each entry type converts into `TarEntry` with `.into()`.
+
+`TarRegularFile::new(path, size, body)`
+: A regular file. It implements `AsyncRead` for the body. `size()` returns
+  the body size.
+
+`TarDirectory::new(path)`
+: A directory.
+
+`TarSymlink::new(path, target)` and `TarLink::new(path, target)`
+: A symbolic link and a hard link. `link()` returns the target.
+
+`TarDevice::new_char(path, major, minor)` and `TarDevice::new_block(path, major, minor)`
+: A character device and a block device.
+
+`TarFifo::new(path)`
+: A FIFO.
+
+Metadata
+: All entry types except `TarLink` have the getters `mode()`, `mtime()`,
+  `atime()`, `ctime()`, `uid()`, `gid()`, `uname()`, `gname()`, and
+  `attrs()`. They also have the builder methods `with_mode`, `with_mtime`,
+  `with_atime`, `with_ctime`, `with_uid`, `with_gid`, `with_uname`,
+  `with_gname`, and `with_attrs`.
+
+`AttrList`
+: The extended attributes of an entry. The writer stores them in pax
+  records.
+
+## Migrate from the tar crate
+
+These are the smol-tar equivalents of the [`tar`](https://docs.rs/tar) and
+[`async-tar`](https://docs.rs/async-tar) API:
+
+- `Archive::new(r).entries()?` -- `TarReader::new(r)`, which is a `Stream`.
+- `entry.path()?` -- `entry.path()`, which returns `&str`.
+- `entry.header().entry_type()` -- a `match` on the `TarEntry` variant.
+- `entry.header().size()?` -- `file.size()` on `TarEntry::File(file)`.
+- `Read` or `AsyncRead` on an entry -- `AsyncRead` on `TarRegularFile`.
+- `Builder::new(w)` -- `TarWriter::new(w)`.
+- `builder.append_data(&mut header, path, body)` --
+  `writer.write(TarRegularFile::new(path, size, body).into())`.
+- `header.set_mode(m)`, `header.set_mtime(t)` -- `.with_mode(m)`,
+  `.with_mtime(t)` on the entry.
+- `builder.append_dir(path, src)` --
+  `writer.write(TarDirectory::new(path).into())`.
+- `builder.finish()` or `builder.into_inner()` -- `writer.finish()`.
+- `Archive::unpack`, `Builder::append_path`, `Builder::append_dir_all` --
+  smol-tar has no equivalents. Iterate the entries and use the filesystem
+  API of your runtime.
 
 ## Supported formats
 
@@ -21,242 +365,48 @@ Writes:
 - PAX records for long paths, long link targets, timestamps, numeric ids,
   symbolic names, sizes, and extended attributes
 
-## Not supported
+Not supported:
 
-- Sparse files and multi-volume archives (the reader returns an error)
+- Sparse files and multi-volume archives. The reader returns an error for
+  these entries.
 
-## Installation
+## Limits
 
-Runtime selection:
+The reader returns an `ErrorKind::InvalidData` error for these archive
+contents:
 
-```toml
-[dependencies]
-smol-tar = "0.1"
-```
-
-```toml
-[dependencies]
-smol-tar = { version = "0.1", default-features = false, features = ["tokio"] }
-```
-
-## Feature flags
-
-- `smol` (default): use the `futures-io` traits `AsyncRead` and `AsyncWrite`.
-  `smol` and other `futures`-based runtimes use these traits.
-- `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`.
-- `futures`: add the `futures` crate as a dependency. The library code does
-  not use it.
-
-Enable `smol` or `tokio`. If you enable neither feature, the build fails. If
-you enable both features, the crate uses the `tokio` traits.
-
-## Minimum supported Rust version
-
-Rust 1.85.
-
-## Reading archives
-
-```rust
-use smol::{
-    io::{copy, sink, Cursor},
-    stream::StreamExt,
-};
-use smol_tar::{TarEntry, TarReader};
-
-let data = Cursor::new(vec![0; 1024]);
-let mut tar = TarReader::new(data);
-
-while let Some(entry) = tar.next().await {
-    match entry? {
-        TarEntry::File(mut file) => {
-            println!("file: {} ({} bytes)", file.path(), file.size());
-            copy(&mut file, &mut sink()).await?;
-        }
-        TarEntry::Directory(dir) => {
-            println!("dir: {}", dir.path());
-        }
-        other => {
-            println!("other: {}", other.path());
-        }
-    }
-}
-```
-
-Regular file bodies are streamed. To move on to the next entry, either read the
-file body to the end or drop the file reader.
-
-## Writing archives
-
-```rust
-use smol::io::Cursor;
-use smol_tar::{
-    TarDirectory, TarEntry, TarRegularFile, TarWriter
-};
-
-let sink = Cursor::new(Vec::<u8>::new());
-let mut tar = TarWriter::new(sink);
-
-tar.write(TarDirectory::new("bin/").into()).await?;
-
-let body = Cursor::new(b"hello\n");
-tar.write(
-    TarRegularFile::new(
-        "bin/hello.txt", 6, body,
-    ).into()
-).await?;
-
-tar.finish().await?;
-```
-
-## Filtering one archive into another sink
-
-The writer also implements the `futures_sink::Sink` trait. This example
-filters the entries of one archive into a second archive:
-
-```rust
-use futures::{future, SinkExt, StreamExt, TryStreamExt};
-use smol::io::Cursor;
-use smol_tar::*;
-
-let mut input = Cursor::new(Vec::<u8>::new());
-let mut source = TarWriter::new(&mut input);
-source.send(
-    TarDirectory::new("bin/").into()
-).await?;
-source.send(TarRegularFile::new(
-        "bin/keep.txt", 5, Cursor::new(b"keep\n".as_ref())
-    ).into(),
-).await?;
-source.send(
-    TarRegularFile::new(
-        "share/skip.txt", 5, Cursor::new(b"skip\n".as_ref())
-    ).into(),
-).await?;
-source.send(
-    TarRegularFile::new(
-        "bin/run.sh", 8, Cursor::new(b"echo hi\n".as_ref())
-    ).with_mode(0o755).into(),
-).await?;
-source.close().await?;
-input.set_position(0);
-
-let mut output = Cursor::new(Vec::<u8>::new());
-let mut filtered = TarWriter::new(&mut output);
-
-TarReader::new(&mut input)
-    .try_filter(|entry| {
-        future::ready(entry.path().starts_with("bin/"))
-    })
-    .forward(&mut filtered)
-    .await?;
-
-filtered.close().await?;
-output.set_position(0);
-
-let paths: Vec<String> = TarReader::new(output)
-    .map_ok(|entry| entry.path().to_string())
-    .try_collect()
-    .await?;
-
-assert_eq!(paths, vec!["bin/", "bin/keep.txt", "bin/run.sh"]);
-```
+- a GNU long name or long link that is larger than 4096 bytes
+- a PAX extension that is larger than 1 MiB
+- more than 256 global PAX extensions
 
 ## Example CLI
 
 The repository also includes a feature-gated example CLI in
-[`examples/smol-tar-bin`](examples/smol-tar-bin/README.md).
+[`examples/smol-tar-bin`](examples/smol-tar-bin/README.md). It creates,
+extracts, and lists archives on disk.
 
 ## Benchmarks
 
 The [`bench`](bench/README.md) crate compares smol-tar with async-tar,
 astral-tokio-tar, and the synchronous `tar` crate. All archives are in
-memory, so the results do not include disk I/O. Refer to
-[`bench/README.md`](bench/README.md) for the corpora, the benchmarks, and the
-commands.
+memory, so the results do not include disk I/O.
 
-In short, the differences between these libraries are a few milliseconds
-for archives that hold thousands of entries and live entirely in memory. The
-first real disk or network read will hide them. Pick the library whose API
-you find the most pleasing to look at. Performance will not make the
-decision for you.
+- For archives that hold thousands of entries, the times of all libraries
+  are within a few milliseconds of each other. The first real disk or
+  network read will hide the differences. Pick the library whose API you
+  find the most pleasing to look at. Performance will not make the decision
+  for you.
+- smol-tar has the lowest time to read the pax and GNU long-name corpora.
+  For pax, smol-tar reads the archive in 9.9 ms and `tar` reads it in
+  21.0 ms.
+- smol-tar makes fewer allocations for each ustar and GNU long-name entry
+  than the other libraries. Its peak live heap is less than 1.5 KB when it
+  reads all entries.
 
-Test environment: Intel Core i9-14900KF, Linux 6.18 x86_64, Rust 1.89.0.
+Refer to [`bench/README.md`](bench/README.md#results) for the result tables,
+the allocation counts, and the test environment.
 
-The numbers in the lists below come from the smol build.
-
-Results:
-
-- With the large corpus (4 files of 64 MiB), all libraries have the same
-  time within 5%. The memory copy sets the time.
-- In `read_all` and `read_skip`, smol-tar has the lowest time for the pax,
-  gnu-long, and mixed corpora in both builds. For pax, smol-tar reads the
-  archive in 9.9 ms and `tar` reads it in 21.0 ms.
-- In `read_all` with the small corpus, `tar` has the lowest time: 3.9 ms.
-  smol-tar takes 4.5 ms.
-- In `write` with the small corpus, smol-tar takes 1.9 ms, `tar` takes
-  3.2 ms, and async-tar takes 4.2 ms.
-- In `filter` with the small corpus, `tar` has the lowest time: 4.6 ms.
-  smol-tar takes 5.1 ms. With the mixed corpus, smol-tar and `tar` both take
-  10.9 ms.
-
-Allocations:
-
-- `read_all`: smol-tar makes 1 allocation for each ustar entry, 2 for each
-  GNU long-name entry, and 8 for each PAX entry. The other libraries make 2
-  for each ustar entry, 5 for each GNU long-name entry, and 5 or 6 for each
-  PAX entry.
-- `write` with the small corpus: smol-tar makes 1 allocation for each entry,
-  `tar` makes 5, and async-tar and astral-tokio-tar make 6.
-- `filter` with the small corpus: smol-tar allocates 206 KB in each
-  iteration, `tar` allocates 400 KB, and async-tar and astral-tokio-tar
-  allocate 41 MB.
-- The peak live heap of smol-tar is less than 1.5 KB in `read_all` and
-  approximately 66 KB in `read_skip` and `filter`. The 66 KB include the
-  64 KiB skip buffer.
-
-The tables show the median time in milliseconds for 100 samples.
-
-smol build (`--features smol`):
-
-| Benchmark | Corpus   | smol-tar | async-tar | tar   |
-| --------- | -------- | -------: | --------: | ----: |
-| read_all  | small    |     4.46 |      4.89 |  3.91 |
-| read_all  | large    |    13.82 |     13.78 | 13.80 |
-| read_all  | pax      |     9.90 |     14.74 | 20.99 |
-| read_all  | gnu-long |     7.44 |     10.84 |  7.81 |
-| read_all  | mixed    |     7.52 |     10.55 |  9.36 |
-| read_skip | small    |     3.61 |      4.56 |  3.73 |
-| read_skip | large    |    13.73 |     13.77 | 13.77 |
-| read_skip | pax      |     9.03 |     14.11 | 20.86 |
-| read_skip | gnu-long |     6.64 |     10.15 |  7.67 |
-| read_skip | mixed    |     6.79 |      8.21 |  7.41 |
-| write     | small    |     1.85 |      4.22 |  3.19 |
-| write     | large    |    25.78 |     25.17 | 25.47 |
-| write     | mixed    |     6.55 |      9.17 |  8.01 |
-| filter    | small    |     5.13 |      6.95 |  4.60 |
-| filter    | mixed    |    10.86 |     12.65 | 10.93 |
-
-tokio build (`--no-default-features --features tokio`):
-
-| Benchmark | Corpus   | smol-tar | async-tar | astral-tokio-tar | tar   |
-| --------- | -------- | -------: | --------: | ---------------: | ----: |
-| read_all  | small    |     4.91 |      4.72 |             5.75 |  4.15 |
-| read_all  | large    |    14.09 |     13.89 |            13.94 | 13.88 |
-| read_all  | pax      |    10.17 |     15.12 |            14.65 | 19.64 |
-| read_all  | gnu-long |     7.76 |     10.42 |            12.52 |  8.09 |
-| read_all  | mixed    |     8.14 |     10.65 |            11.57 |  9.54 |
-| read_skip | small    |     3.73 |      4.69 |             5.27 |  3.80 |
-| read_skip | large    |    13.87 |     13.93 |            13.95 | 13.97 |
-| read_skip | pax      |     9.04 |     14.62 |            14.33 | 19.22 |
-| read_skip | gnu-long |     6.55 |     10.08 |            12.05 |  7.69 |
-| read_skip | mixed    |     6.86 |      8.58 |             9.04 |  7.49 |
-| write     | small    |     1.91 |      4.21 |             4.18 |  3.37 |
-| write     | large    |    25.32 |     26.31 |            25.44 | 25.12 |
-| write     | mixed    |     6.59 |      9.25 |             9.47 |  8.12 |
-| filter    | small    |     5.99 |      6.91 |             8.06 |  4.62 |
-| filter    | mixed    |    11.73 |     12.76 |            13.76 | 10.92 |
-
-# Rationale
+## Rationale
 
 For one of my projects, I needed an asynchronous streaming library for reading
 and writing tar archives. The project was based on `async-std` (now
@@ -267,25 +417,14 @@ needed a bit more functionality, but the depth and number of abstractions in
 `async-tar` became rather a lot to hold in my head, so I put together a small,
 manageable state machine instead.
 
-The library is properly fuzzed and well covered by tests. It has also seen
-heavy use in a real internal CI/CD pipeline for some time, and now seems ready
-for release.
+The reader has a cargo-fuzz target in the `fuzz` directory. The coverage
+badge above shows the test coverage. The library has also seen heavy use in a
+real internal CI/CD pipeline for some time.
 
-# Caveats
-
-- `TarReader` and the `TarRegularFileReader` values that it yields are
-  `Send + Sync`, but they share one archive stream. Use them in sequence, not
-  at the same time. Read each file body to the end or drop it before you get
-  the next entry.
-- Library paths and example-CLI paths must be valid UTF-8.
-- The reader rejects a GNU long name or long link that is larger than 4096
-  bytes, a PAX extension that is larger than 1 MiB, and more than 256 global
-  PAX extensions.
-
-# Special thanks
+## Special thanks
 
 To authors of [`async-tar`](https://crates.io/crates/async-tar) for the inspiration.
 
-# LICENSE
+## License
 
 MIT
