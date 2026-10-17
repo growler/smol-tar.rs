@@ -950,10 +950,6 @@ impl ExtensionBuffer {
             .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
             .map(|p| p.to_string().into_boxed_str())
     }
-    unsafe fn upto(&mut self, n: usize) -> &mut [u8] {
-        assert!(n <= self.buf.capacity());
-        std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), n)
-    }
     unsafe fn remaining_buf(&mut self) -> &mut [u8] {
         let remaining = self.buf.spare_capacity_mut();
         std::slice::from_raw_parts_mut(remaining.as_mut_ptr() as *mut u8, remaining.len())
@@ -968,9 +964,10 @@ pin_project! {
     ///
     /// `pos` tracks how much of the current block has been consumed while
     /// `nxt` marks the boundary at which the next transition happens (end of
-    /// header, file body, padding, etc.). The `state` enum plus the optional
-    /// `ext` buffer describe what the reader is currently expecting: extension
-    /// payloads, entry data that must be skipped, or archive EOF.
+    /// header, file body, padding, etc.). The `state` enum describes what the
+    /// reader is currently expecting: extension payloads, entry data that must
+    /// be skipped, or archive EOF. The optional `ext` buffer holds extension
+    /// payloads. The `skip` buffer receives the data of skipped entries.
     struct TarReaderInner<'a, R> {
         // current position in the stream
         pos: u64,
@@ -978,8 +975,10 @@ pin_project! {
         nxt: u64,
         // current state
         state: State,
-        // the buffer for the current extended header or for skipping a entry
+        // the buffer for the current extended header
         ext: Option<ExtensionBuffer>,
+        // the buffer for skipping entries, allocated at the first skip
+        skip: Option<Box<[u8; SKIP_BUFFER_SIZE]>>,
         // list of the current extended headers
         exts: Vec<ExtensionHeader>,
         // list of the global extended headers
@@ -2429,6 +2428,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
             pos: 0,
             nxt: BLOCK_SIZE as u64,
             ext: None,
+            skip: None,
             exts: Vec::new(),
             globs: Vec::new(),
             header: Header::new(),
@@ -2466,6 +2466,8 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                     }
                     if this.header.is_zero() {
                         *this.nxt += BLOCK_SIZE as u64;
+                        // No entry follows, so release the skip buffer.
+                        this.skip.take();
                         *this.state = Eof;
                         continue;
                     }
@@ -2795,16 +2797,15 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                     let remaining =
                         std::cmp::min(SKIP_BUFFER_SIZE as u64, nxt - *this.pos) as usize;
                     let n = if remaining > 0 {
-                        let buf = if let Some(buf) = this.ext.as_mut() {
-                            buf
-                        } else {
-                            this.ext.replace(ExtensionBuffer::new(SKIP_BUFFER_SIZE));
-                            this.ext.as_mut().unwrap()
-                        };
+                        let buf = this.skip.get_or_insert_with(|| {
+                            vec![0; SKIP_BUFFER_SIZE]
+                                .into_boxed_slice()
+                                .try_into()
+                                .unwrap()
+                        });
+                        let buf = &mut buf[..remaining];
                         let reader = &mut this.reader;
-                        match ready_opt!(poll_read_compat(pin!(reader), ctx, unsafe {
-                            buf.upto(remaining)
-                        })) {
+                        match ready_opt!(poll_read_compat(pin!(reader), ctx, buf)) {
                             0 => Err(Error::new(
                                 ErrorKind::UnexpectedEof,
                                 "unexpected end of tar file",
@@ -2817,7 +2818,6 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                     }?;
                     *this.pos += n;
                     if *this.pos == nxt {
-                        this.ext.take();
                         *this.nxt = *this.pos + BLOCK_SIZE as u64;
                         *this.state = Header;
                     }

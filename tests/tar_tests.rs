@@ -1401,14 +1401,8 @@ fn tar_writer_uses_ustar_symbolic_names_at_max_boundary() -> Result<()> {
             !buffer.windows(6).any(|window| window == b"gname="),
             "31-char gname should fit in ustar header without PAX"
         );
-        assert_eq!(
-            &buffer[UNAME_START..UNAME_START + 31],
-            uname.as_bytes()
-        );
-        assert_eq!(
-            &buffer[GNAME_START..GNAME_START + 31],
-            gname.as_bytes()
-        );
+        assert_eq!(&buffer[UNAME_START..UNAME_START + 31], uname.as_bytes());
+        assert_eq!(&buffer[GNAME_START..GNAME_START + 31], gname.as_bytes());
 
         let mut stream = Box::pin(TarReader::new(Cursor::new(buffer)));
         match stream.next().await.unwrap()? {
