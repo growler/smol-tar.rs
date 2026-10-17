@@ -450,76 +450,76 @@ impl Header {
     }
     #[inline]
     fn mode(&self) -> Result<u32> {
-        parse_octal(&unsafe { self.cast::<GnuHeader>() }.mode)
-            .map(|r| r as u32)
+        parse_numeric(&unsafe { self.cast::<GnuHeader>() }.mode)
             .map_err(|err| {
                 Error::new(
                     ErrorKind::InvalidData,
-                    format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                    format!("invalid numeric field: {:?}", String::from_utf8_lossy(err)),
                 )
             })
+            .and_then(numeric_u32)
     }
     #[inline]
     fn mtime(&self) -> Result<u64> {
-        parse_octal(&unsafe { self.cast::<GnuHeader>() }.mtime).map_err(|err| {
+        parse_numeric(&unsafe { self.cast::<GnuHeader>() }.mtime).map_err(|err| {
             Error::new(
                 ErrorKind::InvalidData,
-                format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                format!("invalid numeric field: {:?}", String::from_utf8_lossy(err)),
             )
         })
     }
     #[inline]
     fn size(&self) -> Result<u64> {
-        parse_octal(&unsafe { self.cast::<GnuHeader>() }.size).map_err(|err| {
+        parse_numeric(&unsafe { self.cast::<GnuHeader>() }.size).map_err(|err| {
             Error::new(
                 ErrorKind::InvalidData,
-                format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                format!("invalid numeric field: {:?}", String::from_utf8_lossy(err)),
             )
         })
     }
     #[inline]
     fn uid(&self) -> Result<u32> {
-        parse_octal(&unsafe { self.cast::<GnuHeader>() }.uid)
-            .map(|r| r as u32)
+        parse_numeric(&unsafe { self.cast::<GnuHeader>() }.uid)
             .map_err(|err| {
                 Error::new(
                     ErrorKind::InvalidData,
-                    format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                    format!("invalid numeric field: {:?}", String::from_utf8_lossy(err)),
                 )
             })
+            .and_then(numeric_u32)
     }
     #[inline]
     fn gid(&self) -> Result<u32> {
-        parse_octal(&unsafe { self.cast::<GnuHeader>() }.gid)
-            .map(|r| r as u32)
+        parse_numeric(&unsafe { self.cast::<GnuHeader>() }.gid)
             .map_err(|err| {
                 Error::new(
                     ErrorKind::InvalidData,
-                    format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                    format!("invalid numeric field: {:?}", String::from_utf8_lossy(err)),
                 )
             })
+            .and_then(numeric_u32)
     }
     #[inline]
     fn dev_major(&self) -> Result<u32> {
-        parse_octal(&unsafe { self.cast::<GnuHeader>() }.dev_major)
-            .map(|r| r as u32)
+        parse_numeric(&unsafe { self.cast::<GnuHeader>() }.dev_major)
             .map_err(|err| {
                 Error::new(
                     ErrorKind::InvalidData,
-                    format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                    format!("invalid numeric field: {:?}", String::from_utf8_lossy(err)),
                 )
             })
+            .and_then(numeric_u32)
     }
     #[inline]
     fn dev_minor(&self) -> Result<u32> {
-        parse_octal(&unsafe { self.cast::<GnuHeader>() }.dev_minor)
-            .map(|r| r as u32)
+        parse_numeric(&unsafe { self.cast::<GnuHeader>() }.dev_minor)
             .map_err(|err| {
                 Error::new(
                     ErrorKind::InvalidData,
-                    format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                    format!("invalid numeric field: {:?}", String::from_utf8_lossy(err)),
                 )
             })
+            .and_then(numeric_u32)
     }
     fn uname(&self) -> Result<Option<Box<str>>> {
         match self.kind() {
@@ -785,18 +785,18 @@ impl GnuHeader {
         path_name(&self.linkname).map(|p| p.to_string().into_boxed_str())
     }
     fn atime(&self) -> Result<u64> {
-        parse_octal(&self.atime).map_err(|err| {
+        parse_numeric(&self.atime).map_err(|err| {
             Error::new(
                 ErrorKind::InvalidData,
-                format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                format!("invalid numeric field: {:?}", String::from_utf8_lossy(err)),
             )
         })
     }
     fn ctime(&self) -> Result<u64> {
-        parse_octal(&self.ctime).map_err(|err| {
+        parse_numeric(&self.ctime).map_err(|err| {
             Error::new(
                 ErrorKind::InvalidData,
-                format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                format!("invalid numeric field: {:?}", String::from_utf8_lossy(err)),
             )
         })
     }
@@ -823,15 +823,15 @@ enum Entry {
 }
 
 fn effective_size(hdr: &Header, size: Option<u64>) -> Result<u64> {
-    Ok(size.unwrap_or(hdr.size()?))
+    size.map_or_else(|| hdr.size(), Ok)
 }
 
 fn effective_uid(hdr: &Header, uid: Option<u32>) -> Result<u32> {
-    Ok(uid.unwrap_or(hdr.uid()?))
+    uid.map_or_else(|| hdr.uid(), Ok)
 }
 
 fn effective_gid(hdr: &Header, gid: Option<u32>) -> Result<u32> {
-    Ok(gid.unwrap_or(hdr.gid()?))
+    gid.map_or_else(|| hdr.gid(), Ok)
 }
 
 fn effective_uname(hdr: &Header, uname: Option<Box<str>>) -> Result<Option<Box<str>>> {
@@ -843,19 +843,23 @@ fn effective_gname(hdr: &Header, gname: Option<Box<str>>) -> Result<Option<Box<s
 }
 
 fn effective_times(hdr: &Header, info: &PaxInfo) -> Result<EntryTimes> {
-    let mut times = EntryTimes::from_mtime(hdr.mtime()?)?;
+    let mut times = match info.mtime {
+        Some(mtime) => EntryTimes::default().with_mtime(mtime),
+        None => EntryTimes::from_mtime(hdr.mtime()?)?,
+    };
     if let HeaderKind::Gnu(gnu) = hdr.kind() {
-        let atime = gnu.atime()?;
-        if atime != 0 {
-            times.atime = Some(unix_epoch_checked_add(Duration::from_secs(atime))?);
+        if info.atime.is_none() {
+            let atime = gnu.atime()?;
+            if atime != 0 {
+                times.atime = Some(unix_epoch_checked_add(Duration::from_secs(atime))?);
+            }
         }
-        let ctime = gnu.ctime()?;
-        if ctime != 0 {
-            times.ctime = Some(unix_epoch_checked_add(Duration::from_secs(ctime))?);
+        if info.ctime.is_none() {
+            let ctime = gnu.ctime()?;
+            if ctime != 0 {
+                times.ctime = Some(unix_epoch_checked_add(Duration::from_secs(ctime))?);
+            }
         }
-    }
-    if let Some(mtime) = info.mtime {
-        times.mtime = mtime;
     }
     if let Some(atime) = info.atime {
         times.atime = Some(atime);
@@ -2206,7 +2210,6 @@ fn ext_as_str(hdr: &Header, size: usize, ext: &Option<ExtensionBuffer>) -> Resul
     } else {
         ext.as_ref().unwrap().as_str(..size)
     }
-    .map(|p| p.to_string().into_boxed_str())
 }
 
 fn take_pax_info(exts: &mut Vec<ExtensionHeader>, globs: &[PosixExtension]) -> Result<PaxInfo> {
@@ -2649,7 +2652,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                         }
                         Kind::PAXLocal | Kind::PAXGlobal if this.header.is_ustar() => {
                             let size = this.header.size().and_then(|size| {
-                                if size as usize > PAX_HEADER_MAX_SIZE {
+                                if size > PAX_HEADER_MAX_SIZE as u64 {
                                     Err(Error::new(
                                         ErrorKind::InvalidData,
                                         format!(
@@ -2675,7 +2678,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                         }
                         Kind::GNULongName | Kind::GNULongLink if this.header.is_gnu() => {
                             let size = this.header.size().and_then(|size| {
-                                if size as usize > PATH_MAX {
+                                if size > PATH_MAX as u64 {
                                     Err(Error::new(
                                         ErrorKind::InvalidData,
                                         format!("long filename exceeds {PATH_MAX} bytes"),
@@ -3036,6 +3039,36 @@ fn parse_octal(field: &'_ [u8]) -> std::result::Result<u64, &'_ [u8]> {
         n = (n << 3) | (u64::from(*d) - u64::from(b'0'));
     }
     Ok(n)
+}
+
+fn parse_numeric(field: &'_ [u8]) -> std::result::Result<u64, &'_ [u8]> {
+    match field.first() {
+        // GNU base-256: high bit set, bit 6 is the sign, rest is big-endian
+        Some(&first) if first & 0x80 != 0 => {
+            if first & 0x40 != 0 {
+                return Err(field);
+            }
+            field[1..]
+                .iter()
+                .try_fold(u64::from(first & 0x3f), |n, &b| {
+                    if n >> 56 != 0 {
+                        Err(field)
+                    } else {
+                        Ok((n << 8) | u64::from(b))
+                    }
+                })
+        }
+        _ => parse_octal(field),
+    }
+}
+
+fn numeric_u32(value: u64) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("numeric field value out of range: {value}"),
+        )
+    })
 }
 
 const fn padded_size(n: u64) -> u64 {
@@ -3691,5 +3724,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("buffer too small for pax header"));
+    }
+
+    #[test]
+    fn parse_numeric_accepts_octal_and_base256() {
+        assert_eq!(parse_numeric(b"0000644\0"), Ok(0o644));
+        assert_eq!(parse_numeric(b"77777777777\0"), Ok(0o77777777777));
+        assert_eq!(
+            parse_numeric(&[0x80, 0, 0, 0, 0, 0, 0, 0x03, 0x00, 0x26, 0x07, 0x5a]),
+            Ok(0x03_0026_075a)
+        );
+        assert_eq!(parse_numeric(&[0x80, 0, 0, 0, 0, 0, 0x10, 0x00]), Ok(4096));
+        assert_eq!(parse_numeric(&[0xbf, 0, 0, 0, 0, 0, 0, 0]), Ok(0x3f << 56));
+        assert_eq!(
+            parse_numeric(&[0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            Ok(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn parse_numeric_rejects_negative_and_overflowing_base256() {
+        let negative = [0xff; 12];
+        assert_eq!(parse_numeric(&negative), Err(&negative[..]));
+        let negative = [0xc0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(parse_numeric(&negative), Err(&negative[..]));
+        let overflow = [0x80, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(parse_numeric(&overflow), Err(&overflow[..]));
+        let overflow = [0x81, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(parse_numeric(&overflow), Err(&overflow[..]));
+    }
+
+    #[test]
+    fn header_u32_fields_reject_base256_overflow() {
+        let mut hdr = Header::new();
+        hdr.buf_mut(108..116)
+            .copy_from_slice(&[0x80, 0, 0, 0, 0, 0x40, 0, 0]);
+        assert_eq!(hdr.uid().unwrap(), 0x0040_0000);
+        hdr.buf_mut(108..116)
+            .copy_from_slice(&[0x80, 0, 0, 1, 0, 0, 0, 0]);
+        let err = hdr.uid().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {err}"
+        );
     }
 }

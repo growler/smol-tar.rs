@@ -1813,7 +1813,7 @@ fn reader_rejects_invalid_octal_fields() {
     assert_archive_error(
         Cursor::new(archive),
         ErrorKind::InvalidData,
-        "invalid octal digit",
+        "invalid numeric field",
     );
 }
 
@@ -1981,6 +1981,34 @@ fn reader_rejects_oversized_pax_extension() {
         ErrorKind::InvalidData,
         "PAX extension exceeds",
     );
+}
+
+#[test]
+fn reader_rejects_oversized_base256_extension_sizes() {
+    // 2^32 + 16 must not pass the bound check after truncation to 32 bits
+    let size = [0x80, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0x10];
+    for (name, typeflag, flavor, message) in [
+        (
+            &b"././@LongLink"[..],
+            b'L',
+            HeaderFlavor::Gnu,
+            "long filename exceeds",
+        ),
+        (
+            &b"././@PaxHeader"[..],
+            b'x',
+            HeaderFlavor::Ustar,
+            "PAX extension exceeds",
+        ),
+    ] {
+        let mut archive = Vec::new();
+        let mut header = build_header(name, typeflag, 0, flavor);
+        set_bytes(&mut header, SIZE_START, 12, &size);
+        finalize_checksum(&mut header);
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(&[0u8; BLOCK_SIZE]);
+        assert_archive_error(Cursor::new(archive), ErrorKind::InvalidData, message);
+    }
 }
 
 #[test]
@@ -2524,6 +2552,37 @@ fn reader_pax_times_override_gnu_header_times() -> Result<()> {
 }
 
 #[test]
+fn reader_pax_times_override_unparsable_gnu_header_times() -> Result<()> {
+    block_on_test(async {
+        let mut archive = Vec::new();
+        let mut local = Vec::new();
+        local.extend_from_slice(&pax_record_bytes("atime", b"1.25"));
+        local.extend_from_slice(&pax_record_bytes("ctime", b"-2"));
+        append_pax_entry(&mut archive, b'x', &local);
+
+        let mut header = build_header(b"file.txt", b'0', 0, HeaderFlavor::Gnu);
+        write_octal(3, &mut header[MTIME_START..MTIME_START + 12]);
+        set_bytes(&mut header, GNU_ATIME_START, 12, b"zzzzzzzzzzz\0");
+        set_bytes(&mut header, GNU_CTIME_START, 12, b"zzzzzzzzzzz\0");
+        finalize_checksum(&mut header);
+        append_entry(&mut archive, header, b"");
+        append_eof(&mut archive);
+
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+        match stream.next().await.unwrap()? {
+            TarEntry::File(file) => {
+                assert_eq!(file.mtime(), ts(3, 0));
+                assert_eq!(file.atime(), Some(ts(1, 250_000_000)));
+                assert_eq!(file.ctime(), Some(ts(-2, 0)));
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
 fn reader_ignores_hardlink_xattrs() -> Result<()> {
     block_on_test(async {
         let mut archive = Vec::new();
@@ -2653,45 +2712,45 @@ fn reader_rejects_invalid_header_numeric_fields() {
             8,
             b'0',
             HeaderFlavor::Ustar,
-            "invalid octal digit",
+            "invalid numeric field",
         ),
         (
             GID_START,
             8,
             b'0',
             HeaderFlavor::Ustar,
-            "invalid octal digit",
+            "invalid numeric field",
         ),
         (
             MTIME_START,
             12,
             b'0',
             HeaderFlavor::Ustar,
-            "invalid octal digit",
+            "invalid numeric field",
         ),
         (
             SIZE_START,
             12,
             b'0',
             HeaderFlavor::Ustar,
-            "invalid octal digit",
+            "invalid numeric field",
         ),
         (
             GNU_ATIME_START,
             12,
             b'0',
             HeaderFlavor::Gnu,
-            "invalid octal digit",
+            "invalid numeric field",
         ),
         (
             GNU_CTIME_START,
             12,
             b'0',
             HeaderFlavor::Gnu,
-            "invalid octal digit",
+            "invalid numeric field",
         ),
-        (329, 8, b'3', HeaderFlavor::Ustar, "invalid octal digit"),
-        (337, 8, b'4', HeaderFlavor::Ustar, "invalid octal digit"),
+        (329, 8, b'3', HeaderFlavor::Ustar, "invalid numeric field"),
+        (337, 8, b'4', HeaderFlavor::Ustar, "invalid numeric field"),
     ] {
         let mut archive = Vec::new();
         let mut header = build_header(b"bad", typeflag, 0, flavor);
@@ -2712,6 +2771,218 @@ fn reader_rejects_invalid_header_numeric_fields() {
         ErrorKind::InvalidData,
         "invalid tar header checksum field",
     );
+}
+
+#[test]
+fn reader_reads_gnu_base256_numeric_fields() -> Result<()> {
+    block_on_test(async {
+        let mut archive = Vec::new();
+        let mut header = build_header(b"big.bin", b'0', 0, HeaderFlavor::Gnu);
+        set_bytes(
+            &mut header,
+            SIZE_START,
+            12,
+            &[0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5],
+        );
+        set_bytes(&mut header, UID_START, 8, &[0x80, 0, 0, 0, 0, 0x40, 0, 0]);
+        set_bytes(
+            &mut header,
+            MTIME_START,
+            12,
+            &[0x80, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0, 0],
+        );
+        finalize_checksum(&mut header);
+        append_entry(&mut archive, header, b"hello");
+        append_entry(
+            &mut archive,
+            build_header(b"next.txt", b'0', 4, HeaderFlavor::Gnu),
+            b"next",
+        );
+        append_eof(&mut archive);
+
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "big.bin");
+                assert_eq!(file.size(), 5);
+                assert_eq!(file.uid(), 0x0040_0000);
+                assert_eq!(file.mtime(), ts(1 << 33, 0));
+                assert_eq!(data, b"hello");
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "next.txt");
+                assert_eq!(data, b"next");
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn reader_pax_overrides_unparsable_header_numeric_fields() -> Result<()> {
+    block_on_test(async {
+        let mut archive = Vec::new();
+        let mut local = Vec::new();
+        local.extend_from_slice(&pax_record_bytes("size", b"5"));
+        local.extend_from_slice(&pax_record_bytes("uid", b"123"));
+        local.extend_from_slice(&pax_record_bytes("gid", b"456"));
+        local.extend_from_slice(&pax_record_bytes("mtime", b"7"));
+        append_pax_entry(&mut archive, b'x', &local);
+        let mut header = build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar);
+        set_bytes(&mut header, SIZE_START, 12, b"8");
+        set_bytes(&mut header, UID_START, 8, b"8");
+        set_bytes(&mut header, GID_START, 8, b"8");
+        set_bytes(&mut header, MTIME_START, 12, b"8");
+        finalize_checksum(&mut header);
+        append_entry(&mut archive, header, b"hello");
+        append_entry(
+            &mut archive,
+            build_header(b"next.txt", b'0', 4, HeaderFlavor::Ustar),
+            b"next",
+        );
+        append_eof(&mut archive);
+
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "file.txt");
+                assert_eq!(file.size(), 5);
+                assert_eq!(file.uid(), 123);
+                assert_eq!(file.gid(), 456);
+                assert_eq!(file.mtime(), ts(7, 0));
+                assert_eq!(data, b"hello");
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await?;
+                assert_eq!(file.path(), "next.txt");
+                assert_eq!(data, b"next");
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn reader_rejects_negative_gnu_base256_numeric_fields() {
+    for (start, len) in [(SIZE_START, 12), (UID_START, 8), (GID_START, 8)] {
+        let mut archive = Vec::new();
+        let mut header = build_header(b"bad", b'0', 0, HeaderFlavor::Gnu);
+        set_bytes(&mut header, start, len, &[0xff; 12][..len]);
+        finalize_checksum(&mut header);
+        append_entry(&mut archive, header, b"");
+        append_eof(&mut archive);
+        assert_archive_error(
+            Cursor::new(archive),
+            ErrorKind::InvalidData,
+            "invalid numeric field",
+        );
+    }
+}
+
+#[test]
+fn reader_rejects_out_of_range_gnu_base256_ids() {
+    for start in [UID_START, GID_START] {
+        let mut archive = Vec::new();
+        let mut header = build_header(b"bad", b'0', 0, HeaderFlavor::Gnu);
+        set_bytes(&mut header, start, 8, &[0x80, 0, 0, 1, 0, 0, 0, 0]);
+        finalize_checksum(&mut header);
+        append_entry(&mut archive, header, b"");
+        append_eof(&mut archive);
+        assert_archive_error(Cursor::new(archive), ErrorKind::InvalidData, "out of range");
+    }
+}
+
+#[test]
+fn reader_reads_gnu_base256_times() -> Result<()> {
+    block_on_test(async {
+        let mut archive = Vec::new();
+        let mut header = build_header(b"file.txt", b'0', 0, HeaderFlavor::Gnu);
+        set_bytes(
+            &mut header,
+            GNU_ATIME_START,
+            12,
+            &[0x80, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0, 0],
+        );
+        set_bytes(
+            &mut header,
+            GNU_CTIME_START,
+            12,
+            &[0x80, 0, 0, 0, 0, 0, 0, 0x03, 0, 0, 0, 0x01],
+        );
+        finalize_checksum(&mut header);
+        append_entry(&mut archive, header, b"");
+        append_eof(&mut archive);
+
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+        match stream.next().await.unwrap()? {
+            TarEntry::File(file) => {
+                assert_eq!(file.atime(), Some(ts(1 << 33, 0)));
+                assert_eq!(file.ctime(), Some(ts((3 << 32) + 1, 0)));
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn reader_reads_gnu_base256_device_numbers() -> Result<()> {
+    block_on_test(async {
+        let mut archive = Vec::new();
+        for (name, typeflag) in [(&b"char"[..], b'3'), (&b"block"[..], b'4')] {
+            let mut header = build_header(name, typeflag, 0, HeaderFlavor::Gnu);
+            set_bytes(&mut header, 329, 8, &[0x80, 0, 0, 0, 0x01, 0, 0, 0]);
+            set_bytes(
+                &mut header,
+                337,
+                8,
+                &[0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff],
+            );
+            finalize_checksum(&mut header);
+            append_entry(&mut archive, header, b"");
+        }
+        append_eof(&mut archive);
+
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+        match stream.next().await.unwrap()? {
+            TarEntry::Device(device) => {
+                assert_eq!(device.path(), "char");
+                assert!(device.is_char());
+                assert_eq!(device.major(), 0x0100_0000);
+                assert_eq!(device.minor(), u32::MAX);
+            }
+            other => panic!("expected device entry, got {:?}", other),
+        }
+        match stream.next().await.unwrap()? {
+            TarEntry::Device(device) => {
+                assert_eq!(device.path(), "block");
+                assert!(device.is_block());
+                assert_eq!(device.major(), 0x0100_0000);
+                assert_eq!(device.minor(), u32::MAX);
+            }
+            other => panic!("expected device entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
 }
 
 #[test]
