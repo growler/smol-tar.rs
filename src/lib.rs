@@ -4,19 +4,25 @@
 
 //! A minimal async streaming tar reader and writer.
 //!
-//! The reader is fully streaming: [`TarReader`] yields [`TarEntry`] values from
-//! any [`AsyncRead`] source with very little buffering. Regular file entries
-//! expose their payload through [`TarRegularFile`], which also implements
-//! [`AsyncRead`]. To move on to the next entry, either read the file body to
-//! the end or drop the file reader.
+//! The crate does not access the filesystem. It reads archives from an
+//! [`AsyncRead`] source and writes archives to an [`AsyncWrite`] sink.
 //!
-//! The writer is a [`Sink`] of [`TarEntry`] values and also
-//! provides inherent [`TarWriter::write`] and [`TarWriter::finish`] helpers for
-//! straightforward sequential writing without [`futures::sink::SinkExt`].
+//! [`TarReader`] is a [`Stream`] of [`TarEntry`] values. It keeps little data
+//! in memory. A regular file entry gives its body through [`TarRegularFile`],
+//! which implements [`AsyncRead`]. To move to the next entry, read the file
+//! body to the end or drop the file entry.
 //!
-//! Write entries to archive with [`TarWriter::write`] or [`futures::sink::SinkExt::send`].
-//! Finish the archive with [`TarWriter::finish`] or [`futures::sink::SinkExt::close`]
-//! so the trailing zero blocks are emitted.
+//! [`TarWriter`] is a [`Sink`] of [`TarEntry`] values. It also has the
+//! inherent methods [`TarWriter::write`] and [`TarWriter::finish`], so you can
+//! write an archive without [`SinkExt`].
+//!
+//! Write entries with [`TarWriter::write`] or [`SinkExt::send`]. Finish the
+//! archive with [`TarWriter::finish`] or [`SinkExt::close`]. These methods
+//! write the two zero blocks that end a tar archive.
+//!
+//! [`SinkExt`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html
+//! [`SinkExt::send`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.send
+//! [`SinkExt::close`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.close
 //!
 //! # Examples
 //!
@@ -192,7 +198,52 @@
 //!
 //! # Not supported
 //!
-//! - Sparse files and multi-volume archives
+//! - Sparse files and multi-volume archives. The reader returns an error for
+//!   these entries.
+//!
+//! # Feature flags
+//!
+//! - `smol` (default): use the `futures-io` traits `AsyncRead` and
+//!   `AsyncWrite`. `smol` and other `futures`-based runtimes use these traits.
+//! - `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`.
+//! - `futures`: add the `futures` crate as a dependency. The library code does
+//!   not use it.
+//!
+//! Enable `smol` or `tokio`. If you enable neither feature, the build fails.
+//! If you enable both features, the crate uses the `tokio` traits.
+//!
+//! The documentation on docs.rs uses the default features. It shows the
+//! `futures-io` traits.
+//!
+//! # Sequential use
+//!
+//! [`TarReader`] and the file entries that it yields are `Send` and `Sync`,
+//! but they share one archive stream. Use them in sequence, not at the same
+//! time. Read each file body to the end or drop it before you get the next
+//! entry.
+//!
+//! # Paths and names
+//!
+//! Entry paths, link targets, and user and group names are UTF-8 strings. The
+//! reader returns an [`InvalidData`] error for a name that is not valid UTF-8.
+//!
+//! # Limits
+//!
+//! The reader returns an [`InvalidData`] error for these archive contents:
+//!
+//! - a GNU long name or long link that is larger than 4096 bytes
+//! - a PAX extension that is larger than 1 MiB
+//! - more than 256 global PAX extensions
+//!
+//! # Minimum supported Rust version
+//!
+//! Rust 1.85.
+//!
+//! # License
+//!
+//! MIT.
+//!
+//! [`InvalidData`]: std::io::ErrorKind::InvalidData
 //!
 
 #[cfg(not(any(feature = "smol", feature = "tokio")))]
@@ -1049,7 +1100,23 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 /// time. File entries remain streaming; to continue past a
 /// [`TarEntry::File`] entry, either read the file body to the end or drop it.
 ///
-/// # Example
+/// The stream ends after the two zero blocks that end the archive.
+///
+/// # Errors
+///
+/// The stream yields an error item in these conditions:
+///
+/// - [`ErrorKind::InvalidData`]: a header is malformed, has a bad checksum,
+///   has an unsupported entry type, has a name that is not valid UTF-8, or
+///   exceeds a crate [limit](crate#limits).
+/// - [`ErrorKind::UnexpectedEof`]: the source ends before the two zero blocks
+///   that end the archive.
+/// - The source reader returns an error. The stream yields that error.
+///
+/// A [`TarRegularFile`] body read returns [`ErrorKind::UnexpectedEof`] when
+/// the source ends before the end of the file body.
+///
+/// # Examples
 ///
 /// ```rust
 /// # #[cfg(all(feature = "smol", not(feature = "tokio")))]
@@ -1173,6 +1240,9 @@ impl TarLink {
     ///
     /// `path_name` is the path of the link entry in the archive and
     /// `link_name` is the target path stored in the header.
+    ///
+    /// The writer stores mode `0`, uid and gid `0`, and modification time
+    /// [`UNIX_EPOCH`] for hard-link entries.
     pub fn new<N: Into<Box<str>>, L: Into<Box<str>>>(path_name: N, link_name: L) -> TarLink {
         TarLink {
             path_name: path_name.into(),
@@ -1234,6 +1304,9 @@ impl<R: AsyncRead> From<TarDevice> for TarEntry<'_, R> {
 }
 impl TarDevice {
     /// Create a character-device entry.
+    ///
+    /// The entry has mode `0o600`, uid and gid `0`, no user or group name,
+    /// modification time [`UNIX_EPOCH`], and no extended attributes.
     pub fn new_char<N: Into<Box<str>>>(path_name: N, major: u32, minor: u32) -> TarDevice {
         TarDevice {
             path_name: path_name.into(),
@@ -1250,6 +1323,9 @@ impl TarDevice {
         }
     }
     /// Create a block-device entry.
+    ///
+    /// The entry has mode `0o600`, uid and gid `0`, no user or group name,
+    /// modification time [`UNIX_EPOCH`], and no extended attributes.
     pub fn new_block<N: Into<Box<str>>>(path_name: N, major: u32, minor: u32) -> TarDevice {
         TarDevice {
             path_name: path_name.into(),
@@ -1289,7 +1365,7 @@ impl TarDevice {
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the tar header, if present.
+    /// Return the symbolic user name, or an empty string if the entry has none.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
@@ -1307,7 +1383,7 @@ impl TarDevice {
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the tar header, if present.
+    /// Return the symbolic group name, or an empty string if the entry has none.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
@@ -1410,6 +1486,9 @@ impl<R: AsyncRead> From<TarFifo> for TarEntry<'_, R> {
 }
 impl TarFifo {
     /// Create a FIFO entry.
+    ///
+    /// The entry has mode `0o644`, uid and gid `0`, no user or group name,
+    /// modification time [`UNIX_EPOCH`], and no extended attributes.
     pub fn new<N: Into<Box<str>>>(path_name: N) -> TarFifo {
         TarFifo {
             path_name: path_name.into(),
@@ -1446,7 +1525,7 @@ impl TarFifo {
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the tar header, if present.
+    /// Return the symbolic user name, or an empty string if the entry has none.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
@@ -1464,7 +1543,7 @@ impl TarFifo {
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the tar header, if present.
+    /// Return the symbolic group name, or an empty string if the entry has none.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
@@ -1552,6 +1631,9 @@ impl TarSymlink {
     ///
     /// `path_name` is the link path stored in the archive and `link_name` is
     /// the target path.
+    ///
+    /// The entry has mode `0o777`, uid and gid `0`, no user or group name,
+    /// modification time [`UNIX_EPOCH`], and no extended attributes.
     pub fn new<N: Into<Box<str>>, L: Into<Box<str>>>(path_name: N, link_name: L) -> TarSymlink {
         TarSymlink {
             path_name: path_name.into(),
@@ -1593,7 +1675,7 @@ impl TarSymlink {
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the tar header, if present.
+    /// Return the symbolic user name, or an empty string if the entry has none.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
@@ -1611,7 +1693,7 @@ impl TarSymlink {
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the tar header, if present.
+    /// Return the symbolic group name, or an empty string if the entry has none.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
@@ -1697,7 +1779,8 @@ impl<R: AsyncRead> From<TarDirectory> for TarEntry<'_, R> {
 impl TarDirectory {
     /// Create a directory entry.
     ///
-    /// New directory entries are created with a stored size of `0`.
+    /// The entry has size `0`, mode `0o755`, uid and gid `0`, no user or group
+    /// name, modification time [`UNIX_EPOCH`], and no extended attributes.
     pub fn new<N: Into<Box<str>>>(path_name: N) -> TarDirectory {
         TarDirectory {
             path_name: path_name.into(),
@@ -1739,7 +1822,7 @@ impl TarDirectory {
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the tar header, if present.
+    /// Return the symbolic user name, or an empty string if the entry has none.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
@@ -1757,7 +1840,7 @@ impl TarDirectory {
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the tar header, if present.
+    /// Return the symbolic group name, or an empty string if the entry has none.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
@@ -1904,6 +1987,13 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
     /// Build a regular-file entry with the provided body reader.
     ///
     /// `size` must match the exact number of bytes that `inner` will yield.
+    /// When [`TarWriter`] writes the entry, it reads exactly `size` bytes from
+    /// `inner`. If `inner` ends before `size` bytes, the write fails with
+    /// [`ErrorKind::UnexpectedEof`]. If `inner` has more bytes, the writer
+    /// does not read them.
+    ///
+    /// The entry has mode `0o644`, uid and gid `0`, no user or group name,
+    /// modification time [`UNIX_EPOCH`], and no extended attributes.
     pub fn new<N: Into<Box<str>>>(path_name: N, size: u64, inner: R) -> TarRegularFile<'a, R> {
         TarRegularFile {
             path_name: path_name.into(),
@@ -1947,7 +2037,7 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
     pub fn uid(&self) -> u32 {
         self.uid
     }
-    /// Return the symbolic user name stored in the tar header, if present.
+    /// Return the symbolic user name, or an empty string if the entry has none.
     pub fn uname(&self) -> &str {
         self.uname.as_deref().unwrap_or("")
     }
@@ -1965,7 +2055,7 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
     pub fn gid(&self) -> u32 {
         self.gid
     }
-    /// Return the symbolic group name stored in the tar header, if present.
+    /// Return the symbolic group name, or an empty string if the entry has none.
     pub fn gname(&self) -> &str {
         self.gname.as_deref().unwrap_or("")
     }
@@ -3386,24 +3476,24 @@ fn format_octal(val: u64, field: &mut [u8]) -> std::io::Result<()> {
 }
 
 pin_project! {
-    /// Streaming tar writer that implements `future_sink::Sink<TarEntry<...>>`.
+    /// Streaming tar writer that implements [`Sink<TarEntry>`](Sink).
     ///
-    /// Headers and file payloads are staged inside `buf` until downstream I/O
-    /// makes progress, which keeps memory usage predictable while preserving
-    /// proper block alignment.
+    /// The writer keeps headers and file data in a fixed 16 KiB buffer inside
+    /// the struct until the output writer accepts them. Each entry starts on a
+    /// 512-byte block boundary.
     ///
-    /// The composable `Sink` interface is handy, but if bringing in the
-    /// `futures` crate feels a bit much, the writer also provides inherent
-    /// methods. Use [`TarWriter::write`] to send entries to the tar stream, and
-    /// [`TarWriter::finish`] once all entries have been written so the
-    /// terminating zero blocks required by the format are emitted.
-    /// [`futures::sink::SinkExt::close`] performs the same operation.
+    /// The writer also has inherent methods, so you can use it without the
+    /// `futures` crate. Use [`TarWriter::write`] to write each entry. When all
+    /// entries are written, call [`TarWriter::finish`] to write the two zero
+    /// blocks that end the archive. [`SinkExt::close`] does the same.
+    ///
+    /// [`SinkExt::close`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.close
     ///
     /// Type inference usually determines `R` from the file entries you send. If
     /// you only send metadata-only entries such as directories, you may need an
     /// explicit `TarWriter::<_, SomeReaderType>::new(...)` annotation.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```rust
     /// # #[cfg(all(feature = "smol", not(feature = "tokio")))]
@@ -3475,6 +3565,24 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> TarWriter<'a, 'b, W,
     }
 
     /// Write a single tar entry and flush it to the underlying writer.
+    ///
+    /// For a [`TarEntry::File`] entry, the method also reads the file body and
+    /// writes it to the archive.
+    ///
+    /// # Errors
+    ///
+    /// The method returns an error in these conditions:
+    ///
+    /// - [`ErrorKind::Other`]: the mode or a device number is too large for
+    ///   its header field, an
+    ///   extended-attribute name contains characters that are not ASCII
+    ///   graphic characters or contains `=`, or the PAX records of the entry
+    ///   do not fit in the writer buffer.
+    /// - [`ErrorKind::UnexpectedEof`]: the file body ends before
+    ///   [`TarRegularFile::size`] bytes.
+    /// - [`ErrorKind::WriteZero`]: the underlying writer accepts zero bytes.
+    /// - The file body reader or the underlying writer returns an error. The
+    ///   method returns that error.
     pub async fn write(&mut self, entry: TarEntry<'b, R>) -> std::io::Result<()> {
         poll_fn(|cx| {
             // SAFETY: the mutable borrow of `self` is held for the duration of
@@ -3495,6 +3603,15 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> TarWriter<'a, 'b, W,
     }
 
     /// Finish the archive by emitting the trailing zero blocks and closing.
+    ///
+    /// The method writes the remaining buffered data, then the two zero blocks
+    /// that end the archive. Then it closes the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// The method returns the same errors as [`TarWriter::write`] for data
+    /// that is not yet written. It also returns an error from the underlying
+    /// writer when the close fails.
     pub async fn finish(&mut self) -> std::io::Result<()> {
         poll_fn(|cx| {
             // SAFETY: the mutable borrow of `self` is held for the duration of

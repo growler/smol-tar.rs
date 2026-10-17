@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.89", stable, nightly]
+        rust: ["1.85", stable, nightly]
     
     steps:
       - uses: actions/checkout@v5
@@ -36,6 +36,14 @@ jobs:
         run: cargo test --no-default-features --features tokio -- --nocapture --test-threads=1
         env:
           RUST_BACKTRACE: 1 
+
+      - name: Build Docs
+        if: matrix.rust == 'stable'
+        run: |
+          cargo doc --no-deps
+          cargo doc --no-deps --no-default-features --features tokio
+        env:
+          RUSTDOCFLAGS: -D warnings
 
       - name: Report Coverage to Summary
         if: matrix.rust == 'nightly'

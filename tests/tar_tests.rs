@@ -3177,6 +3177,29 @@ fn writer_errors_when_file_source_is_short() {
 }
 
 #[test]
+fn writer_reads_only_size_bytes_when_file_source_is_long() -> Result<()> {
+    block_on_test(async {
+        let (writer_sink, shared) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
+        writer
+            .write(TarEntry::File(TarRegularFile::new(
+                "long.txt",
+                3,
+                Cursor::new(b"abcdef".as_slice()),
+            )))
+            .await?;
+        writer.finish().await?;
+
+        let buffer = shared.lock().unwrap().clone();
+        let entries = collect_entries_async(Cursor::new(buffer)).await?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "long.txt");
+        assert_eq!(entries[0].data, b"abc");
+        Ok(())
+    })
+}
+
+#[test]
 fn writer_rejects_nonportable_xattr_names() {
     block_on_test(async {
         let (writer_sink, _) = VecAsyncWriter::new();

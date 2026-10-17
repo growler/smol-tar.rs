@@ -1,8 +1,9 @@
 # smol-tar
 [![Tests](https://github.com/growler/smol-tar.rs/actions/workflows/test.yml/badge.svg)](https://github.com/growler/smol-tar.rs/actions/workflows/test.yml) ![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/growler/afe6b562550658e432029a3999ff9a8d/raw/smol-tar.rs-coverage.json) [![Docs](https://docs.rs/smol-tar/badge.svg)](https://docs.rs/smol-tar) [![Crates.io](https://img.shields.io/crates/v/smol-tar.svg?maxAge=2592000)](https://crates.io/crates/smol-tar)
 
-A minimal async streaming tar reader/writer. It does not perform filesystem 
-operations itself; it works with async readers, writers, and streams.
+A minimal async streaming tar reader and writer. It does not access the
+filesystem. It reads archives from async readers and writes archives to async
+writers.
 
 ## Supported formats
 
@@ -37,6 +38,21 @@ smol-tar = "0.1"
 [dependencies]
 smol-tar = { version = "0.1", default-features = false, features = ["tokio"] }
 ```
+
+## Feature flags
+
+- `smol` (default): use the `futures-io` traits `AsyncRead` and `AsyncWrite`.
+  `smol` and other `futures`-based runtimes use these traits.
+- `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`.
+- `futures`: add the `futures` crate as a dependency. The library code does
+  not use it.
+
+Enable `smol` or `tokio`. If you enable neither feature, the build fails. If
+you enable both features, the crate uses the `tokio` traits.
+
+## Minimum supported Rust version
+
+Rust 1.85.
 
 ## Reading archives
 
@@ -92,10 +108,10 @@ tar.write(
 tar.finish().await?;
 ```
 
-Alongside the direct API, the writer also implements the composable
-`futures_sink::Sink` interface:
-
 ## Filtering one archive into another sink
+
+The writer also implements the `futures_sink::Sink` trait. This example
+filters the entries of one archive into a second archive:
 
 ```rust
 use futures::{future, SinkExt, StreamExt, TryStreamExt};
@@ -165,17 +181,18 @@ The library is properly fuzzed and well covered by tests. It has also seen
 heavy use in a real internal CI/CD pipeline for some time, and now seems ready
 for release.
 
-## Caveats
+# Caveats
 
-- Although TarReader and the TarRegularFileReader values it yields are 
-  Send + Sync, they still share a single underlying archive stream and are 
-  intended for sequential, non-concurrent use. Read each file body to completion 
-  or drop it before advancing to the next entry. 
-- Regular file bodies are streamed. To advance to the next entry, either read
-  the file body to the end or drop the file reader.
+- `TarReader` and the `TarRegularFileReader` values that it yields are
+  `Send + Sync`, but they share one archive stream. Use them in sequence, not
+  at the same time. Read each file body to the end or drop it before you get
+  the next entry.
 - Library paths and example-CLI paths must be valid UTF-8.
+- The reader rejects a GNU long name or long link that is larger than 4096
+  bytes, a PAX extension that is larger than 1 MiB, and more than 256 global
+  PAX extensions.
 
-## Specail thanks
+# Special thanks
 
 To authors of [`async-tar`](https://crates.io/crates/async-tar) for the inspiration.
 
