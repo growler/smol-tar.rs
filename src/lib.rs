@@ -235,14 +235,6 @@
 //! - a PAX extension that is larger than 1 MiB
 //! - more than 256 global PAX extensions
 //!
-//! # Minimum supported Rust version
-//!
-//! Rust 1.85.
-//!
-//! # License
-//!
-//! MIT.
-//!
 //! [`InvalidData`]: std::io::ErrorKind::InvalidData
 //!
 
@@ -3476,7 +3468,7 @@ fn format_octal(val: u64, field: &mut [u8]) -> std::io::Result<()> {
 }
 
 pin_project! {
-    /// Streaming tar writer that implements [`Sink<TarEntry>`](Sink).
+    /// Streaming tar writer that implements [`Sink`] for [`TarEntry`] values.
     ///
     /// The writer keeps headers and file data in a fixed 16 KiB buffer inside
     /// the struct until the output writer accepts them. Each entry starts on a
