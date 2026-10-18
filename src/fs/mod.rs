@@ -4,12 +4,14 @@
 
 #[cfg_attr(not(test), expect(dead_code))]
 mod rt;
+mod source;
 #[cfg_attr(not(test), expect(dead_code))]
 mod sys;
 #[cfg(test)]
 mod testutil;
-#[cfg_attr(not(test), expect(dead_code))]
 mod walk;
+
+pub use source::{FsEntry, FsSource};
 
 use {
     crate::AttrList,
@@ -55,7 +57,6 @@ pub(crate) struct Meta {
 }
 
 /// Node in a directory.
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug)]
 pub(crate) struct Child {
     /// UTF-8 name in its parent directory.
@@ -66,7 +67,6 @@ pub(crate) struct Child {
 }
 
 /// Root of a source walk.
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug)]
 pub(crate) enum Root {
     /// The root is a directory.
