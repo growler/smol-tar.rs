@@ -1,7 +1,7 @@
 //! Filesystem source: a stream of the nodes in a directory tree.
 
 use {
-    super::{rt, sys, walk, with_path, Child, FsKind, Meta, Root},
+    super::{rt, sys, walk, with_path, Child, FsFile, FsKind, Meta, Root},
     crate::AttrList,
     futures_core::stream::Stream,
     std::{
@@ -386,10 +386,8 @@ pub struct FsEntry {
     /// Symlink target.
     link: Option<Box<str>>,
     /// Directory that holds the entry.
-    #[expect(dead_code)]
     parent: Arc<sys::Dir>,
     /// Name in `parent`.
-    #[expect(dead_code)]
     name: Box<str>,
 }
 
@@ -445,6 +443,19 @@ impl FsEntry {
     /// does not read extended attributes.
     pub fn xattrs(&self) -> &AttrList {
         &self.meta.xattrs
+    }
+
+    /// Body of the entry. The file opens on the first read. The caller makes
+    /// the body only for a regular file.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn file(&self) -> FsFile {
+        FsFile::new(
+            Arc::clone(&self.parent),
+            self.name.clone(),
+            self.meta.id,
+            self.meta.size,
+            self.path.clone(),
+        )
     }
 }
 

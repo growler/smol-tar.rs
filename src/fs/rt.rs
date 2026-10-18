@@ -4,7 +4,6 @@
 use std::io;
 
 /// Chunk size for file body I/O.
-#[cfg_attr(feature = "tokio", expect(dead_code))]
 pub(crate) const FILE_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Async file type for file bodies.
@@ -58,6 +57,37 @@ pub(crate) fn async_file(file: std::fs::File) -> AsyncFile {
 #[cfg(feature = "tokio")]
 pub(crate) fn async_file(file: std::fs::File) -> AsyncFile {
     tokio::fs::File::from_std(file)
+}
+
+/// Buffered reader for file bodies.
+///
+/// `Unblock` reads ahead up to `FILE_BUFFER_SIZE` bytes. `Take` stops the
+/// reader at the size that the source read, so the reader does no read at
+/// the end of the file.
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+pub(crate) type FileReader = blocking::Unblock<std::io::Take<std::fs::File>>;
+/// Buffered reader for file bodies.
+///
+/// `tokio::fs::File` does one round trip to the blocking thread pool for each
+/// read and does no read-ahead. Thus the reader reads the file in chunks of
+/// `FILE_BUFFER_SIZE`. `Take` stops the reader at the size that the source
+/// read, so the reader does no read at the end of the file.
+#[cfg(feature = "tokio")]
+pub(crate) type FileReader = tokio::io::BufReader<tokio::io::Take<AsyncFile>>;
+
+/// Wrap a blocking file in the buffered reader for file bodies. The reader
+/// gives no more than `size` bytes.
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+pub(crate) fn file_reader(file: std::fs::File, size: u64) -> FileReader {
+    blocking::Unblock::with_capacity(FILE_BUFFER_SIZE, std::io::Read::take(file, size))
+}
+
+/// Wrap a blocking file in the buffered reader for file bodies. The reader
+/// gives no more than `size` bytes.
+#[cfg(feature = "tokio")]
+pub(crate) fn file_reader(file: std::fs::File, size: u64) -> FileReader {
+    let file = tokio::io::AsyncReadExt::take(async_file(file), size);
+    tokio::io::BufReader::with_capacity(FILE_BUFFER_SIZE, file)
 }
 
 /// Wait for all pending operations, then give back the blocking file.

@@ -2,6 +2,7 @@
 //!
 //! This module is available only on Unix, with the `fs` feature.
 
+mod file;
 #[cfg_attr(not(test), expect(dead_code))]
 mod rt;
 mod source;
@@ -11,7 +12,10 @@ mod sys;
 mod testutil;
 mod walk;
 
-pub use source::{FsEntry, FsSource};
+pub use {
+    file::FsFile,
+    source::{FsEntry, FsSource},
+};
 
 use {
     crate::AttrList,
