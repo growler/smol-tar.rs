@@ -5,6 +5,8 @@
 mod file;
 mod into_tar;
 #[cfg_attr(not(test), expect(dead_code))]
+mod resolve;
+#[cfg_attr(not(test), expect(dead_code))]
 mod rt;
 mod source;
 #[cfg_attr(not(test), expect(dead_code))]
@@ -41,6 +43,25 @@ pub enum FsKind {
     BlockDevice,
 }
 
+/// Action of the sink when it cannot write an extended attribute.
+///
+/// The sink cannot write an attribute in these conditions:
+///
+/// - The system refuses the attribute (`EPERM` or `ENOTSUP`). For example,
+///   `security.*` and `trusted.*` attributes need privileges, and some
+///   filesystems do not support extended attributes.
+/// - The platform cannot write extended attributes on the kind of the node.
+///   For example, Linux does not write them on symbolic links and devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UnsupportedXattr {
+    /// Stop with an error. The error has the entry path and the attribute
+    /// name.
+    #[default]
+    Error,
+    /// Do not write the attribute, and continue.
+    Skip,
+}
+
 /// Metadata of a filesystem node.
 #[derive(Debug)]
 pub(crate) struct Meta {
@@ -71,6 +92,18 @@ pub(crate) struct Child {
     link: Option<Box<str>>,
 }
 
+/// Metadata that the sink sets on a node.
+pub(crate) struct SetMeta {
+    /// `None`: do not change the mode.
+    mode: Option<u32>,
+    /// `(uid, gid)`. `None`: do not change the owner.
+    owner: Option<(u32, u32)>,
+    mtime: SystemTime,
+    /// Empty: do not write xattrs.
+    xattrs: AttrList,
+    xattr_policy: UnsupportedXattr,
+}
+
 /// Root of a source walk.
 #[derive(Debug)]
 pub(crate) enum Root {
@@ -78,6 +111,17 @@ pub(crate) enum Root {
     Dir { dir: sys::Dir, meta: Meta },
     /// The root is not a directory. `parent` is the directory that holds it.
     Other { parent: sys::Dir, child: Child },
+}
+
+/// Node at a name in the destination of the sink.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Existing {
+    /// No node has the name.
+    Missing,
+    /// A directory. A symlink to a directory is `Other`.
+    Directory,
+    /// A node of another kind.
+    Other,
 }
 
 /// Add a path to the message of an error. The error kind does not change.

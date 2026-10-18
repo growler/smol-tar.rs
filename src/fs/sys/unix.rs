@@ -2,23 +2,23 @@
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use rustix::fs::Dir as DirReader;
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+use rustix::fs::{fgetxattr, flistxattr, fsetxattr, XattrFlags};
+#[cfg(not(target_vendor = "apple"))]
+use rustix::fs::{makedev, mknodat};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{seek, RawDir, SeekFrom};
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-use rustix::{
-    fd::{AsFd, BorrowedFd},
-    fs::{fgetxattr, flistxattr},
-};
 use {
     crate::{
-        fs::{with_path, Child, FsKind, Meta, Root},
+        fs::{with_path, Child, Existing, FsKind, Meta, Root, SetMeta, UnsupportedXattr},
         AttrList,
     },
     rustix::{
-        fd::OwnedFd,
+        fd::{AsFd, BorrowedFd, OwnedFd},
         fs::{
-            fcntl_setfl, fstat, major, minor, openat, readlinkat, readlinkat_raw, statat, AtFlags,
-            FileType, Mode, OFlags, Stat, CWD,
+            chmodat, chownat, fchmod, fchown, fcntl_setfl, fstat, futimens, linkat, major, minor,
+            mkdirat, openat, readlinkat, readlinkat_raw, statat, symlinkat, unlinkat, utimensat,
+            AtFlags, FileType, Gid, Mode, OFlags, Stat, Timespec, Timestamps, Uid, CWD, UTIME_OMIT,
         },
         io::Errno,
         path::Arg,
@@ -29,7 +29,7 @@ use {
         mem::MaybeUninit,
         os::unix::ffi::OsStrExt,
         path::Path,
-        time::{Duration, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     },
 };
 
@@ -387,15 +387,32 @@ fn read_xattrs_at_with<P: Arg + Copy>(
     expect: FileId,
     bufs: &mut XattrBufs,
 ) -> io::Result<AttrList> {
-    let fd = match kind {
+    let fd = match open_for_xattrs(parent, name, kind) {
+        Ok(Some(fd)) => fd,
+        Ok(None) => return Ok(AttrList::new()),
+        // A FIFO has no body. An empty list lets the walk keep a FIFO that it
+        // cannot open.
+        Err(err) if kind == FsKind::Fifo && Errno::from_io_error(&err) == Some(Errno::ACCESS) => {
+            return Ok(AttrList::new())
+        }
+        Err(err) => return Err(err),
+    };
+    check_id(&fstat(&fd)?, kind, expect)?;
+    read_fd_xattrs(fd.as_fd(), bufs)
+}
+
+/// Open the node `name` in `parent` to read or write its xattrs. `kind` is
+/// the expected kind of the node. The caller checks the kind. A kind that
+/// cannot be opened safely gives `None`.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn open_for_xattrs<P: Arg + Copy>(
+    parent: &Dir,
+    name: P,
+    kind: FsKind,
+) -> io::Result<Option<OwnedFd>> {
+    Ok(Some(match kind {
         FsKind::File => open_nonblock(parent, name)?.0,
-        FsKind::Fifo => match openat(parent, name, FILE_FLAGS, Mode::empty()) {
-            Ok(fd) => fd,
-            // A FIFO has no body. An empty list lets the walk keep a FIFO
-            // that it cannot open.
-            Err(Errno::ACCESS) => return Ok(AttrList::new()),
-            Err(err) => return Err(err.into()),
-        },
+        FsKind::Fifo => openat(parent, name, FILE_FLAGS, Mode::empty())?,
         FsKind::Directory => openat(parent, name, DIR_FLAGS, Mode::empty())?,
         // `O_SYMLINK` opens the symlink itself. If the node is no longer a
         // symlink, `O_NONBLOCK` and `O_NOCTTY` make the open safe for a FIFO
@@ -410,10 +427,8 @@ fn read_xattrs_at_with<P: Arg + Copy>(
         // Linux: an `O_PATH` descriptor gives `EBADF` for `flistxattr`, and
         // `user.*` is not allowed on symlinks. The open of a device node can
         // have side effects.
-        _ => return Ok(AttrList::new()),
-    };
-    check_id(&fstat(&fd)?, kind, expect)?;
-    read_fd_xattrs(fd.as_fd(), bufs)
+        _ => return Ok(None),
+    }))
 }
 
 /// Read the xattrs of the node `name` in `parent`. This target has no xattrs.
@@ -497,6 +512,289 @@ fn read_sized(
             }
             result => return result,
         }
+    }
+}
+
+/// Open the destination directory of the sink. `path` can be a symlink to a
+/// directory.
+pub(crate) fn open_dest(path: &Path) -> io::Result<Dir> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    openat(CWD, path, flags, Mode::empty()).map_err(|err| path_error(err.into(), path))
+}
+
+/// Open the directory `name` in `parent`. With `create` set, create a
+/// missing directory with mode 0o755. The new directory keeps the setgid bit
+/// that it gets from `parent`.
+pub(crate) fn open_child_dir(parent: &Dir, name: &str, create: bool) -> io::Result<Dir> {
+    match openat(parent, name, DIR_FLAGS, Mode::empty()) {
+        Err(Errno::NOENT) if create => {}
+        result => return Ok(result?),
+    }
+    let mode = Mode::from_raw_mode(0o755);
+    let created = match mkdirat(parent, name, mode) {
+        Ok(()) => true,
+        // Another process created the name after the first open.
+        Err(Errno::EXIST) => false,
+        Err(err) => return Err(err.into()),
+    };
+    let dir = openat(parent, name, DIR_FLAGS, Mode::empty())?;
+    if created {
+        set_new_dir_mode(&dir, mode)?;
+    }
+    Ok(dir)
+}
+
+/// Set the mode of the new directory `dir` to `mode`, because `mkdirat`
+/// applies the umask. Keep the setgid bit of `dir`.
+fn set_new_dir_mode(dir: &Dir, mode: Mode) -> io::Result<()> {
+    let setgid = Mode::from_raw_mode(fstat(dir)?.st_mode as _) & Mode::SGID;
+    Ok(fchmod(dir, mode | setgid)?)
+}
+
+/// Give the kind of the node `name` in `parent`. A symlink is `Other`.
+pub(crate) fn lookup(parent: &Dir, name: &str) -> io::Result<Existing> {
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) if kind_of(&st) == Some(FsKind::Directory) => Ok(Existing::Directory),
+        Ok(_) => Ok(Existing::Other),
+        Err(Errno::NOENT) => Ok(Existing::Missing),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Remove the node `name` in `parent`. The node must not be a directory.
+pub(crate) fn remove(parent: &Dir, name: &str) -> io::Result<()> {
+    Ok(unlinkat(parent, name, AtFlags::empty())?)
+}
+
+/// Create the directory `name` in `parent` with mode 0o700. The directory
+/// keeps the setgid bit that it gets from `parent`.
+pub(crate) fn create_dir(parent: &Dir, name: &str) -> io::Result<()> {
+    let mode = Mode::from_raw_mode(0o700);
+    mkdirat(parent, name, mode)?;
+    let dir = openat(parent, name, DIR_FLAGS, Mode::empty())?;
+    set_new_dir_mode(&dir, mode)
+}
+
+/// Create the regular file `name` in `parent` with mode 0o600 and open it
+/// for writing. An existing name gives `AlreadyExists`.
+pub(crate) fn create_file(parent: &Dir, name: &str) -> io::Result<std::fs::File> {
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = openat(parent, name, flags, Mode::from_raw_mode(0o600))?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// Create the symlink `name` in `parent` with the target `target`.
+pub(crate) fn create_symlink(parent: &Dir, name: &str, target: &str) -> io::Result<()> {
+    Ok(symlinkat(target, parent, name)?)
+}
+
+/// Create the name `name` in `parent` for the node `from_name` in `from`.
+pub(crate) fn create_link(from: &Dir, from_name: &str, parent: &Dir, name: &str) -> io::Result<()> {
+    Ok(linkat(from, from_name, parent, name, AtFlags::empty())?)
+}
+
+/// Create the FIFO or device `name` in `parent` with mode 0o600. A device
+/// needs `device`, the `(major, minor)` numbers. Other kinds give
+/// `InvalidInput`.
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn create_special(
+    parent: &Dir,
+    name: &str,
+    kind: FsKind,
+    device: Option<(u32, u32)>,
+) -> io::Result<()> {
+    let (file_type, dev) = match (kind, device) {
+        (FsKind::Fifo, _) => (FileType::Fifo, 0),
+        (FsKind::CharDevice, Some((major, minor))) => {
+            (FileType::CharacterDevice, makedev(major, minor))
+        }
+        (FsKind::BlockDevice, Some((major, minor))) => {
+            (FileType::BlockDevice, makedev(major, minor))
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a FIFO or a device with device numbers",
+            ))
+        }
+    };
+    let mode = Mode::from_raw_mode(0o600);
+    Ok(mknodat(parent, name, file_type, mode, dev)?)
+}
+
+/// Create a FIFO or a device. Apple platforms have no `mknodat`.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn create_special(
+    _parent: &Dir,
+    _name: &str,
+    _kind: FsKind,
+    _device: Option<(u32, u32)>,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "FIFOs and devices are not supported on this platform",
+    ))
+}
+
+/// Set the metadata of an open regular file.
+pub(crate) fn set_meta_file(file: &std::fs::File, meta: &SetMeta) -> io::Result<()> {
+    set_meta_fd(file.as_fd(), meta)
+}
+
+/// Set the metadata of an open directory.
+pub(crate) fn set_meta_dir(dir: &Dir, meta: &SetMeta) -> io::Result<()> {
+    set_meta_fd(dir.as_fd(), meta)
+}
+
+/// Set the metadata of an open node. The xattrs come before the mode, thus a
+/// read-only mode does not stop the xattr writes.
+fn set_meta_fd(fd: BorrowedFd<'_>, meta: &SetMeta) -> io::Result<()> {
+    if let Some(owner) = meta.owner {
+        let (uid, gid) = owner_ids(owner);
+        fchown(fd, uid, gid)?;
+    }
+    set_fd_xattrs(fd, &meta.xattrs, meta.xattr_policy)?;
+    if let Some(mode) = meta.mode {
+        fchmod(fd, Mode::from_raw_mode(mode as _))?;
+    }
+    futimens(fd, &timestamps(meta.mtime)?)?;
+    Ok(())
+}
+
+/// Set the metadata of the symlink, FIFO or device `name` in `parent`. The
+/// node must have the kind `kind`. Other kinds give `InvalidInput`. The mode
+/// of a symlink does not change.
+pub(crate) fn set_meta_at(
+    parent: &Dir,
+    name: &str,
+    kind: FsKind,
+    meta: &SetMeta,
+) -> io::Result<()> {
+    if matches!(kind, FsKind::File | FsKind::Directory) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a symlink, a FIFO or a device",
+        ));
+    }
+    let times = timestamps(meta.mtime)?;
+    utimensat(parent, name, &times, AtFlags::SYMLINK_NOFOLLOW)?;
+    if let Some(owner) = meta.owner {
+        let (uid, gid) = owner_ids(owner);
+        chownat(parent, name, uid, gid, AtFlags::SYMLINK_NOFOLLOW)?;
+    }
+    set_xattrs_at(parent, name, kind, meta)?;
+    if let Some(mode) = meta.mode {
+        if kind != FsKind::Symlink {
+            // Linux does not support `SYMLINK_NOFOLLOW` here on all kernels.
+            // The node is not a symlink: the sink created it immediately
+            // before, in a directory that it opened without following links.
+            let mode = Mode::from_raw_mode(mode as _);
+            chmodat(parent, name, mode, AtFlags::empty())?;
+        }
+    }
+    Ok(())
+}
+
+/// Give the `chown` arguments for `(uid, gid)`.
+fn owner_ids((uid, gid): (u32, u32)) -> (Option<Uid>, Option<Gid>) {
+    // `from_raw` rejects `u32::MAX` in debug builds. For `chown`, `u32::MAX`
+    // means "no change".
+    (
+        Some(Uid::from_raw_unchecked(uid)),
+        Some(Gid::from_raw_unchecked(gid)),
+    )
+}
+
+/// Give the timestamps that set the mtime to `mtime` and do not change the
+/// atime. A time out of range gives `InvalidInput`.
+fn timestamps(mtime: SystemTime) -> io::Result<Timestamps> {
+    let out_of_range = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "modification time out of range",
+        )
+    };
+    let (sec, nsec) = match mtime.duration_since(UNIX_EPOCH) {
+        Ok(after) => (i64::try_from(after.as_secs()), after.subsec_nanos()),
+        Err(err) => {
+            // `tv_nsec` is not negative: round `tv_sec` down.
+            let before = err.duration();
+            let sec = i64::try_from(before.as_secs()).map(|sec| -sec);
+            match before.subsec_nanos() {
+                0 => (sec, 0),
+                nsec => (sec.map(|sec| sec - 1), 1_000_000_000 - nsec),
+            }
+        }
+    };
+    Ok(Timestamps {
+        last_access: Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        last_modification: Timespec {
+            tv_sec: sec.map_err(|_| out_of_range())?,
+            tv_nsec: nsec as _,
+        },
+    })
+}
+
+/// Write the xattrs of `meta` on the node `name` in `parent`. The node must
+/// have the kind `kind`. A different kind gives `InvalidData`.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn set_xattrs_at(parent: &Dir, name: &str, kind: FsKind, meta: &SetMeta) -> io::Result<()> {
+    if meta.xattrs.is_empty() {
+        return Ok(());
+    }
+    let Some(fd) = open_for_xattrs(parent, name, kind)? else {
+        return no_xattrs(&meta.xattrs, meta.xattr_policy);
+    };
+    if kind_of(&fstat(&fd)?) != Some(kind) {
+        return Err(file_changed());
+    }
+    set_fd_xattrs(fd.as_fd(), &meta.xattrs, meta.xattr_policy)
+}
+
+/// Write the xattrs of `meta` on a node. This target has no xattrs.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn set_xattrs_at(_parent: &Dir, _name: &str, _kind: FsKind, meta: &SetMeta) -> io::Result<()> {
+    no_xattrs(&meta.xattrs, meta.xattr_policy)
+}
+
+/// Write `attrs` on `fd`. `EPERM` and `ENOTSUP` apply `policy`.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn set_fd_xattrs(fd: BorrowedFd<'_>, attrs: &AttrList, policy: UnsupportedXattr) -> io::Result<()> {
+    for (name, value) in attrs.iter() {
+        match fsetxattr(fd, name, value, XattrFlags::empty()) {
+            Ok(()) => {}
+            Err(Errno::PERM | Errno::NOTSUP) if policy == UnsupportedXattr::Skip => {}
+            Err(err) => {
+                let err = io::Error::from(err);
+                return Err(io::Error::new(err.kind(), format!("xattr {name}: {err}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write `attrs` on `fd`. This target has no xattrs.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn set_fd_xattrs(
+    _fd: BorrowedFd<'_>,
+    attrs: &AttrList,
+    policy: UnsupportedXattr,
+) -> io::Result<()> {
+    no_xattrs(attrs, policy)
+}
+
+/// Apply `policy` to `attrs` for a node that cannot have xattrs. A list that
+/// is not empty gives `Unsupported` with `UnsupportedXattr::Error`.
+fn no_xattrs(attrs: &AttrList, policy: UnsupportedXattr) -> io::Result<()> {
+    match attrs.iter().next() {
+        Some((name, _)) if policy == UnsupportedXattr::Error => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("xattr {name}: extended attributes are not supported on this file type"),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -813,6 +1111,227 @@ mod tests {
         assert!(find(&children, "p").meta.xattrs.is_empty());
     }
 
+    /// Give a `SetMeta` with no owner and no xattrs.
+    fn set_meta(mode: Option<u32>, mtime: SystemTime) -> SetMeta {
+        SetMeta {
+            mode,
+            owner: None,
+            mtime,
+            xattrs: AttrList::new(),
+            xattr_policy: UnsupportedXattr::Error,
+        }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[test]
+    fn open_child_dir_creates_with_mode_0o755() {
+        // The umask 0o022 does not change 0o755. Only a umask that removes
+        // more bits, for example 0o077, tests the `fchmod`.
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        open_child_dir(&root, "d", true).unwrap();
+        assert_eq!(mode_of(&tmp.path().join("d")), 0o755);
+    }
+
+    #[test]
+    fn open_child_dir_missing_gives_not_found() {
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        let err = open_child_dir(&root, "d", false).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn open_child_dir_does_not_follow_symlink() {
+        let tmp = TempDir::new();
+        std::fs::create_dir(tmp.path().join("d")).unwrap();
+        std::os::unix::fs::symlink("d", tmp.path().join("l")).unwrap();
+        std::os::unix::fs::symlink("missing", tmp.path().join("dangling")).unwrap();
+        let root = open_dest(tmp.path()).unwrap();
+        open_child_dir(&root, "l", true).unwrap_err();
+        open_child_dir(&root, "dangling", true).unwrap_err();
+        assert_eq!(std::fs::read_dir(tmp.path().join("d")).unwrap().count(), 0);
+        assert!(std::fs::symlink_metadata(tmp.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn open_child_dir_on_file_gives_enotdir() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join("f"), b"").unwrap();
+        let root = open_dest(tmp.path()).unwrap();
+        let err = open_child_dir(&root, "f", true).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(Errno::NOTDIR.raw_os_error()));
+    }
+
+    #[test]
+    fn lookup_kinds() {
+        let tmp = TempDir::new();
+        std::fs::create_dir(tmp.path().join("d")).unwrap();
+        std::fs::write(tmp.path().join("f"), b"").unwrap();
+        std::os::unix::fs::symlink("d", tmp.path().join("l")).unwrap();
+        let root = open_dest(tmp.path()).unwrap();
+        assert_eq!(lookup(&root, "missing").unwrap(), Existing::Missing);
+        assert_eq!(lookup(&root, "d").unwrap(), Existing::Directory);
+        assert_eq!(lookup(&root, "f").unwrap(), Existing::Other);
+        assert_eq!(lookup(&root, "l").unwrap(), Existing::Other);
+    }
+
+    #[test]
+    fn remove_does_not_follow_symlink() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join("t"), b"").unwrap();
+        std::os::unix::fs::symlink("t", tmp.path().join("l")).unwrap();
+        let root = open_dest(tmp.path()).unwrap();
+        remove(&root, "l").unwrap();
+        assert!(std::fs::symlink_metadata(tmp.path().join("l")).is_err());
+        assert!(tmp.path().join("t").is_file());
+    }
+
+    #[test]
+    fn create_dir_mode_0o700() {
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        create_dir(&root, "d").unwrap();
+        assert_eq!(mode_of(&tmp.path().join("d")), 0o700);
+    }
+
+    #[test]
+    fn open_child_dir_and_create_dir_keep_setgid() {
+        use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+        let tmp = TempDir::new();
+        let parent = tmp.path().join("p");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, Permissions::from_mode(0o2775)).unwrap();
+        if mode_of(&parent) != 0o2775 {
+            eprintln!("skip: the process cannot set the setgid bit");
+            return;
+        }
+        std::fs::create_dir(parent.join("probe")).unwrap();
+        if mode_of(&parent.join("probe")) & 0o2000 == 0 {
+            eprintln!("skip: a new directory does not get the setgid bit");
+            return;
+        }
+        let dir = open_dest(&parent).unwrap();
+        open_child_dir(&dir, "a", true).unwrap();
+        create_dir(&dir, "b").unwrap();
+        assert_eq!(mode_of(&parent.join("a")), 0o2755);
+        assert_eq!(mode_of(&parent.join("b")), 0o2700);
+    }
+
+    #[test]
+    fn create_file_existing_gives_already_exists() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join("f"), b"").unwrap();
+        let root = open_dest(tmp.path()).unwrap();
+        let err = create_file(&root, "f").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn create_file_does_not_follow_dangling_symlink() {
+        let tmp = TempDir::new();
+        std::os::unix::fs::symlink("t", tmp.path().join("l")).unwrap();
+        let root = open_dest(tmp.path()).unwrap();
+        create_file(&root, "l").unwrap_err();
+        assert!(std::fs::symlink_metadata(tmp.path().join("t")).is_err());
+    }
+
+    #[test]
+    fn create_symlink_target() {
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        create_symlink(&root, "l", "some/target").unwrap();
+        let target = std::fs::read_link(tmp.path().join("l")).unwrap();
+        assert_eq!(target, Path::new("some/target"));
+    }
+
+    #[test]
+    fn create_link_shares_inode() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join("f"), b"").unwrap();
+        let root = open_dest(tmp.path()).unwrap();
+        create_link(&root, "f", &root, "g").unwrap();
+        assert_eq!(id_of(&tmp.path().join("f")), id_of(&tmp.path().join("g")));
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn create_special_fifo() {
+        use std::os::unix::fs::FileTypeExt;
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        create_special(&root, "p", FsKind::Fifo, None).unwrap();
+        let md = std::fs::symlink_metadata(tmp.path().join("p")).unwrap();
+        assert!(md.file_type().is_fifo());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn create_special_fifo() {
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        let err = create_special(&root, "p", FsKind::Fifo, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn set_meta_at_symlink_sets_mtime() {
+        use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+        let tmp = TempDir::new();
+        let target = tmp.path().join("t");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, Permissions::from_mode(0o644)).unwrap();
+        let target_mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+        std::os::unix::fs::symlink("t", tmp.path().join("l")).unwrap();
+        let root = open_dest(tmp.path()).unwrap();
+        let mtime = UNIX_EPOCH + Duration::new(1_000_000, 500);
+        set_meta_at(&root, "l", FsKind::Symlink, &set_meta(Some(0o600), mtime)).unwrap();
+        let md = std::fs::symlink_metadata(tmp.path().join("l")).unwrap();
+        assert_eq!(md.modified().unwrap(), mtime);
+        let md = std::fs::metadata(&target).unwrap();
+        assert_eq!(md.modified().unwrap(), target_mtime);
+        assert_eq!(md.mode() & 0o7777, 0o644);
+    }
+
+    #[test]
+    fn set_meta_file_sets_mode_and_mtime() {
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        // `create_file` gives mode 0o600. No umask gives 0o640 from it.
+        let file = create_file(&root, "f").unwrap();
+        let mtime = UNIX_EPOCH + Duration::new(1_000_000, 500);
+        set_meta_file(&file, &set_meta(Some(0o640), mtime)).unwrap();
+        let md = std::fs::symlink_metadata(tmp.path().join("f")).unwrap();
+        assert_eq!(md.mode() & 0o7777, 0o640);
+        assert_eq!(md.modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn set_meta_dir_sets_mode_and_mtime() {
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        create_dir(&root, "d").unwrap();
+        let dir = open_child_dir(&root, "d", false).unwrap();
+        let mtime = UNIX_EPOCH - Duration::from_millis(1500);
+        // The directory stays empty, thus the removal of the temporary
+        // directory does not need write permission on it.
+        set_meta_dir(&dir, &set_meta(Some(0o555), mtime)).unwrap();
+        let md = std::fs::symlink_metadata(tmp.path().join("d")).unwrap();
+        assert_eq!(md.mode() & 0o7777, 0o555);
+        assert_eq!(md.modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn timestamps_before_epoch() {
+        let times = timestamps(UNIX_EPOCH - Duration::from_millis(1500)).unwrap();
+        assert_eq!(times.last_modification.tv_sec, -2);
+        assert_eq!(times.last_modification.tv_nsec, 500_000_000);
+        assert_eq!(times.last_access.tv_nsec, UTIME_OMIT);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     mod xattr {
         use {
@@ -966,6 +1485,151 @@ mod tests {
             let err = read_xattrs_at(&dir, "f", FsKind::Fifo, id_of(&path)).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidData);
             assert_eq!(err.to_string(), "file changed");
+        }
+
+        /// Give `true` if the filesystem of `dir` supports `user.*` xattrs.
+        fn user_xattrs_supported(dir: &Path) -> bool {
+            let probe = dir.join("probe");
+            std::fs::write(&probe, b"").unwrap();
+            let supported = set_xattr(&probe, "user.probe", b"");
+            std::fs::remove_file(&probe).unwrap();
+            supported
+        }
+
+        /// Give `true` if the process can set the xattr `name` on a new file
+        /// in `dir`.
+        #[cfg(target_os = "linux")]
+        fn can_set_xattr(dir: &Path, name: &str, value: &[u8]) -> bool {
+            let probe = dir.join("probe");
+            std::fs::write(&probe, b"").unwrap();
+            let allowed = match setxattr(&probe, name, value, XattrFlags::empty()) {
+                Ok(()) => true,
+                Err(Errno::PERM) => false,
+                Err(err) => panic!("setxattr {name}: {err}"),
+            };
+            std::fs::remove_file(&probe).unwrap();
+            allowed
+        }
+
+        fn set_meta_xattrs(
+            mode: Option<u32>,
+            xattrs: AttrList,
+            xattr_policy: UnsupportedXattr,
+        ) -> SetMeta {
+            SetMeta {
+                xattrs,
+                xattr_policy,
+                ..set_meta(mode, UNIX_EPOCH)
+            }
+        }
+
+        #[test]
+        fn set_meta_writes_user_xattrs() {
+            let tmp = TempDir::new();
+            if !user_xattrs_supported(tmp.path()) {
+                return;
+            }
+            let root = open_dest(tmp.path()).unwrap();
+            let attrs = AttrList::new().with("user.a", &b"1"[..]);
+
+            let file = create_file(&root, "f").unwrap();
+            let meta = set_meta_xattrs(Some(0o444), attrs.clone(), UnsupportedXattr::Error);
+            set_meta_file(&file, &meta).unwrap();
+            let id = id_of(&tmp.path().join("f"));
+            let list = read_xattrs_at(&root, "f", FsKind::File, id).unwrap();
+            assert_eq!(user_attrs(&list), [("user.a", &b"1"[..])]);
+
+            // A process without the right to bypass permission checks cannot
+            // write `user.*` xattrs on a directory with mode 0o555. The
+            // directory stays empty for the removal of the temporary
+            // directory.
+            create_dir(&root, "d").unwrap();
+            let dir = open_child_dir(&root, "d", false).unwrap();
+            let meta = set_meta_xattrs(Some(0o555), attrs, UnsupportedXattr::Error);
+            set_meta_dir(&dir, &meta).unwrap();
+            let list = read_xattrs_dir(&dir).unwrap();
+            assert_eq!(user_attrs(&list), [("user.a", &b"1"[..])]);
+            assert_eq!(mode_of(&tmp.path().join("d")), 0o555);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn set_meta_file_trusted_xattr_policy() {
+            let tmp = TempDir::new();
+            if !user_xattrs_supported(tmp.path()) {
+                return;
+            }
+            if can_set_xattr(tmp.path(), "trusted.x", b"1") {
+                eprintln!("skip: the process can set trusted xattrs");
+                return;
+            }
+            let root = open_dest(tmp.path()).unwrap();
+            let file = create_file(&root, "f").unwrap();
+            let attrs = AttrList::new()
+                .with("trusted.x", &b"1"[..])
+                .with("user.a", &b"1"[..]);
+
+            let meta = set_meta_xattrs(None, attrs.clone(), UnsupportedXattr::Error);
+            let err = set_meta_file(&file, &meta).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+            assert!(err.to_string().starts_with("xattr trusted.x: "), "{err}");
+
+            let meta = set_meta_xattrs(None, attrs, UnsupportedXattr::Skip);
+            set_meta_file(&file, &meta).unwrap();
+            let id = id_of(&tmp.path().join("f"));
+            let list = read_xattrs_at(&root, "f", FsKind::File, id).unwrap();
+            assert_eq!(user_attrs(&list), [("user.a", &b"1"[..])]);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn set_meta_at_symlink_xattr_policy() {
+            let tmp = TempDir::new();
+            std::os::unix::fs::symlink("t", tmp.path().join("l")).unwrap();
+            let root = open_dest(tmp.path()).unwrap();
+            let attrs = AttrList::new().with("user.a", &b"1"[..]);
+
+            let meta = set_meta_xattrs(None, attrs.clone(), UnsupportedXattr::Error);
+            let err = set_meta_at(&root, "l", FsKind::Symlink, &meta).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Unsupported);
+            assert!(err.to_string().starts_with("xattr user.a: "), "{err}");
+
+            let meta = set_meta_xattrs(None, attrs, UnsupportedXattr::Skip);
+            set_meta_at(&root, "l", FsKind::Symlink, &meta).unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn set_meta_file_keeps_capability_after_owner() {
+            // VFS capability version 2: magic and flags, then the permitted
+            // set with `CAP_NET_BIND_SERVICE`, then the inheritable set and
+            // the upper 32 bits.
+            let mut cap = [0u8; 20];
+            cap[..8].copy_from_slice(&[0x01, 0x00, 0x00, 0x02, 0x00, 0x04, 0x00, 0x00]);
+            let tmp = TempDir::new();
+            if !can_set_xattr(tmp.path(), "security.capability", &cap) {
+                eprintln!("skip: the process cannot set security.capability");
+                return;
+            }
+            let root = open_dest(tmp.path()).unwrap();
+            let file = create_file(&root, "f").unwrap();
+            let md = file.metadata().unwrap();
+            let meta = SetMeta {
+                owner: Some((md.uid(), md.gid())),
+                ..set_meta_xattrs(
+                    Some(0o755),
+                    AttrList::new().with("security.capability", &cap[..]),
+                    UnsupportedXattr::Error,
+                )
+            };
+            set_meta_file(&file, &meta).unwrap();
+            let id = id_of(&tmp.path().join("f"));
+            let list = read_xattrs_at(&root, "f", FsKind::File, id).unwrap();
+            let value = list
+                .iter()
+                .find(|(name, _)| *name == "security.capability")
+                .map(|(_, value)| value);
+            assert_eq!(value, Some(&cap[..]));
         }
     }
 }

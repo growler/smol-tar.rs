@@ -71,6 +71,9 @@
 //!   default directory mode of the platform (Unix: 0o755).
 //! - `create_dir` makes a directory that only the owner can change (Unix:
 //!   0o700). The sink sets the final mode when it finishes.
+//! - On Unix, the umask does not change the mode of a directory that
+//!   `open_child_dir` or `create_dir` creates. The directory keeps the setgid
+//!   bit that it gets from its parent.
 //! - `create_file` creates a new file and fails if the name exists.
 //! - `create_special` gives `Unsupported` on a platform that cannot create the
 //!   kind.
