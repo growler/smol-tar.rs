@@ -4,12 +4,10 @@
 
 mod file;
 mod into_tar;
-#[cfg_attr(not(test), expect(dead_code))]
 mod resolve;
-#[cfg_attr(not(test), expect(dead_code))]
 mod rt;
+mod sink;
 mod source;
-#[cfg_attr(not(test), expect(dead_code))]
 mod sys;
 #[cfg(test)]
 mod testutil;
@@ -18,6 +16,7 @@ mod walk;
 pub use {
     file::FsFile,
     into_tar::{FsStreamExt, IntoTar},
+    sink::FsSink,
     source::{FsEntry, FsSource},
 };
 
@@ -41,6 +40,26 @@ pub enum FsKind {
     CharDevice,
     /// Block device.
     BlockDevice,
+}
+
+/// Action of the sink for a hard link whose target the sink did not create.
+///
+/// The sink creates a hard link only to a path that it created before from
+/// the same archive. The target is not available in these conditions:
+///
+/// - The archive has the link before its target.
+/// - A filter removed the target entry.
+/// - The target is a directory, or a later entry replaced it with a
+///   directory.
+/// - The target path starts with `/` or has a `..` component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MissingLinkTarget {
+    /// Stop with a [`NotFound`](std::io::ErrorKind::NotFound) error. The
+    /// error has the entry path and the link target.
+    #[default]
+    Error,
+    /// Do not create the link, and continue.
+    Skip,
 }
 
 /// Action of the sink when it cannot write an extended attribute.

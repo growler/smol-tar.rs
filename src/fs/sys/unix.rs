@@ -368,6 +368,7 @@ pub(crate) fn read_xattrs_dir(_dir: &Dir) -> io::Result<AttrList> {
 /// Read the xattrs of the node `name` in `parent`. The kind must be `kind`
 /// and the identity must be `expect`. A kind that cannot be opened safely
 /// gives an empty list.
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn read_xattrs_at(
     parent: &Dir,
     name: &str,
