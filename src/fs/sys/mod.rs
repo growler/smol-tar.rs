@@ -75,8 +75,10 @@
 //!   `open_child_dir` or `create_dir` creates. The directory keeps the setgid
 //!   bit that it gets from its parent.
 //! - `create_file` creates a new file and fails if the name exists.
-//! - `create_special` gives `Unsupported` on a platform that cannot create the
-//!   kind.
+//! - `create_special` creates a FIFO or a device with mode 0o600. A kind that
+//!   is not a FIFO or a device with device numbers gives `InvalidInput`. On
+//!   Apple platforms, device numbers that the platform cannot encode give
+//!   `InvalidInput`.
 //!
 //! Extended attributes:
 //!

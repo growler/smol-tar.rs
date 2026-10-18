@@ -149,16 +149,18 @@ Then the reader of the body, for example `TarWriter`, gives an
 
 - `ErrorKind::InvalidData`: the entry path starts with `/`, has a `..`
   component, or has no components.
+- `ErrorKind::InvalidInput`: the entry path or the link target has a NUL
+  byte, or the platform cannot encode the device numbers or the
+  modification time.
 - `ErrorKind::AlreadyExists`: a directory has the name of an entry that is
   not a directory.
 - `ErrorKind::NotFound`: the destination does not exist, or the target of a
   hard link is not available and the policy is `MissingLinkTarget::Error`.
 - `ErrorKind::PermissionDenied`: the sink cannot set the owner, create a
   device, or write an extended attribute.
-- `ErrorKind::Unsupported`: the platform cannot create a FIFO or a device.
-  This error also occurs when the filesystem does not support extended
-  attributes, or when the platform cannot write extended attributes on the
-  kind of the node.
+- `ErrorKind::Unsupported`: the filesystem does not support extended
+  attributes, or the platform cannot write extended attributes on the kind
+  of the node.
 - `ErrorKind::UnexpectedEof`: the file body ends before the size of the
   entry.
 - Other errors from the system or from the body reader pass through.

@@ -1,5 +1,5 @@
 //! Unix backend. It uses `rustix` for all system calls, except `mkfifoat`
-//! on Apple platforms, which uses `libc`.
+//! and `mknodat` on Apple platforms, which use `libc`.
 
 #[cfg(target_vendor = "apple")]
 use rustix::fd::AsRawFd;
@@ -626,10 +626,12 @@ pub(crate) fn create_special(
     Ok(mknodat(parent, name, file_type, mode, dev)?)
 }
 
-/// Create the FIFO `name` in `parent` with mode 0o600. `mkfifoat` needs
-/// macOS 13 or later. A device gives `Unsupported`, because rustix has no
-/// `mknodat` on Apple platforms and device creation needs root privileges.
-/// Other kinds give `InvalidInput`.
+/// Create the FIFO or device `name` in `parent` with mode 0o600. A device
+/// needs `device`, the `(major, minor)` numbers. A major number above 0xff
+/// or a minor number above 0xffffff gives `InvalidInput`. The numbers
+/// (0xff, 0xffffff) also give `InvalidInput`. A FIFO uses `mkfifoat`. A
+/// device uses `mknodat`, which needs root privileges. Both functions need
+/// macOS 13 or later. Other kinds give `InvalidInput`.
 #[cfg(target_vendor = "apple")]
 pub(crate) fn create_special(
     parent: &Dir,
@@ -637,29 +639,45 @@ pub(crate) fn create_special(
     kind: FsKind,
     device: Option<(u32, u32)>,
 ) -> io::Result<()> {
-    match (kind, device) {
-        (FsKind::Fifo, _) => {}
-        (FsKind::CharDevice | FsKind::BlockDevice, Some(_)) => {
+    let makedev = |(major, minor): (u32, u32)| {
+        // `makedev(0xff, 0xffffff)` gives -1. -1 is `NODEV`, the value for
+        // "no device".
+        if major > 0xff || minor > 0xff_ffff || (major, minor) == (0xff, 0xff_ffff) {
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "devices are not supported on this platform",
-            ))
+                io::ErrorKind::InvalidInput,
+                "device numbers out of range",
+            ));
         }
+        Ok(libc::makedev(major as i32, minor as i32))
+    };
+    let (file_type, dev) = match (kind, device) {
+        (FsKind::Fifo, _) => (libc::S_IFIFO, 0),
+        (FsKind::CharDevice, Some(device)) => (libc::S_IFCHR, makedev(device)?),
+        (FsKind::BlockDevice, Some(device)) => (libc::S_IFBLK, makedev(device)?),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "not a FIFO or a device with device numbers",
             ))
         }
-    }
-    let name = CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    // SAFETY: `parent` is an open descriptor and `name` is a NUL-terminated
-    // string. Both outlive the call.
-    if unsafe { libc::mkfifoat(parent.as_raw_fd(), name.as_ptr(), 0o600) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    };
+    // A NUL byte in `name` gives `EINVAL`.
+    name.into_with_c_str(|name| {
+        // SAFETY: `parent` is an open descriptor and `name` is a
+        // NUL-terminated string. Both outlive the call.
+        let ret = unsafe {
+            if file_type == libc::S_IFIFO {
+                libc::mkfifoat(parent.as_raw_fd(), name.as_ptr(), 0o600)
+            } else {
+                libc::mknodat(parent.as_raw_fd(), name.as_ptr(), file_type | 0o600, dev)
+            }
+        };
+        Ok(if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        })
+    })?
 }
 
 /// Set the metadata of an open regular file.
@@ -786,16 +804,22 @@ fn set_xattrs_at(_parent: &Dir, _name: &str, _kind: FsKind, meta: &SetMeta) -> i
     no_xattrs(&meta.xattrs, meta.xattr_policy)
 }
 
-/// Write `attrs` on `fd`. `EPERM` and `ENOTSUP` apply `policy`.
+/// Write `attrs` on `fd`. `EPERM` and `ENOTSUP` apply `policy`. With
+/// `UnsupportedXattr::Error`, `ENOTSUP` gives `Unsupported`.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn set_fd_xattrs(fd: BorrowedFd<'_>, attrs: &AttrList, policy: UnsupportedXattr) -> io::Result<()> {
     for (name, value) in attrs.iter() {
         match fsetxattr(fd, name, value, XattrFlags::empty()) {
             Ok(()) => {}
             Err(Errno::PERM | Errno::NOTSUP) if policy == UnsupportedXattr::Skip => {}
-            Err(err) => {
-                let err = io::Error::from(err);
-                return Err(io::Error::new(err.kind(), format!("xattr {name}: {err}")));
+            Err(errno) => {
+                let err = io::Error::from(errno);
+                // On Apple platforms, std gives `Uncategorized` for `ENOTSUP`.
+                let kind = match errno {
+                    Errno::NOTSUP => io::ErrorKind::Unsupported,
+                    _ => err.kind(),
+                };
+                return Err(io::Error::new(kind, format!("xattr {name}: {err}")));
             }
         }
     }
@@ -1313,13 +1337,38 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn create_special_device_unsupported() {
+    fn create_special_device() {
+        use std::os::unix::fs::FileTypeExt;
         let tmp = TempDir::new();
         let root = open_dest(tmp.path()).unwrap();
-        let err = create_special(&root, "c", FsKind::CharDevice, Some((1, 3))).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::Unsupported);
-        let err = create_special(&root, "b", FsKind::BlockDevice, Some((1, 3))).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::Unsupported);
+        // SAFETY: `geteuid` has no preconditions.
+        let is_root = unsafe { libc::geteuid() } == 0;
+        for (name, kind) in [("c", FsKind::CharDevice), ("b", FsKind::BlockDevice)] {
+            let result = create_special(&root, name, kind, Some((3, 2)));
+            if !is_root {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::PermissionDenied);
+                continue;
+            }
+            result.unwrap();
+            let md = std::fs::symlink_metadata(tmp.path().join(name)).unwrap();
+            let file_type = md.file_type();
+            match kind {
+                FsKind::CharDevice => assert!(file_type.is_char_device()),
+                _ => assert!(file_type.is_block_device()),
+            }
+            assert_eq!((major(md.rdev() as _), minor(md.rdev() as _)), (3, 2));
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn create_special_device_out_of_range() {
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        for device in [(0x100, 0), (0, 0x100_0000), (0xff, 0xff_ffff)] {
+            let err = create_special(&root, "c", FsKind::CharDevice, Some(device)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
     }
 
     #[test]

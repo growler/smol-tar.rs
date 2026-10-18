@@ -567,7 +567,6 @@ fn fifo_created() {
     assert_eq!(mode(&path), 0o640);
 }
 
-#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn device_needs_privilege() {
     use smol_tar::TarDevice;

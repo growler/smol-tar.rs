@@ -108,15 +108,18 @@ use {
 ///
 /// - [`InvalidData`]: the entry path starts with `/`, has a `..`
 ///   component, or has no components.
+/// - [`InvalidInput`]: the entry path or the link target has a NUL byte,
+///   or the platform cannot encode the device numbers or the modification
+///   time.
 /// - [`AlreadyExists`]: a directory has the name of an entry that is not a
 ///   directory.
 /// - [`NotFound`]: the target of a hard link is not available, and the
 ///   policy is [`MissingLinkTarget::Error`].
 /// - [`PermissionDenied`]: the sink cannot set the owner, create a device,
 ///   or write an extended attribute.
-/// - [`Unsupported`]: the platform cannot create a FIFO or a device, the
-///   filesystem does not support extended attributes, or the platform
-///   cannot write extended attributes on the kind of the node.
+/// - [`Unsupported`]: the filesystem does not support extended attributes,
+///   or the platform cannot write extended attributes on the kind of the
+///   node.
 /// - [`UnexpectedEof`]: the file body ends before the size of the entry.
 /// - Another error from the system or from the body reader.
 ///
@@ -128,6 +131,7 @@ use {
 /// disk with mode 0o600.
 ///
 /// [`InvalidData`]: io::ErrorKind::InvalidData
+/// [`InvalidInput`]: io::ErrorKind::InvalidInput
 /// [`AlreadyExists`]: io::ErrorKind::AlreadyExists
 /// [`NotFound`]: io::ErrorKind::NotFound
 /// [`PermissionDenied`]: io::ErrorKind::PermissionDenied
