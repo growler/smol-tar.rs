@@ -241,7 +241,8 @@
 //!   not use it.
 //! - `fs`: add the `fs` module. It packs a directory tree into an archive and
 //!   unpacks an archive into a directory. The module is available only on
-//!   Unix.
+//!   Unix. On Apple platforms, the `fs` feature needs macOS 13, iOS 16,
+//!   tvOS 16, or watchOS 9 or later.
 //!
 //! Enable `smol` or `tokio`. If you enable neither feature, the build fails.
 //! If you enable both features, the crate uses the `tokio` traits.

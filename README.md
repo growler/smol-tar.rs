@@ -57,7 +57,9 @@ The minimum supported Rust version is 1.85.
   not use it.
 - `fs`: add the `smol_tar::fs` module. It packs a directory tree into an
   archive and unpacks an archive into a directory. The module is available
-  only on Unix. On other platforms, the crate has no `fs` module.
+  only on Unix. On other platforms, the crate has no `fs` module. On Apple
+  platforms, the `fs` feature needs macOS 13, iOS 16, tvOS 16, or watchOS 9
+  or later.
 
 Enable `smol` or `tokio`. If you enable neither feature, the build fails. If
 you enable both features, the crate uses the `tokio` traits.

@@ -1,5 +1,8 @@
-//! Unix backend. It uses `rustix` for all system calls.
+//! Unix backend. It uses `rustix` for all system calls, except `mkfifoat`
+//! on Apple platforms, which uses `libc`.
 
+#[cfg(target_vendor = "apple")]
+use rustix::fd::AsRawFd;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use rustix::fs::Dir as DirReader;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -623,18 +626,40 @@ pub(crate) fn create_special(
     Ok(mknodat(parent, name, file_type, mode, dev)?)
 }
 
-/// Create a FIFO or a device. Apple platforms have no `mknodat`.
+/// Create the FIFO `name` in `parent` with mode 0o600. `mkfifoat` needs
+/// macOS 13 or later. A device gives `Unsupported`, because rustix has no
+/// `mknodat` on Apple platforms and device creation needs root privileges.
+/// Other kinds give `InvalidInput`.
 #[cfg(target_vendor = "apple")]
 pub(crate) fn create_special(
-    _parent: &Dir,
-    _name: &str,
-    _kind: FsKind,
-    _device: Option<(u32, u32)>,
+    parent: &Dir,
+    name: &str,
+    kind: FsKind,
+    device: Option<(u32, u32)>,
 ) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "FIFOs and devices are not supported on this platform",
-    ))
+    match (kind, device) {
+        (FsKind::Fifo, _) => {}
+        (FsKind::CharDevice | FsKind::BlockDevice, Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "devices are not supported on this platform",
+            ))
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a FIFO or a device with device numbers",
+            ))
+        }
+    }
+    let name = CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: `parent` is an open descriptor and `name` is a NUL-terminated
+    // string. Both outlive the call.
+    if unsafe { libc::mkfifoat(parent.as_raw_fd(), name.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Set the metadata of an open regular file.
@@ -1258,7 +1283,6 @@ mod tests {
         assert_eq!(id_of(&tmp.path().join("f")), id_of(&tmp.path().join("g")));
     }
 
-    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn create_special_fifo() {
         use std::os::unix::fs::FileTypeExt;
@@ -1269,12 +1293,32 @@ mod tests {
         assert!(md.file_type().is_fifo());
     }
 
-    #[cfg(target_vendor = "apple")]
     #[test]
-    fn create_special_fifo() {
+    fn create_special_other_kind_invalid_input() {
         let tmp = TempDir::new();
         let root = open_dest(tmp.path()).unwrap();
-        let err = create_special(&root, "p", FsKind::Fifo, None).unwrap_err();
+        let err = create_special(&root, "c", FsKind::CharDevice, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = create_special(&root, "f", FsKind::File, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn create_special_interior_nul_gives_einval() {
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        let err = create_special(&root, "a\0b", FsKind::Fifo, None).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn create_special_device_unsupported() {
+        let tmp = TempDir::new();
+        let root = open_dest(tmp.path()).unwrap();
+        let err = create_special(&root, "c", FsKind::CharDevice, Some((1, 3))).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+        let err = create_special(&root, "b", FsKind::BlockDevice, Some((1, 3))).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unsupported);
     }
 
