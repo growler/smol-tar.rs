@@ -6,9 +6,10 @@
 use {
     futures::{Stream, StreamExt},
     std::{
+        ffi::CString,
         fs::{self, Permissions},
         future::Future,
-        os::unix::fs::PermissionsExt,
+        os::unix::{ffi::OsStrExt, fs::PermissionsExt},
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
@@ -65,6 +66,19 @@ fn make_writable(dir: &Path) {
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             make_writable(&entry.path());
         }
+    }
+}
+
+/// Create a FIFO at `path` with the permission bits `mode`, less the umask.
+pub fn make_fifo(path: &Path, mode: libc::mode_t) {
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a valid NUL-terminated string.
+    if unsafe { libc::mkfifo(c_path.as_ptr(), mode) } != 0 {
+        panic!(
+            "mkfifo {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
     }
 }
 

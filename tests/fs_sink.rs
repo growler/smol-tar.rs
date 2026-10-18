@@ -555,7 +555,6 @@ mod xattr {
     }
 }
 
-#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn fifo_created() {
     use {smol_tar::TarFifo, std::os::unix::fs::FileTypeExt};

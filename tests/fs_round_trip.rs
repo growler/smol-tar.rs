@@ -3,7 +3,7 @@
 mod fs_common;
 
 use {
-    fs_common::{block_on, TempDir},
+    fs_common::{block_on, make_fifo, TempDir},
     futures::StreamExt,
     rustix::fs::{utimensat, AtFlags, Timespec, Timestamps, CWD, UTIME_OMIT},
     smol_tar::{
@@ -40,7 +40,6 @@ const NODES: &[(&str, Option<u32>)] = &[
     ("big", Some(0o644)),
     ("data", Some(0o644)),
     ("empty", Some(0o644)),
-    #[cfg(not(target_vendor = "apple"))]
     ("fifo", Some(0o640)),
     ("rel", None),
     ("ro", Some(0o555)),
@@ -105,18 +104,7 @@ fn make_tree(root: &Path) {
     fs::hard_link(path("data"), path("a/data.link")).unwrap();
     symlink("a/b/c/leaf", path("rel")).unwrap();
     symlink("/etc/passwd", path("abs")).unwrap();
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        use rustix::fs::{mknodat, FileType, Mode};
-        mknodat(
-            CWD,
-            path("fifo"),
-            FileType::Fifo,
-            Mode::from_raw_mode(0o640),
-            0,
-        )
-        .unwrap();
-    }
+    make_fifo(&path("fifo"), 0o640);
     // Children come before their parents, and the root comes last.
     for (i, &(name, mode)) in NODES.iter().enumerate().rev() {
         if let Some(mode) = mode {

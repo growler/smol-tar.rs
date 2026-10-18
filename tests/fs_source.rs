@@ -3,7 +3,7 @@
 mod fs_common;
 
 use {
-    fs_common::{block_on, collect, TempDir},
+    fs_common::{block_on, collect, make_fifo, TempDir},
     futures::{future, Stream, StreamExt, TryStreamExt},
     smol_tar::{
         fs::{FsEntry, FsKind, FsSource, FsStreamExt},
@@ -372,14 +372,11 @@ fn char_device() {
     );
 }
 
-#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn fifo() {
-    use rustix::fs::{mknodat, FileType, Mode, CWD};
-
     let tmp = TempDir::new();
     let path = tmp.path().join("p");
-    mknodat(CWD, &path, FileType::Fifo, Mode::from_raw_mode(0o644), 0).unwrap();
+    make_fifo(&path, 0o644);
     assert_eq!(
         tar_items(FsSource::new(tmp.path())),
         [Item::Fifo("p".into())]
