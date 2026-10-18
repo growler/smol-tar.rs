@@ -1,9 +1,14 @@
 //! Helpers for the filesystem tests.
 
+// Each test crate uses a part of the helpers.
+#![allow(dead_code)]
+
 use {
     futures::{Stream, StreamExt},
     std::{
+        fs::{self, Permissions},
         future::Future,
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
@@ -42,7 +47,24 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if fs::remove_dir_all(&self.path).is_err() {
+            make_writable(&self.path);
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Give the owner all permissions on the directory `dir` and on each
+/// directory in it. Do not follow symlinks. Ignore errors.
+fn make_writable(dir: &Path) {
+    let _ = fs::set_permissions(dir, Permissions::from_mode(0o700));
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            make_writable(&entry.path());
+        }
     }
 }
 
