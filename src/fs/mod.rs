@@ -3,6 +3,7 @@
 //! This module is available only on Unix, with the `fs` feature.
 
 mod file;
+mod into_tar;
 #[cfg_attr(not(test), expect(dead_code))]
 mod rt;
 mod source;
@@ -14,6 +15,7 @@ mod walk;
 
 pub use {
     file::FsFile,
+    into_tar::{FsStreamExt, IntoTar},
     source::{FsEntry, FsSource},
 };
 
@@ -40,7 +42,6 @@ pub enum FsKind {
 }
 
 /// Metadata of a filesystem node.
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug)]
 pub(crate) struct Meta {
     kind: FsKind,

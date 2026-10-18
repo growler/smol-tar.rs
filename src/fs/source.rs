@@ -380,15 +380,15 @@ impl Stream for FsSource {
 #[derive(Debug)]
 pub struct FsEntry {
     /// Archive path. The path of a directory ends with `/`.
-    path: Box<str>,
+    pub(super) path: Box<str>,
     fs_path: PathBuf,
-    meta: Meta,
+    pub(super) meta: Meta,
     /// Symlink target.
-    link: Option<Box<str>>,
+    pub(super) link: Option<Box<str>>,
     /// Directory that holds the entry.
-    parent: Arc<sys::Dir>,
+    pub(super) parent: Arc<sys::Dir>,
     /// Name in `parent`.
-    name: Box<str>,
+    pub(super) name: Box<str>,
 }
 
 impl FsEntry {

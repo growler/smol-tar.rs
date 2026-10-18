@@ -3,17 +3,26 @@
 mod fs_common;
 
 use {
-    fs_common::{collect, TempDir},
-    futures::{future, Stream, TryStreamExt},
-    smol_tar::fs::{FsEntry, FsKind, FsSource},
+    fs_common::{block_on, collect, TempDir},
+    futures::{future, Stream, StreamExt, TryStreamExt},
+    smol_tar::{
+        fs::{FsEntry, FsKind, FsSource, FsStreamExt},
+        TarEntry, TarReader, TarWriter,
+    },
     std::{
         fs,
         io::{self, ErrorKind},
-        os::unix::fs::{MetadataExt, PermissionsExt},
+        os::unix::fs::{symlink, MetadataExt, PermissionsExt},
         path::Path,
+        pin::pin,
         time::{Duration, UNIX_EPOCH},
     },
 };
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+use smol::io::{AsyncRead, AsyncReadExt};
+#[cfg(feature = "tokio")]
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Nodes of the test tree. A name that ends with `/` is a directory.
 const TREE: [&str; 9] = [
@@ -194,6 +203,211 @@ fn try_filter_drops_entries() {
     );
 }
 
+/// Tar entry in a form that tests can compare.
+#[derive(Debug, PartialEq)]
+enum Item {
+    /// Path and body.
+    File(String, Vec<u8>),
+    /// Path and target.
+    Link(String, String),
+    /// Path and target.
+    Symlink(String, String),
+    /// Path.
+    Dir(String),
+    /// Path.
+    Fifo(String),
+    /// Path, `true` for a character device, major and minor numbers.
+    Device(String, bool, u32, u32),
+}
+
+/// Give the comparable form of `entry`. Read the body of a regular file.
+async fn item<R: AsyncRead>(entry: TarEntry<'_, R>) -> Item {
+    match entry {
+        TarEntry::File(file) => {
+            let path = file.path().to_owned();
+            let mut file = pin!(file);
+            let mut body = Vec::new();
+            file.read_to_end(&mut body).await.unwrap();
+            Item::File(path, body)
+        }
+        TarEntry::Link(link) => Item::Link(link.path().into(), link.link().into()),
+        TarEntry::Symlink(link) => Item::Symlink(link.path().into(), link.link().into()),
+        TarEntry::Directory(dir) => Item::Dir(dir.path().into()),
+        TarEntry::Fifo(fifo) => Item::Fifo(fifo.path().into()),
+        TarEntry::Device(dev) => {
+            Item::Device(dev.path().into(), dev.is_char(), dev.major(), dev.minor())
+        }
+    }
+}
+
+/// Give the tar entries of a stream in the comparable form.
+fn tar_items(source: impl Stream<Item = io::Result<FsEntry>>) -> Vec<Item> {
+    block_on(async {
+        let entries: Vec<_> = source.into_tar().try_collect().await.unwrap();
+        let mut items = Vec::new();
+        for entry in entries {
+            items.push(item(entry).await);
+        }
+        items
+    })
+}
+
+/// Write the tar entries of a stream to an archive in memory.
+fn archive(source: impl Stream<Item = io::Result<FsEntry>>) -> Vec<u8> {
+    let mut data = Vec::new();
+    block_on(source.into_tar().forward(TarWriter::new(&mut data))).unwrap();
+    data
+}
+
+/// Read the entries of an archive in the comparable form.
+fn read_archive(data: &[u8]) -> Vec<Item> {
+    block_on(async {
+        let mut reader = pin!(TarReader::new(data));
+        let mut items = Vec::new();
+        while let Some(entry) = reader.next().await {
+            items.push(item(entry.unwrap()).await);
+        }
+        items
+    })
+}
+
+/// Body of the regular file in the hard link tests.
+const DATA: &[u8] = b"data";
+
+/// Create the regular file `a` in `root`, and the hard links `links` to it.
+fn hard_links(root: &Path, links: &[&str]) {
+    fs::write(root.join("a"), DATA).unwrap();
+    for link in links {
+        fs::hard_link(root.join("a"), root.join(link)).unwrap();
+    }
+}
+
+/// Give the source of `root` without the entries with the paths `skip`.
+fn without<'a>(root: &Path, skip: &'a [&'a str]) -> impl Stream<Item = io::Result<FsEntry>> + 'a {
+    FsSource::new(root).try_filter(move |entry| future::ready(!skip.contains(&entry.path())))
+}
+
+/// Regular file `path` with the body `DATA`.
+fn file(path: &str) -> Item {
+    Item::File(path.into(), DATA.into())
+}
+
+/// Hard link `path` to `target`.
+fn link(path: &str, target: &str) -> Item {
+    Item::Link(path.into(), target.into())
+}
+
+#[test]
+fn hardlink_second_path_is_link() {
+    let tmp = TempDir::new();
+    hard_links(tmp.path(), &["b"]);
+    assert_eq!(
+        tar_items(FsSource::new(tmp.path())),
+        [file("a"), link("b", "a")]
+    );
+}
+
+#[test]
+fn hardlink_first_path_filtered() {
+    let tmp = TempDir::new();
+    hard_links(tmp.path(), &["b"]);
+    assert_eq!(tar_items(without(tmp.path(), &["a"])), [file("b")]);
+}
+
+#[test]
+fn hardlink_link_path_filtered() {
+    let tmp = TempDir::new();
+    hard_links(tmp.path(), &["b"]);
+    assert_eq!(tar_items(without(tmp.path(), &["b"])), [file("a")]);
+}
+
+#[test]
+fn hardlink_three_paths_first_filtered() {
+    let tmp = TempDir::new();
+    hard_links(tmp.path(), &["b", "c"]);
+    assert_eq!(
+        tar_items(without(tmp.path(), &["a"])),
+        [file("b"), link("c", "b")]
+    );
+}
+
+#[test]
+fn hardlink_outside_tree() {
+    let tmp = TempDir::new();
+    fs::create_dir(tmp.path().join("d")).unwrap();
+    hard_links(tmp.path(), &["d/b"]);
+    assert_eq!(tar_items(FsSource::new(tmp.path().join("d"))), [file("b")]);
+}
+
+#[test]
+fn hardlink_symlink() {
+    let tmp = TempDir::new();
+    fs::write(tmp.path().join("t"), DATA).unwrap();
+    symlink("t", tmp.path().join("a")).unwrap();
+    fs::hard_link(tmp.path().join("a"), tmp.path().join("b")).unwrap();
+    if !fs::symlink_metadata(tmp.path().join("b"))
+        .unwrap()
+        .file_type()
+        .is_symlink()
+    {
+        eprintln!("skip: a hard link to a symlink follows the symlink");
+        return;
+    }
+    assert_eq!(
+        tar_items(FsSource::new(tmp.path())),
+        [
+            Item::Symlink("a".into(), "t".into()),
+            link("b", "a"),
+            file("t"),
+        ]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn char_device() {
+    assert_eq!(
+        tar_items(FsSource::new("/dev/null").with_prefix("null")),
+        [Item::Device("null".into(), true, 1, 3)]
+    );
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn fifo() {
+    use rustix::fs::{mknodat, FileType, Mode, CWD};
+
+    let tmp = TempDir::new();
+    let path = tmp.path().join("p");
+    mknodat(CWD, &path, FileType::Fifo, Mode::from_raw_mode(0o644), 0).unwrap();
+    assert_eq!(
+        tar_items(FsSource::new(tmp.path())),
+        [Item::Fifo("p".into())]
+    );
+}
+
+#[test]
+fn forward_to_writer() {
+    let tmp = TempDir::new();
+    make_tree(tmp.path(), ["f", "skip", "d/", "d/g"]);
+    fs::hard_link(tmp.path().join("f"), tmp.path().join("h")).unwrap();
+    symlink("f", tmp.path().join("s")).unwrap();
+    let source = FsSource::new(tmp.path())
+        .with_prefix("pkg")
+        .try_filter(|entry| future::ready(entry.path() != "pkg/skip"));
+    assert_eq!(
+        read_archive(&archive(source)),
+        [
+            Item::Dir("pkg/".into()),
+            Item::File("pkg/f".into(), b"f".into()),
+            link("pkg/h", "pkg/f"),
+            Item::Symlink("pkg/s".into(), "f".into()),
+            Item::Dir("pkg/d/".into()),
+            Item::File("pkg/d/g".into(), b"d/g".into()),
+        ]
+    );
+}
+
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 mod xattr {
     use {
@@ -272,5 +486,69 @@ mod xattr {
             user_attrs(find(&entries, "pkg/d/").xattrs()),
             [("user.dir", &b"d"[..])]
         );
+    }
+
+    /// Give the path and the extended attributes of each regular file and
+    /// each directory in an archive.
+    fn archive_attrs(data: &[u8]) -> Vec<(String, AttrList)> {
+        block_on(async {
+            let mut reader = pin!(TarReader::new(data));
+            let mut attrs = Vec::new();
+            while let Some(entry) = reader.next().await {
+                match entry.unwrap() {
+                    TarEntry::File(file) => attrs.push((file.path().into(), file.attrs().clone())),
+                    TarEntry::Directory(dir) => {
+                        attrs.push((dir.path().into(), dir.attrs().clone()))
+                    }
+                    _ => {}
+                }
+            }
+            attrs
+        })
+    }
+
+    #[test]
+    fn xattrs_in_archive() {
+        let tmp = TempDir::new();
+        make_tree(tmp.path(), ["f", "d/"]);
+        if !set_xattr(&tmp.path().join("f"), "user.file", b"f")
+            || !set_xattr(&tmp.path().join("f"), "user.more", &[0, 0xff])
+            || !set_xattr(&tmp.path().join("d"), "user.dir", b"d")
+        {
+            return;
+        }
+        let archived = archive_attrs(&archive(FsSource::new(tmp.path()).with_xattrs(true)));
+        let paths: Vec<&str> = archived.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, ["f", "d/"]);
+        assert_eq!(
+            user_attrs(&archived[0].1),
+            [("user.file", &b"f"[..]), ("user.more", &[0, 0xff][..])]
+        );
+        assert_eq!(user_attrs(&archived[1].1), [("user.dir", &b"d"[..])]);
+    }
+
+    #[test]
+    fn hardlink_has_no_xattrs() {
+        let tmp = TempDir::new();
+        fs::write(tmp.path().join("a"), DATA).unwrap();
+        if !set_xattr(&tmp.path().join("a"), "user.a", b"1") {
+            return;
+        }
+        fs::hard_link(tmp.path().join("a"), tmp.path().join("b")).unwrap();
+        let source = || FsSource::new(tmp.path()).with_xattrs(true);
+        let entries: Vec<_> = block_on(source().into_tar().try_collect()).unwrap();
+        let [TarEntry::File(file), TarEntry::Link(link)] = &entries[..] else {
+            panic!("the entries are not a file and a link");
+        };
+        assert_eq!(file.path(), "a");
+        assert_eq!(user_attrs(file.attrs()), [("user.a", &b"1"[..])]);
+        assert_eq!((link.path(), link.link()), ("b", "a"));
+        let data = archive(source());
+        let record = b"SCHILY.xattr.user.a=";
+        let count = data
+            .windows(record.len())
+            .filter(|window| window == record)
+            .count();
+        assert_eq!(count, 1);
     }
 }
