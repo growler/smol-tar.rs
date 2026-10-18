@@ -61,9 +61,9 @@
 //!
 //! Identity:
 //!
-//! - `open_dir` and `open_file` compare the identity of the opened object with
-//!   `expect`. A difference gives `InvalidData`. `open_file` also compares the
-//!   size.
+//! - `open_dir` and `open_file` compare the identity and the kind of the
+//!   opened object with `expect`. A difference gives `InvalidData` "file
+//!   changed". `open_file` also compares the size.
 //!
 //! Creation:
 //!
@@ -86,8 +86,9 @@
 //! - `read_xattrs_at` gives an empty list for a kind that the platform cannot
 //!   open safely. It gives an empty list if the filesystem does not support
 //!   xattrs.
-//! - `read_xattrs_at` compares the identity of the opened object with
-//!   `expect`. A difference gives `InvalidData` "file changed".
+//! - `read_xattrs_at` compares the identity and the kind of the opened object
+//!   with `expect` and `kind`. A difference gives `InvalidData` "file
+//!   changed".
 //! - A name that is not UTF-8 gives `InvalidData` with the path.
 //! - The `set_meta_*` functions write `SetMeta::xattrs` and apply
 //!   `SetMeta::xattr_policy`.
@@ -95,5 +96,4 @@
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-#[expect(unused_imports)]
 pub(crate) use unix::*;
