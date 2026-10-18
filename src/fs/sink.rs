@@ -99,9 +99,10 @@ use {
 ///
 /// # Runtime
 ///
-/// The sink does all filesystem I/O on the blocking thread pool of the
-/// runtime. With the `tokio` feature, poll the sink inside a Tokio runtime
-/// context.
+/// The sink runs the filesystem calls on the blocking thread pool of the
+/// runtime. The close of a file or a directory can occur on the thread that
+/// polls or drops the sink. With the `tokio` feature, poll the sink inside a
+/// Tokio runtime context.
 ///
 /// # Errors
 ///

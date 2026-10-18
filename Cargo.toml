@@ -71,3 +71,11 @@ required-features = ["smol"]
 [[example]]
 name = "filter"
 required-features = ["smol"]
+
+[[example]]
+name = "pack"
+required-features = ["smol", "fs"]
+
+[[example]]
+name = "unpack"
+required-features = ["smol", "fs"]

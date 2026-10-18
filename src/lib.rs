@@ -4,8 +4,9 @@
 
 //! A minimal async streaming tar reader and writer.
 //!
-//! The crate does not access the filesystem. It reads archives from an
-//! [`AsyncRead`] source and writes archives to an [`AsyncWrite`] sink.
+//! Without the `fs` feature, the crate does not access the filesystem. It
+//! reads archives from an [`AsyncRead`] source and writes archives to an
+//! [`AsyncWrite`] sink.
 //!
 //! [`TarReader`] is a [`Stream`] of [`TarEntry`] values. It keeps little data
 //! in memory. A regular file entry gives its body through [`TarRegularFile`],
@@ -211,8 +212,25 @@
 //! # Buffering
 //!
 //! [`TarReader`] does not buffer the source. Wrap a file or a socket in a
-//! `BufReader`. [`TarWriter`] has an output buffer, so a `BufWriter` is not
-//! necessary.
+//! `BufReader`. [`TarWriter`] writes the header, each part of the body (up
+//! to 16 KiB), and the padding of each entry as separate writes. To decrease
+//! the number of writes to a file or a socket, wrap it in a `BufWriter`.
+//!
+//! # Filesystem
+//!
+//! With the `fs` feature, the `fs` module packs a directory tree into an
+//! archive and unpacks an archive into a directory. The module is available
+//! only on Unix.
+//!
+//! - `fs::FsSource` is a stream of the nodes in a directory tree.
+//!   `fs::FsStreamExt::into_tar` converts the nodes to [`TarEntry`] values
+//!   for [`TarWriter`].
+//! - `fs::FsSink` is a sink of [`TarEntry`] values, for example from
+//!   [`TarReader`]. It writes each entry to a directory.
+//!
+//! The source and the sink run the filesystem calls on the blocking thread
+//! pool of the runtime. The close of a file or a directory can occur on the
+//! thread that drops it.
 //!
 //! # Feature flags
 //!
@@ -221,12 +239,15 @@
 //! - `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`.
 //! - `futures`: add the `futures` crate as a dependency. The library code does
 //!   not use it.
+//! - `fs`: add the `fs` module. It packs a directory tree into an archive and
+//!   unpacks an archive into a directory. The module is available only on
+//!   Unix.
 //!
 //! Enable `smol` or `tokio`. If you enable neither feature, the build fails.
 //! If you enable both features, the crate uses the `tokio` traits.
 //!
-//! The documentation on docs.rs uses the default features. It shows the
-//! `futures-io` traits.
+//! The documentation on docs.rs uses the default features and the `futures`
+//! and `fs` features. It shows the `futures-io` traits.
 //!
 //! # Sequential use
 //!

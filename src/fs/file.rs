@@ -33,7 +33,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 /// stays open until the `FsFile` is dropped, and the data is read in parts.
 /// The reads do not go past the size that the source read. If a file of up
 /// to 256 KiB has less data than that size, the first read gives an
-/// [`InvalidData`] error with the message "file changed".
+/// [`InvalidData`] error with the message "file changed". If a larger file
+/// gets smaller after the open, the reads end before that size.
 ///
 /// An error from the open has the archive path of the entry. For a file of
 /// up to 256 KiB, the read is part of the open, thus a read error also has

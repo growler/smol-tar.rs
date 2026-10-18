@@ -40,17 +40,22 @@ use {
 /// kind [`FsKind::Symlink`], with its target in [`FsEntry::link`]. Below
 /// the root, the source skips nodes that have no [`FsKind`], for example
 /// sockets. A root that has no [`FsKind`] gives an [`InvalidInput`] error.
-/// A name or a symlink target that is not UTF-8 gives an [`InvalidData`]
-/// error. A directory that was replaced by another directory after its
-/// parent was read gives an [`InvalidData`] error. Other changes give the
-/// error from the system. The source does not stop at mount points.
+/// A name, a symlink target, or an extended attribute name that is not
+/// UTF-8 gives an [`InvalidData`] error. A modification time that is out of
+/// range gives an [`InvalidData`] error. A node that changes after the
+/// source read its metadata gives an [`InvalidData`] error with the message
+/// "file changed". For example, another directory replaces a directory, or
+/// a node of a different kind replaces a symlink. With
+/// [`with_xattrs`](Self::with_xattrs), a different node at the name of a
+/// node gives the same error. Other changes give the error from the system.
+/// The source does not stop at mount points.
 ///
 /// The source does not read extended attributes by default. Use
 /// [`with_xattrs`](Self::with_xattrs) to read them.
 ///
-/// The source does all filesystem I/O on the blocking thread pool of the
-/// runtime. With the `tokio` feature, poll the stream inside a Tokio runtime
-/// context.
+/// The source runs the filesystem calls on the blocking thread pool of the
+/// runtime. The close of a directory can occur on the thread that drops it.
+/// With the `tokio` feature, poll the stream inside a Tokio runtime context.
 ///
 /// An error from the filesystem has the path of the node. After an error,
 /// the stream ends.

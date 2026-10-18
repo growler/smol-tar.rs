@@ -4,13 +4,15 @@
 smol-tar is an async streaming tar reader and writer for Rust. `TarReader` is
 a `Stream` of tar entries from an `AsyncRead` source. `TarWriter` is a `Sink`
 of tar entries to an `AsyncWrite` destination. The crate works with smol and
-other `futures-io` runtimes, and with tokio. It does not access the
-filesystem.
+other `futures-io` runtimes, and with tokio. Without the `fs` feature, it
+does not access the filesystem.
 
 - Reads old tar, GNU tar, and POSIX ustar/pax archives.
 - Writes POSIX ustar archives with pax extension records.
 - Streams file bodies. The reader does not keep file bodies in memory.
 - Makes 1 heap allocation for each ustar entry when it reads or writes.
+- With the `fs` feature, packs a directory tree into an archive and unpacks
+  an archive into a directory, on Unix.
 - Has a fuzz target for the reader. The tests run on Rust 1.85, stable, and
   nightly, with the smol traits and with the tokio traits.
 
@@ -19,12 +21,14 @@ filesystem.
 - Use smol-tar to read or write tar data as a stream in async code. The
   source or destination can be a file, a socket, an HTTP body, a
   decompressor, or memory. Your code decides what goes to disk.
+- Use smol-tar with the `fs` feature to pack a directory tree into an
+  archive or to unpack an archive into a directory, on Unix.
 - Use [`tar`](https://crates.io/crates/tar) for synchronous code.
-- Use [`async-tar`](https://crates.io/crates/async-tar) or
+- On platforms other than Unix, use
+  [`async-tar`](https://crates.io/crates/async-tar) or
   [`astral-tokio-tar`](https://crates.io/crates/astral-tokio-tar) to unpack
   an archive into a directory with one call (`unpack`), or to add a
-  directory tree from disk with one call (`append_dir_all`). smol-tar has no
-  filesystem functions.
+  directory tree from disk with one call (`append_dir_all`).
 
 ## Installation
 
@@ -51,6 +55,9 @@ The minimum supported Rust version is 1.85.
 - `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`.
 - `futures`: add the `futures` crate as a dependency. The library code does
   not use it.
+- `fs`: add the `smol_tar::fs` module. It packs a directory tree into an
+  archive and unpacks an archive into a directory. The module is available
+  only on Unix. On other platforms, the crate has no `fs` module.
 
 Enable `smol` or `tokio`. If you enable neither feature, the build fails. If
 you enable both features, the crate uses the `tokio` traits.
@@ -62,8 +69,10 @@ you enable both features, the crate uses the `tokio` traits.
    it before you get the next entry. The types are `Send` and `Sync`, but do
    not read two of them at the same time.
 2. Wrap a file or a socket in a `BufReader` before you give it to
-   `TarReader`. The reader does not buffer the source. `TarWriter` has a
-   16 KiB output buffer, so a `BufWriter` is not necessary.
+   `TarReader`. The reader does not buffer the source. `TarWriter` writes
+   the header, each part of the body (up to 16 KiB), and the padding of each
+   entry as separate writes. To decrease the number of writes to a file or a
+   socket, wrap it in a `BufWriter`.
 3. Give `TarRegularFile::new` the exact size of the body. If the body is
    shorter, the write fails with `ErrorKind::UnexpectedEof`. If the body is
    longer, the writer does not read the remaining bytes.
@@ -79,6 +88,24 @@ you enable both features, the crate uses the `tokio` traits.
    `TarWriter::<_, Empty>::new(destination)`.
 6. Paths, link targets, and user and group names are UTF-8 strings. Extended
    attribute names are UTF-8 strings. Extended attribute values are bytes.
+7. Call `FsSink::finish` or `SinkExt::close` after the last entry. These
+   methods set the mode and the modification time of the directories of the
+   directory entries. With `with_owner` and `with_xattrs`, they also set the
+   owner and the extended attributes of these directories.
+   `StreamExt::forward` closes the sink at the end of the stream. If you drop
+   the sink before, the directories that the sink created for directory
+   entries keep mode 0o700.
+8. In an archive for `FsSink`, put the target of each hard link before the
+   link. `FsSink` creates a hard link only to a path that it created before
+   from the same archive.
+9. Filter the entries of `FsSource` before `FsStreamExt::into_tar`. Then each
+   hard link in the archive points to an entry in the archive.
+10. `FsSource` and `FsSink` do not read or write extended attributes by
+    default. To keep the extended attributes, call `with_xattrs(true)` on
+    both of them.
+11. With the `tokio` feature, use `FsSource`, `FsFile`, `FsSink`, and the
+    stream of `into_tar` inside a Tokio runtime context. Outside of a Tokio
+    runtime context, they panic.
 
 ## Errors
 
@@ -91,11 +118,65 @@ All functions return `std::io::Error`. The reader uses these error kinds:
   or before the end of a file body.
 - Errors from the source reader pass through without change.
 
+`FsSource` and `FsFile` use these error kinds:
+
+- `ErrorKind::InvalidInput`: the root has a kind that the source does not
+  support, for example a socket. This error also occurs when the root is not
+  a directory and the prefix is empty.
+- `ErrorKind::InvalidData`: one of these conditions occurs:
+  - A name, a symlink target, or an extended attribute name is not valid
+    UTF-8.
+  - The modification time of a node is out of range.
+  - A node changes after the source read its metadata. For example, another
+    directory replaces a directory, or a node of a different kind replaces
+    a symlink. With `with_xattrs(true)`, a different node at the name of a
+    node also gives this error. The message is "file changed".
+  - When `FsFile` opens the file, the identity or the size of the file is
+    different from the values that the source read. The message is "file
+    changed". A file of up to 256 KiB with less data than that size gives
+    the same error.
+- Other errors from the system pass through. Each error has the path of the
+  node. After an error, the stream ends.
+
+`FsFile` compares the identity and the size only when it opens the file. If
+a file larger than 256 KiB gets smaller after the open, the body ends early.
+Then the reader of the body, for example `TarWriter`, gives an
+`ErrorKind::UnexpectedEof` error.
+
+`FsSink` uses these error kinds:
+
+- `ErrorKind::InvalidData`: the entry path starts with `/`, has a `..`
+  component, or has no components.
+- `ErrorKind::AlreadyExists`: a directory has the name of an entry that is
+  not a directory.
+- `ErrorKind::NotFound`: the destination does not exist, or the target of a
+  hard link is not available and the policy is `MissingLinkTarget::Error`.
+- `ErrorKind::PermissionDenied`: the sink cannot set the owner, create a
+  device, or write an extended attribute.
+- `ErrorKind::Unsupported`: the platform cannot create a FIFO or a device.
+  This error also occurs when the filesystem does not support extended
+  attributes, or when the platform cannot write extended attributes on the
+  kind of the node.
+- `ErrorKind::UnexpectedEof`: the file body ends before the size of the
+  entry.
+- Other errors from the system or from the body reader pass through.
+
+Each error message starts with the entry path, without its empty and `.`
+components. An error of the entry path itself shows the path from the
+archive. An error from the open of the destination starts with the
+destination path. After an error, the sink stops. Each later call gives the
+error "the sink stopped after an error". After `finish`, a write gives the
+error "the sink is finished". These two errors have no path.
+
 ## Examples
 
 Each example is a program in the [`examples`](examples) directory. The test
-suite makes sure that the code below is equal to these programs, and
-`cargo test` compiles them.
+suite makes sure that the code below is equal to these programs. These
+commands compile the programs:
+
+- `cargo test`: `read`, `read_gz`, `write`, and `filter`.
+- `cargo test --features fs`: the same programs, and `pack` and `unpack`.
+- `cargo test --no-default-features --features tokio`: `read_tokio`.
 
 ### Read an archive with smol
 
@@ -231,7 +312,8 @@ fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().expect("usage: write OUT.tar FILE...");
     smol::block_on(async {
-        // TarWriter buffers its output. A BufWriter is not necessary.
+        // TarWriter writes each header and each part of a body separately.
+        // To decrease the number of writes, wrap the file in a BufWriter.
         let mut tar = TarWriter::new(File::create(out).await?);
         tar.write(TarDirectory::new("files/").with_mode(0o755).into())
             .await?;
@@ -285,6 +367,82 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+### Pack a directory
+
+`FsSource` is a `Stream` of the nodes in a directory tree. `into_tar`
+converts the nodes to tar entries.
+
+Dependencies: `smol-tar` with the `fs` feature, `smol`, `futures`.
+
+<!-- example: examples/pack.rs -->
+```rust
+//! Pack a directory tree into a new tar archive with smol.
+//!
+//! Run: cargo run --example pack --features fs -- OUT.tar DIR
+
+use futures::{future, StreamExt, TryStreamExt};
+use smol::{fs::File, io::BufWriter};
+use smol_tar::{
+    fs::{FsSource, FsStreamExt},
+    TarWriter,
+};
+
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let [output, dir] = args.as_slice() else {
+        panic!("usage: pack OUT.tar DIR");
+    };
+    smol::block_on(async {
+        // TarWriter writes each header and each part of a body separately.
+        // A BufWriter decreases the number of writes to the file.
+        let file = BufWriter::with_capacity(256 * 1024, File::create(output).await?);
+        let mut out = TarWriter::new(file);
+        // Filter the entries before into_tar(). Then each hard link in the
+        // archive points to an entry that is in the archive.
+        // forward() closes the writer at the end of the stream. The close
+        // also flushes the BufWriter.
+        FsSource::new(dir)
+            .try_filter(|entry| future::ready(!entry.path().starts_with(".git/")))
+            .into_tar()
+            .forward(&mut out)
+            .await
+    })
+}
+```
+
+### Unpack an archive into a directory
+
+`FsSink` is a `Sink` of tar entries. It writes each entry to a directory.
+
+Dependencies: `smol-tar` with the `fs` feature, `smol`, `futures`.
+
+<!-- example: examples/unpack.rs -->
+```rust
+//! Unpack a tar archive into a directory with smol.
+//!
+//! Run: cargo run --example unpack --features fs -- IN.tar DIR
+
+use futures::StreamExt;
+use smol::{fs::File, io::BufReader};
+use smol_tar::{fs::FsSink, TarReader};
+
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let [input, dir] = args.as_slice() else {
+        panic!("usage: unpack IN.tar DIR");
+    };
+    smol::block_on(async {
+        // DIR must exist. If it does not exist, the sink gives a NotFound
+        // error at the first entry. forward() calls finish() at the end of
+        // the stream. finish() sets the mode and the modification time of
+        // the directories.
+        TarReader::new(BufReader::new(File::open(input).await?))
+            .forward(FsSink::new(dir))
+            .await
+    })
+}
+```
+
 ## API summary
 
 Refer to [docs.rs](https://docs.rs/smol-tar) for the full API.
@@ -328,6 +486,15 @@ Metadata
 : The extended attributes of an entry. The writer stores them in pax
   records.
 
+`smol_tar::fs` (`fs` feature, Unix only)
+: `FsSource::new(dir)` is a `Stream` of the nodes in a directory tree. Its
+  options are `with_prefix` and `with_xattrs`. `FsStreamExt::into_tar()`
+  converts the nodes to `TarEntry` values. The body of a regular file is an
+  `FsFile`. `FsSink::new(dir)` is a `Sink` of `TarEntry` that writes the
+  entries to a directory. It also has the methods `write(entry)` and
+  `finish()`. Its options are `with_missing_link_target`, `with_owner`,
+  `with_special_bits`, `with_xattrs`, and `with_unsupported_xattr`.
+
 ## Migrate from the tar crate
 
 These are the smol-tar equivalents of the [`tar`](https://docs.rs/tar) and
@@ -346,9 +513,19 @@ These are the smol-tar equivalents of the [`tar`](https://docs.rs/tar) and
 - `builder.append_dir(path, src)` --
   `writer.write(TarDirectory::new(path).into())`.
 - `builder.finish()` or `builder.into_inner()` -- `writer.finish()`.
-- `Archive::unpack`, `Builder::append_path`, `Builder::append_dir_all` --
-  smol-tar has no equivalents. Iterate the entries and use the filesystem
-  API of your runtime.
+- `archive.unpack(dir)` -- `TarReader::new(r).forward(FsSink::new(dir))`
+  with the `fs` feature. `FsSink` needs an existing directory. The
+  `unpack` method of the `tar` crate creates the directory.
+- `builder.append_dir_all(path, dir)` --
+  `writer.send_all(&mut FsSource::new(dir).with_prefix(path).into_tar())`
+  with the `fs` feature and `SinkExt`. `FsSource` stores symlinks as
+  symlinks and does not follow them, the same as
+  `builder.follow_symlinks(false)`.
+- `builder.append_path_with_name(path, name)` for a file --
+  `writer.send_all(&mut FsSource::new(path).with_prefix(name).into_tar())`
+  with the `fs` feature and `SinkExt`. For `builder.append_path(path)`, use
+  `path` as the name. For a directory, smol-tar has no equivalent, because
+  `FsSource` gives the directory and all of its contents.
 
 ## Supported formats
 
