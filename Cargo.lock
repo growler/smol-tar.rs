@@ -519,11 +519,13 @@ version = "0.1.10"
 dependencies = [
  "async-compression",
  "async-lock",
+ "blocking",
  "futures",
  "futures-core",
  "futures-io",
  "futures-sink",
  "pin-project-lite",
+ "rustix",
  "smol",
  "static_assertions",
  "tokio",

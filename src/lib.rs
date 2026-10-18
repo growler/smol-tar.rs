@@ -256,6 +256,9 @@
 #[cfg(not(any(feature = "smol", feature = "tokio")))]
 compile_error!("either feature `smol` or `tokio` must be enabled");
 
+#[cfg(all(unix, feature = "fs"))]
+pub mod fs;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use {

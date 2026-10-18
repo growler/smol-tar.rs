@@ -19,13 +19,14 @@ include = [
 rust-version = "1.85"
 
 [package.metadata.docs.rs]
-features = ["futures"]
+features = ["futures", "fs"]
 
 [features]
 default = ["smol"]
 smol = ["dep:async-lock", "dep:futures-io"]
 tokio = ["dep:tokio", "dep:tokio-stream"]
 futures = ["dep:futures"]
+fs = ["dep:rustix", "dep:blocking"]
 
 [dependencies]
 futures-core = "0.3"
@@ -36,6 +37,10 @@ futures-io = { version = "0.3", optional = true }
 tokio = { version = "1", optional = true, features = ["fs", "io-util", "rt"] }
 tokio-stream = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }
+blocking = { version = "1.6", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"], optional = true }
 
 [dev-dependencies]
 smol = "2.0"
