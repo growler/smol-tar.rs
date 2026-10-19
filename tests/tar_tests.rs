@@ -2183,7 +2183,7 @@ fn reader_reads_binary_xattr_value_from_large_pax_extensions() -> Result<()> {
 
 #[test]
 fn reader_accepts_empty_pax_extension() -> Result<()> {
-    for typeflag in [b'x', b'g'] {
+    for typeflag in *b"xg" {
         let mut archive = Vec::new();
         append_pax_entry(&mut archive, typeflag, &[]);
         append_entry(
