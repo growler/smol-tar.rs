@@ -1940,6 +1940,12 @@ impl AttrList {
             .iter()
             .map(|(name, value)| (name.as_ref(), value.as_ref()))
     }
+
+    /// Keep only the attributes for which `f` gives `true`. The order of the
+    /// kept attributes does not change.
+    pub fn retain<F: FnMut(&str, &[u8]) -> bool>(&mut self, mut f: F) {
+        self.inner.retain(|(name, value)| f(name, value));
+    }
 }
 
 impl From<Vec<(Box<str>, Box<[u8]>)>> for AttrList {

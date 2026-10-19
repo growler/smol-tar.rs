@@ -1217,6 +1217,21 @@ fn attr_list_with_and_from_preserve_pairs() {
 }
 
 #[test]
+fn attr_list_retain_keeps_order() {
+    let mut attrs = AttrList::new()
+        .with("user.a", b"1".as_slice())
+        .with("trusted.b", b"2".as_slice())
+        .with("user.c", b"3".as_slice())
+        .with("user.d", b"drop".as_slice());
+    attrs.retain(|name, value| name.starts_with("user.") && value != b"drop");
+    let kept: Vec<(&str, &[u8])> = attrs.iter().collect();
+    assert_eq!(
+        kept,
+        [("user.a", b"1".as_slice()), ("user.c", b"3".as_slice())]
+    );
+}
+
+#[test]
 fn tar_writer_writes_xattrs() -> Result<()> {
     block_on_test(async {
         let (writer_sink, shared) = VecAsyncWriter::new();
