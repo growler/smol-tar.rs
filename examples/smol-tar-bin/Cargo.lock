@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "smol-tar"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "async-lock",
  "futures-core",
