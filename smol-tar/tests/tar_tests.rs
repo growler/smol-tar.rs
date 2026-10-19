@@ -95,6 +95,7 @@ const SIZE_START: usize = 124;
 const MTIME_START: usize = 136;
 const CKSUM_START: usize = 148;
 const TYPEFLAG_START: usize = 156;
+const LINKNAME_START: usize = 157;
 const MAGIC_START: usize = 257;
 const VERSION_START: usize = 263;
 const UNAME_START: usize = 265;
@@ -507,6 +508,71 @@ fn cve_2025_62518_archive() -> ([u8; BLOCK_SIZE], Vec<u8>) {
     );
     append_eof(&mut archive);
     (fake_header, archive)
+}
+
+fn smuggled_entry() -> Vec<u8> {
+    let mut entry = Vec::new();
+    append_entry(
+        &mut entry,
+        build_header(b"smuggled.txt", b'0', 6, HeaderFlavor::Ustar),
+        b"pwned\n",
+    );
+    entry
+}
+
+fn hardlink_data_archive(
+    flavor: HeaderFlavor,
+    header_size: u64,
+    pax_size: Option<u64>,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut archive = Vec::new();
+    append_entry(
+        &mut archive,
+        build_header(b"visible0.txt", b'0', 6, HeaderFlavor::Ustar),
+        b"first\n",
+    );
+    if let Some(size) = pax_size {
+        let pax = pax_record_bytes("size", size.to_string().as_bytes());
+        append_pax_entry(&mut archive, b'x', &pax);
+    }
+    let mut header = build_header(b"hl", b'1', header_size, flavor);
+    set_bytes(&mut header, LINKNAME_START, 100, b"visible0.txt");
+    finalize_checksum(&mut header);
+    append_entry(&mut archive, header, data);
+    append_entry(
+        &mut archive,
+        build_header(b"visible1.txt", b'0', 7, HeaderFlavor::Ustar),
+        b"second\n",
+    );
+    append_eof(&mut archive);
+    archive
+}
+
+fn hardlink_data_entries() -> Vec<ObservedEntry> {
+    vec![
+        ObservedEntry {
+            kind: "file",
+            path: "visible0.txt".to_string(),
+            link: None,
+            data: b"first\n".to_vec(),
+            attrs: Vec::new(),
+        },
+        ObservedEntry {
+            kind: "hardlink",
+            path: "hl".to_string(),
+            link: Some("visible0.txt".to_string()),
+            data: Vec::new(),
+            attrs: Vec::new(),
+        },
+        ObservedEntry {
+            kind: "file",
+            path: "visible1.txt".to_string(),
+            link: None,
+            data: b"second\n".to_vec(),
+            attrs: Vec::new(),
+        },
+    ]
 }
 
 #[test]
@@ -1888,6 +1954,21 @@ fn reader_reports_truncated_padding() {
 }
 
 #[test]
+fn reader_reports_truncated_hardlink_data() {
+    let mut archive = Vec::new();
+    let mut header = build_header(b"hl", b'1', 4096, HeaderFlavor::Ustar);
+    set_bytes(&mut header, LINKNAME_START, 100, b"target");
+    finalize_checksum(&mut header);
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(&[b'x'; BLOCK_SIZE]);
+    assert_archive_error(
+        Cursor::new(archive),
+        ErrorKind::UnexpectedEof,
+        "unexpected end of tar file",
+    );
+}
+
+#[test]
 fn reader_requires_two_zero_blocks() {
     assert_archive_error(
         Cursor::new(vec![0u8; BLOCK_SIZE]),
@@ -2399,6 +2480,58 @@ fn dropping_pax_sized_file_skips_over_embedded_tar_headers() -> Result<()> {
 }
 
 #[test]
+fn reader_skips_hardlink_data() -> Result<()> {
+    let hidden = smuggled_entry();
+    let archive = hardlink_data_archive(HeaderFlavor::Ustar, 1024, None, &hidden);
+    assert_eq!(
+        collect_entries(Cursor::new(archive.clone()))?,
+        hardlink_data_entries()
+    );
+    assert_eq!(
+        collect_entries(ChunkedReader::new(Cursor::new(archive), 17))?,
+        hardlink_data_entries()
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_skips_hardlink_data_with_pax_size() -> Result<()> {
+    let hidden = smuggled_entry();
+    for header_size in [0, 2048] {
+        let archive = hardlink_data_archive(HeaderFlavor::Ustar, header_size, Some(1024), &hidden);
+        assert_eq!(
+            collect_entries(Cursor::new(archive))?,
+            hardlink_data_entries()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn reader_skips_hardlink_data_in_gnu_and_old_headers() -> Result<()> {
+    let hidden = smuggled_entry();
+    for flavor in [HeaderFlavor::Gnu, HeaderFlavor::Old] {
+        let archive = hardlink_data_archive(flavor, 1024, None, &hidden);
+        assert_eq!(
+            collect_entries(Cursor::new(archive))?,
+            hardlink_data_entries()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn reader_skips_unaligned_hardlink_data_and_padding() -> Result<()> {
+    let hidden = smuggled_entry();
+    let archive = hardlink_data_archive(HeaderFlavor::Ustar, 513, None, &hidden[..513]);
+    assert_eq!(
+        collect_entries(Cursor::new(archive))?,
+        hardlink_data_entries()
+    );
+    Ok(())
+}
+
+#[test]
 fn reader_rejects_invalid_pax_time_metadata() {
     for (value, expected) in [
         ("1.".to_string(), "invalid PAX timestamp value"),
@@ -2836,6 +2969,16 @@ fn reader_rejects_pax_size_causing_position_overflow() {
 }
 
 #[test]
+fn reader_rejects_pax_hardlink_size_causing_position_overflow() {
+    let archive = hardlink_data_archive(HeaderFlavor::Ustar, 0, Some(u64::MAX), &[]);
+    assert_archive_error(
+        Cursor::new(archive),
+        ErrorKind::InvalidData,
+        "link size overflows archive position",
+    );
+}
+
+#[test]
 fn reader_rejects_invalid_header_numeric_fields() {
     for (field_start, field_len, typeflag, flavor, message) in [
         (
@@ -2882,6 +3025,13 @@ fn reader_rejects_invalid_header_numeric_fields() {
         ),
         (329, 8, b'3', HeaderFlavor::Ustar, "invalid numeric field"),
         (337, 8, b'4', HeaderFlavor::Ustar, "invalid numeric field"),
+        (
+            SIZE_START,
+            12,
+            b'1',
+            HeaderFlavor::Ustar,
+            "invalid numeric field",
+        ),
     ] {
         let mut archive = Vec::new();
         let mut header = build_header(b"bad", typeflag, 0, flavor);

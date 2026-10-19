@@ -104,6 +104,25 @@ fn write_archive<'b>(entries: Vec<TarEntry<'b, &'b [u8]>>) -> Result<Vec<u8>> {
     })
 }
 
+/// Builds a ustar hard link header with `size` bytes of data.
+fn link_header(name: &str, link: &str, size: usize) -> [u8; 512] {
+    let mut block = [0u8; 512];
+    block[..name.len()].copy_from_slice(name.as_bytes());
+    block[100..108].copy_from_slice(b"0000644\0");
+    block[108..116].copy_from_slice(b"0000000\0");
+    block[116..124].copy_from_slice(b"0000000\0");
+    block[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+    block[136..148].copy_from_slice(b"00000000000\0");
+    block[148..156].fill(b' ');
+    block[156] = b'1';
+    block[157..157 + link.len()].copy_from_slice(link.as_bytes());
+    block[257..263].copy_from_slice(b"ustar\0");
+    block[263..265].copy_from_slice(b"00");
+    let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
+    block[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    block
+}
+
 #[test]
 fn skipped_entries_allocate_one_skip_buffer() -> Result<()> {
     const FILES: usize = 128;
@@ -132,6 +151,54 @@ fn skipped_entries_allocate_one_skip_buffer() -> Result<()> {
     })?;
 
     assert_eq!(entries, FILES);
+    assert_eq!(
+        large, 1,
+        "expected exactly 1 allocation of {LARGE} bytes or more, got {large}"
+    );
+    Ok(())
+}
+
+#[test]
+fn skipped_link_data_allocates_one_skip_buffer() -> Result<()> {
+    const LINKS: usize = 128;
+    const LINK_SIZE: usize = 1000;
+    let tail = b"tail data";
+    let tail_file = TarRegularFile::new("tail.txt", tail.len() as u64, &tail[..]);
+    let tail_archive = write_archive(vec![tail_file.into()])?;
+    let mut archive = Vec::new();
+    for i in 0..LINKS {
+        archive.extend_from_slice(&link_header(&format!("link-{i}"), "target", LINK_SIZE));
+        archive.extend_from_slice(&[0x5a; LINK_SIZE]);
+        archive.resize(archive.len().next_multiple_of(512), 0);
+    }
+    archive.extend_from_slice(&tail_archive);
+
+    let (links, data, large) = block_on_test(async {
+        let counter = Counter::start();
+        let mut stream = Box::pin(TarReader::new(&archive[..]));
+        let mut links = 0;
+        let data = loop {
+            match stream.next().await.unwrap()? {
+                TarEntry::Link(link) => {
+                    assert_eq!(link.path(), format!("link-{links}"));
+                    assert_eq!(link.link(), "target");
+                    links += 1;
+                }
+                TarEntry::File(mut file) => {
+                    assert_eq!(file.path(), "tail.txt");
+                    let mut data = Vec::new();
+                    file.read_to_end(&mut data).await?;
+                    break data;
+                }
+                other => panic!("expected link or file entry, got {:?}", other),
+            }
+        };
+        assert!(stream.next().await.is_none());
+        Ok::<_, std::io::Error>((links, data, counter.count()))
+    })?;
+
+    assert_eq!(links, LINKS);
+    assert_eq!(data, tail);
     assert_eq!(
         large, 1,
         "expected exactly 1 allocation of {LARGE} bytes or more, got {large}"

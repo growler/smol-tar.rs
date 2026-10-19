@@ -2705,11 +2705,24 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                         }
                         Kind::Link => {
                             let info = take_pax_info(this.exts, this.globs)?;
-                            *this.nxt += BLOCK_SIZE as u64;
-                            *this.state = Header;
+                            let size = effective_size(this.header, info.size)?;
                             let (path_name, link_name) =
                                 entry_path_link(this.header, info.path, info.linkpath)?;
                             let _ = info.attrs;
+                            if size == 0 {
+                                *this.nxt += BLOCK_SIZE as u64;
+                                *this.state = Header;
+                            } else {
+                                // Data blocks can follow a hard link header. A
+                                // link has no body, so skip data and padding.
+                                *this.nxt = this.nxt.checked_add(size).ok_or_else(|| {
+                                    Error::new(
+                                        ErrorKind::InvalidData,
+                                        "link size overflows archive position",
+                                    )
+                                })?;
+                                *this.state = SkipEntry;
+                            }
                             Ok((
                                 Entry::Link(TarLink {
                                     path_name,

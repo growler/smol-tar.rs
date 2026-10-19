@@ -108,6 +108,28 @@ fn owner_in(dir: &Path) -> (u32, u32) {
     (meta.uid(), meta.gid())
 }
 
+/// Append a ustar entry `name` with the body `body` to `out`. Pad the
+/// body to a full block.
+fn push_raw(out: &mut Vec<u8>, name: &str, typeflag: u8, linkname: &str, body: &[u8]) {
+    let mut block = [0; 512];
+    block[..name.len()].copy_from_slice(name.as_bytes());
+    block[100..108].copy_from_slice(b"0000644\0");
+    block[108..116].copy_from_slice(b"0000000\0");
+    block[116..124].copy_from_slice(b"0000000\0");
+    block[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
+    block[136..148].copy_from_slice(b"00000000000\0");
+    block[148..156].fill(b' ');
+    block[156] = typeflag;
+    block[157..157 + linkname.len()].copy_from_slice(linkname.as_bytes());
+    block[257..263].copy_from_slice(b"ustar\0");
+    block[263..265].copy_from_slice(b"00");
+    let sum: u32 = block.iter().map(|&byte| u32::from(byte)).sum();
+    block[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    out.extend_from_slice(&block);
+    out.extend_from_slice(body);
+    out.resize(out.len().next_multiple_of(512), 0);
+}
+
 #[test]
 fn rejects_parent_component() {
     let tmp = TempDir::new();
@@ -255,6 +277,29 @@ fn link_to_replaced_path() {
     let data = archive(vec![file("a", b"a"), dir("a/"), link("b", "a")]);
     let err = extract(&data, tmp.path()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::NotFound);
+}
+
+#[test]
+fn link_with_data() {
+    let tmp = TempDir::new();
+    let mut hidden = Vec::new();
+    push_raw(&mut hidden, "smuggled.txt", b'0', "", b"pwned\n");
+    let mut data = Vec::new();
+    push_raw(&mut data, "PaxHeader", b'x', "", b"11 mtime=1\n");
+    push_raw(&mut data, "data.bin", b'0', "", &hidden);
+    push_raw(&mut data, "PaxHeader", b'x', "", b"11 mtime=1\n");
+    push_raw(&mut data, "hl", b'1', "data.bin", &hidden);
+    push_raw(&mut data, "visible1.txt", b'0', "", b"second\n");
+    data.extend_from_slice(&[0; 1024]);
+    extract(&data, tmp.path()).unwrap();
+    assert!(!tmp.path().join("smuggled.txt").exists());
+    let visible = fs::read(tmp.path().join("visible1.txt")).unwrap();
+    assert_eq!(visible, b"second\n");
+    let meta = fs::metadata(tmp.path().join("data.bin")).unwrap();
+    assert_eq!(meta.len(), 1024);
+    let link = fs::metadata(tmp.path().join("hl")).unwrap();
+    assert_eq!(meta.ino(), link.ino());
+    assert_eq!(count(tmp.path()), 3);
 }
 
 #[test]

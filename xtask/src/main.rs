@@ -91,6 +91,7 @@ fn gen_fuzz_seeds() -> io::Result<()> {
         "seed_hardlink_ignores_pax_metadata.tar",
         seed_hardlink_ignores_pax_metadata(),
     )?;
+    write_seed(&out_dir, "seed_hardlink_data.tar", seed_hardlink_data())?;
     write_seed(
         &out_dir,
         "seed_old_style_directory.tar",
@@ -276,6 +277,38 @@ fn seed_hardlink_ignores_pax_metadata() -> Vec<u8> {
     set_bytes(&mut header, GNAME_START, 32, &[0xfe]);
     finalize_checksum(&mut header);
     append_entry(&mut archive, header, b"");
+    append_eof(&mut archive);
+    archive
+}
+
+fn seed_hardlink_data() -> Vec<u8> {
+    let mut hidden = Vec::new();
+    append_entry(
+        &mut hidden,
+        build_header(b"smuggled.txt", b'0', 6, HeaderFlavor::Ustar),
+        b"pwned\n",
+    );
+
+    let mut archive = Vec::new();
+    let local = pax_record_bytes("mtime", b"1");
+    append_pax_entry(&mut archive, b'x', &local);
+    append_entry(
+        &mut archive,
+        build_header(b"data.bin", b'0', hidden.len() as u64, HeaderFlavor::Ustar),
+        &hidden,
+    );
+
+    append_pax_entry(&mut archive, b'x', &local);
+    let mut header = build_header(b"hl", b'1', hidden.len() as u64, HeaderFlavor::Ustar);
+    set_bytes(&mut header, LINKNAME_START, 100, b"data.bin");
+    finalize_checksum(&mut header);
+    append_entry(&mut archive, header, &hidden);
+
+    append_entry(
+        &mut archive,
+        build_header(b"visible1.txt", b'0', 7, HeaderFlavor::Ustar),
+        b"second\n",
+    );
     append_eof(&mut archive);
     archive
 }
