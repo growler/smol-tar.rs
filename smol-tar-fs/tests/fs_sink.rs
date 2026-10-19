@@ -447,6 +447,8 @@ mod xattr {
             io::Errno,
         },
         smol_tar::AttrList,
+        smol_tar_fs::UnsupportedXattr,
+        std::sync::{Arc, Mutex},
     };
 
     /// Give `true` if the filesystem of `dir` supports `user.*` xattrs.
@@ -477,6 +479,17 @@ mod xattr {
                 false
             }
         }
+    }
+
+    /// Give `true` if the process can set `trusted.x` on `dir`. Print a skip
+    /// message if not.
+    #[cfg(target_os = "linux")]
+    fn trusted_xattrs_allowed(dir: &Path) -> bool {
+        if setxattr(dir, "trusted.x", b"1", XattrFlags::empty()).is_ok() {
+            return true;
+        }
+        eprintln!("skip: the process cannot set trusted xattrs");
+        false
     }
 
     /// Give the `user.*` xattrs of `path`, sorted by name. Do not follow a
@@ -571,7 +584,10 @@ mod xattr {
             return;
         }
         let data = archive(vec![file_with("f", &[("trusted.x", b"1")])]);
-        let err = extract_into(&data, FsSink::new(tmp.path()).with_xattrs(true)).unwrap_err();
+        let sink = FsSink::new(tmp.path())
+            .with_xattrs(true)
+            .with_xattr_filter(|_| true);
+        let err = extract_into(&data, sink).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
         assert!(err.to_string().starts_with("f: xattr trusted.x: "), "{err}");
     }
@@ -579,8 +595,6 @@ mod xattr {
     #[cfg(target_os = "linux")]
     #[test]
     fn xattr_policy_skip() {
-        use smol_tar_fs::UnsupportedXattr;
-
         let tmp = TempDir::new();
         if !user_xattrs_supported(tmp.path()) {
             return;
@@ -594,12 +608,107 @@ mod xattr {
         )]);
         let sink = FsSink::new(tmp.path())
             .with_xattrs(true)
+            .with_xattr_filter(|_| true)
             .with_unsupported_xattr(UnsupportedXattr::Skip);
         extract_into(&data, sink).unwrap();
         assert_eq!(
             user_attrs(&tmp.path().join("f")),
             owned(&[("user.a", b"1")])
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xattr_default_filter() {
+        let tmp = TempDir::new();
+        if !user_xattrs_supported(tmp.path()) {
+            return;
+        }
+        let trusted = || AttrList::new().with("trusted.b", &b"2"[..]);
+        let data = archive(vec![
+            file_with(
+                "f",
+                &[
+                    ("user.a", b"1"),
+                    ("trusted.b", b"2"),
+                    ("security.capability", b"invalid"),
+                ],
+            ),
+            TarDirectory::new("d/").with_attrs(trusted()).into(),
+            TarSymlink::new("s", "f").with_attrs(trusted()).into(),
+        ]);
+        let sink = FsSink::new(tmp.path())
+            .with_xattrs(true)
+            .with_unsupported_xattr(UnsupportedXattr::Error);
+        extract_into(&data, sink).unwrap();
+        let path = tmp.path().join("f");
+        assert_eq!(user_attrs(&path), owned(&[("user.a", b"1")]));
+        // Without CAP_SYS_ADMIN, a `trusted.*` read gives ENODATA: `trusted.b` checks need root.
+        for name in ["trusted.b", "security.capability"] {
+            let err = lgetxattr(&path, name, &mut [0; 256][..]).unwrap_err();
+            assert_eq!(err, Errno::NODATA, "{name}");
+        }
+        let dir = tmp.path().join("d");
+        let err = lgetxattr(&dir, "trusted.b", &mut [0; 256][..]).unwrap_err();
+        assert_eq!(err, Errno::NODATA);
+    }
+
+    #[test]
+    fn xattr_filter_rejects_all() {
+        let tmp = TempDir::new();
+        if !user_xattrs_supported(tmp.path()) {
+            return;
+        }
+        let mut attrs: Vec<(&str, &[u8])> = vec![("user.a", b"1")];
+        if cfg!(target_os = "linux") {
+            attrs.push(("trusted.b", b"2"));
+        }
+        let data = archive(vec![file_with("f", &attrs)]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let filter = {
+            let seen = Arc::clone(&seen);
+            move |name: &str| {
+                seen.lock().unwrap().push(name.to_owned());
+                false
+            }
+        };
+        let sink = FsSink::new(tmp.path())
+            .with_xattrs(true)
+            .with_xattr_filter(filter.clone());
+        extract_into(&data, sink).unwrap();
+        assert!(user_attrs(&tmp.path().join("f")).is_empty());
+        let names: Vec<_> = attrs.iter().map(|(name, _)| name.to_string()).collect();
+        assert_eq!(*seen.lock().unwrap(), names);
+
+        let tmp = TempDir::new();
+        seen.lock().unwrap().clear();
+        extract_into(&data, FsSink::new(tmp.path()).with_xattr_filter(filter)).unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xattr_filter_allows_trusted() {
+        let tmp = TempDir::new();
+        if !user_xattrs_supported(tmp.path()) {
+            return;
+        }
+        if !trusted_xattrs_allowed(tmp.path()) {
+            return;
+        }
+        let data = archive(vec![file_with(
+            "f",
+            &[("user.a", b"1"), ("trusted.b", b"2")],
+        )]);
+        let sink = FsSink::new(tmp.path())
+            .with_xattrs(true)
+            .with_xattr_filter(|name| name.starts_with("user.") || name.starts_with("trusted."));
+        extract_into(&data, sink).unwrap();
+        let path = tmp.path().join("f");
+        assert_eq!(user_attrs(&path), owned(&[("user.a", b"1")]));
+        let mut value = [0; 256];
+        let len = lgetxattr(&path, "trusted.b", &mut value[..]).unwrap();
+        assert_eq!(&value[..len], b"2");
     }
 
     #[test]

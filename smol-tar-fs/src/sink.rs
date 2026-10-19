@@ -174,6 +174,8 @@ struct Inner {
     special_bits: bool,
     xattrs: bool,
     xattr_policy: UnsupportedXattr,
+    /// Gives `true` for an attribute name that the sink writes.
+    xattr_filter: Box<dyn Fn(&str) -> bool + Send + Sync>,
     finished: bool,
     /// Buffer for file bodies. It is empty until the first file body that
     /// is not empty.
@@ -206,6 +208,7 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
             special_bits: false,
             xattrs: false,
             xattr_policy: UnsupportedXattr::default(),
+            xattr_filter: Box::new(default_xattr_filter),
             finished: false,
             buf: Box::default(),
         };
@@ -260,7 +263,9 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
     }
 
     /// Write the extended attributes of each entry. The default is `false`:
-    /// the sink does not write extended attributes.
+    /// the sink does not write extended attributes. The sink writes only the
+    /// names that the filter of [`with_xattr_filter`](Self::with_xattr_filter)
+    /// accepts.
     ///
     /// Call the options before the first entry.
     pub fn with_xattrs(mut self, restore: bool) -> Self {
@@ -277,6 +282,32 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
     pub fn with_unsupported_xattr(mut self, policy: UnsupportedXattr) -> Self {
         if let SinkState::Idle(inner) = &mut self.state {
             inner.xattr_policy = policy;
+        }
+        self
+    }
+
+    /// Set the filter for the extended attribute names. With
+    /// [`with_xattrs(true)`](Self::with_xattrs), the sink calls `filter` for
+    /// each attribute name of an entry that it writes. It writes only the
+    /// attributes for which `filter` gives `true`. The policy of
+    /// [`with_unsupported_xattr`](Self::with_unsupported_xattr) does not apply
+    /// to an attribute that the filter removes.
+    ///
+    /// The default filter:
+    ///
+    /// - Apple platforms: all names. Apple names have no namespace prefix, for
+    ///   example `com.apple.FinderInfo`.
+    /// - Other platforms: the names that start with `user.`. Thus the sink
+    ///   does not write `security.*`, `system.*` and `trusted.*` attributes,
+    ///   for example file capabilities and ACLs.
+    ///
+    /// Call the options before the first entry.
+    pub fn with_xattr_filter<F>(mut self, filter: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        if let SinkState::Idle(inner) = &mut self.state {
+            inner.xattr_filter = Box::new(filter);
         }
         self
     }
@@ -403,7 +434,13 @@ impl Inner {
             owner: self.owner.then_some((uid, gid)),
             mtime,
             xattrs: if self.xattrs {
-                mem::take(attrs)
+                let mut attrs = mem::take(attrs);
+                attrs.retain(|name, _| (self.xattr_filter)(name));
+                if attrs.is_empty() {
+                    AttrList::new()
+                } else {
+                    attrs
+                }
             } else {
                 AttrList::new()
             },
@@ -696,6 +733,11 @@ async fn copy_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         remain -= len as u64;
     }
     poll_fn(|cx| Pin::new(&mut *out).poll_flush(cx)).await
+}
+
+/// Give `true` for an extended attribute name that the sink writes by default.
+fn default_xattr_filter(name: &str) -> bool {
+    cfg!(target_vendor = "apple") || name.starts_with("user.")
 }
 
 /// Give `true` for a path with no components: each component is empty or
@@ -1093,6 +1135,23 @@ mod tests {
         assert_eq!(link_target("./a//b").as_deref(), Some("a/b"));
         assert_eq!(link_target("/a"), None);
         assert_eq!(link_target("a/.."), None);
+    }
+
+    #[test]
+    fn default_xattr_filter_names() {
+        assert!(default_xattr_filter("user.a"));
+        for name in [
+            "trusted.a",
+            "security.capability",
+            "system.posix_acl_access",
+            "com.apple.FinderInfo",
+        ] {
+            assert_eq!(
+                default_xattr_filter(name),
+                cfg!(target_vendor = "apple"),
+                "{name}"
+            );
+        }
     }
 
     #[test]
