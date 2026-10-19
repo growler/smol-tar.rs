@@ -367,7 +367,7 @@ pub(crate) fn matches_filter(path: &str, filter: Option<&str>) -> bool {
 fn run(cli: Cli) -> io::Result<()> {
     #[cfg(all(feature = "smol", not(feature = "tokio")))]
     {
-        return block_on(run_async(cli));
+        block_on(run_async(cli))
     }
 
     #[cfg(feature = "tokio")]
