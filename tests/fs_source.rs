@@ -363,12 +363,16 @@ fn hardlink_symlink() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[test]
 fn char_device() {
+    #[cfg(target_os = "linux")]
+    let (major, minor) = (1, 3);
+    #[cfg(target_vendor = "apple")]
+    let (major, minor) = (3, 2);
     assert_eq!(
         tar_items(FsSource::new("/dev/null").with_prefix("null")),
-        [Item::Device("null".into(), true, 1, 3)]
+        [Item::Device("null".into(), true, major, minor)]
     );
 }
 
