@@ -14,9 +14,9 @@ fn main() -> std::io::Result<()> {
     };
     smol::block_on(async {
         // DIR must exist. If it does not exist, the sink gives a NotFound
-        // error at the first entry. forward() calls finish() at the end of
-        // the stream. finish() sets the mode and the modification time of
-        // the directories.
+        // error at the first entry that it writes. forward() calls finish()
+        // at the end of the stream. finish() sets the mode and the
+        // modification time of the directories.
         TarReader::new(BufReader::new(File::open(input).await?))
             .forward(FsSink::new(dir))
             .await

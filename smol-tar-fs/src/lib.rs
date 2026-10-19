@@ -125,6 +125,8 @@ pub enum FsKind {
 /// - The target is a directory, or a later entry replaced it with a
 ///   directory.
 /// - The target path starts with `/` or has a `..` component.
+/// - The last entry at the target path is a device entry that the sink
+///   skipped with [`DeviceNodes::Skip`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MissingLinkTarget {
     /// Stop with a [`NotFound`](std::io::ErrorKind::NotFound) error. The
@@ -138,7 +140,9 @@ pub enum MissingLinkTarget {
 /// Action of the sink for a character or block device entry.
 ///
 /// A device node gives access to the device through the extracted tree.
-/// The policy does not apply to FIFO entries.
+/// The policy does not apply to FIFO entries. A device entry with a path
+/// that is not valid gives an [`InvalidData`](std::io::ErrorKind::InvalidData)
+/// error with each policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DeviceNodes {
     /// Create the device node. Without privileges, the entry gives a
@@ -161,6 +165,9 @@ pub enum DeviceNodes {
 ///   filesystems do not support extended attributes.
 /// - The platform cannot write extended attributes on the kind of the node.
 ///   For example, Linux does not write them on symbolic links and devices.
+///
+/// The policy does not apply to an attribute that the filter of
+/// [`FsSink::with_xattr_filter`] removes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum UnsupportedXattr {
     /// Stop with an error. The error has the entry path and the attribute

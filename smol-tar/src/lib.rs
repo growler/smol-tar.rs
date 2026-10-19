@@ -1087,13 +1087,39 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 ///
 /// The stream ends after the two zero blocks that end the archive.
 ///
+/// # Entry sizes
+///
+/// The reader uses the size of an entry to find the next header. The size
+/// is the PAX `size` record of the entry. If the entry has no `size`
+/// record, the size is the `size` record of the last global PAX header that
+/// has one. If neither record exists, the size is the size field of the
+/// header.
+///
+/// - Regular file: the size is the length of the file body after the
+///   header. [`TarRegularFile`] gives the body.
+/// - Hard link: data can follow the header. The reader skips the data and
+///   its padding. [`TarLink`] has no body.
+/// - Symbolic link: the size must be 0. Another size gives an
+///   [`ErrorKind::InvalidData`] error.
+/// - Directory, character device, block device and FIFO: no data follows
+///   the header. The next header starts in the block after the header.
+///   [`TarDirectory::size`] gives the size of a directory entry.
+/// - In an old tar header, a regular file entry with a path that ends with
+///   `/` is a directory entry.
+///
+/// Other tar parsers can read data after a directory, device or FIFO
+/// header. They can also ignore a global `size` record. Thus they can find
+/// different entries in the same archive. Use the same parser to validate
+/// and to extract an archive.
+///
 /// # Errors
 ///
 /// The stream yields an error item in these conditions:
 ///
 /// - [`ErrorKind::InvalidData`]: a header is malformed, has a bad checksum,
 ///   has an unsupported entry type, has a name that is not valid UTF-8, or
-///   exceeds a crate [limit](crate#limits).
+///   exceeds a crate [limit](crate#limits). A symbolic link entry with a
+///   size that is not 0 also gives this error.
 /// - [`ErrorKind::UnexpectedEof`]: the source ends before the two zero blocks
 ///   that end the archive.
 /// - The source reader returns an error. The stream yields that error.
@@ -1784,7 +1810,13 @@ impl TarDirectory {
     pub fn path(&'_ self) -> &'_ str {
         &self.path_name
     }
-    /// Return the size stored in the tar header.
+    /// Return the size stored for this directory entry.
+    ///
+    /// For an entry from [`TarReader`], the size is the PAX `size` record of
+    /// the entry. If the entry has no `size` record, the size is the `size`
+    /// record of the last global PAX header that has one. If neither record
+    /// exists, the size is the size field of the header. [`new`](Self::new)
+    /// sets the size to 0. No data follows a directory header.
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -1860,7 +1892,9 @@ impl TarDirectory {
         self.times = self.times.with_ctime(ctime);
         self
     }
-    /// Replace the size stored in the tar header.
+    /// Replace the size stored in the tar header. [`TarWriter`] writes no
+    /// data after the header. Other tar parsers can read this number of bytes
+    /// after the header.
     pub fn with_size(mut self, size: u64) -> Self {
         self.size = size;
         self

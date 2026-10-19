@@ -94,7 +94,8 @@ All functions return `std::io::Error`. The reader uses these error kinds:
 
 - `ErrorKind::InvalidData`: a header is malformed, has a bad checksum, has an
   unsupported entry type (for example, a sparse file), has a name that is not
-  valid UTF-8, or is larger than a [limit](#limits).
+  valid UTF-8, or is larger than a [limit](#limits). A symbolic link entry
+  with a size that is not 0 also gives this error.
 - `ErrorKind::UnexpectedEof`: the source ends before the end of the archive
   or before the end of a file body.
 - Errors from the source reader pass through without change.
@@ -360,7 +361,17 @@ These are the smol-tar equivalents of the [`tar`](https://docs.rs/tar) and
 - `builder.finish()` or `builder.into_inner()` -- `writer.finish()`.
 - `archive.unpack(dir)` -- `TarReader::new(r).forward(FsSink::new(dir))`
   with smol-tar-fs. `FsSink` needs an existing directory. The
-  `unpack` method of the `tar` crate creates the directory.
+  `unpack` method of the `tar` crate creates the directory. It writes a
+  character device, block device or FIFO entry as a regular file with the
+  data of the entry. By default, `FsSink` skips character and block device
+  entries and creates a FIFO for a FIFO entry. To create device nodes, call
+  `with_device_nodes(DeviceNodes::Create)`.
+- `archive.set_unpack_xattrs(true)` -- `FsSink::new(dir).with_xattrs(true)`.
+  The `tar` crate then writes all attribute names on regular files.
+  By default, `FsSink` writes all names on Apple platforms, and only the
+  names that start with `user.` on Linux and Android. To write other names,
+  call `with_xattr_filter`. On other Unix platforms, `FsSink` cannot write
+  extended attributes. `with_unsupported_xattr` sets the action for them.
 - `builder.append_dir_all(path, dir)` --
   `writer.send_all(&mut FsSource::new(dir).with_prefix(path).into_tar())`
   with smol-tar-fs and `SinkExt`. `FsSource` stores symlinks as
@@ -392,6 +403,30 @@ Not supported:
 
 - Sparse files and multi-volume archives. The reader returns an error for
   these entries.
+
+## Entry sizes
+
+The reader uses the size of an entry to find the next header. The size is
+the PAX `size` record of the entry. If the entry has no `size` record, the
+size is the `size` record of the last global PAX header that has one. If
+neither record exists, the size is the size field of the header.
+
+- Regular file: the size is the length of the file body after the header.
+  `TarRegularFile` gives the body.
+- Hard link: data can follow the header. The reader skips the data and its
+  padding. `TarLink` has no body.
+- Symbolic link: the size must be 0. Another size gives an
+  `ErrorKind::InvalidData` error.
+- Directory, character device, block device and FIFO: no data follows the
+  header. The next header starts in the block after the header.
+  `TarDirectory::size()` gives the size of a directory entry.
+- In an old tar header, a regular file entry with a path that ends with `/`
+  is a directory entry.
+
+Other tar parsers can read data after a directory, device or FIFO header.
+They can also ignore a global `size` record. Thus they can find different
+entries in the same archive. Use the same parser to validate and to extract
+an archive.
 
 ## Limits
 

@@ -71,8 +71,17 @@ feature for `smol-tar` and `smol-tar-fs`. If `smol-tar` uses `tokio` and
    hard link in the archive points to an entry in the archive.
 4. `FsSource` and `FsSink` do not read or write extended attributes by
    default. To keep the extended attributes, call `with_xattrs(true)` on
-   both of them.
-5. With the `tokio` feature, use `FsSource`, `FsFile`, `FsSink`, and the
+   both of them. On Apple platforms, the default filter of `FsSink` accepts
+   all names. On Linux and Android, it accepts only the names that start
+   with `user.`. To write other names, call `with_xattr_filter`. On other
+   Unix platforms, `FsSink` cannot write extended attributes.
+   `with_unsupported_xattr` sets the action for them.
+5. By default, `FsSink` skips character and block device entries and
+   creates no device nodes. To create device nodes, call
+   `with_device_nodes(DeviceNodes::Create)`. To stop at a device entry, use
+   `DeviceNodes::Error`. A device entry with a path that is not valid gives
+   an `ErrorKind::InvalidData` error with each policy.
+6. With the `tokio` feature, use `FsSource`, `FsFile`, `FsSink`, and the
    stream of `into_tar` inside a Tokio runtime context. Outside of a Tokio
    runtime context, they panic.
 
@@ -117,10 +126,12 @@ Then the reader of the body, for example `TarWriter`, gives an
 - `ErrorKind::NotFound`: the destination does not exist, or the target of a
   hard link is not available and the policy is `MissingLinkTarget::Error`.
 - `ErrorKind::PermissionDenied`: the sink cannot set the owner, create a
-  device, or write an extended attribute.
+  device, or write an extended attribute. A device entry with the policy
+  `DeviceNodes::Error` also gives this error. The message is "PATH: device
+  entries are not allowed".
 - `ErrorKind::Unsupported`: the filesystem does not support extended
-  attributes, or the platform cannot write extended attributes on the kind
-  of the node.
+  attributes, the platform cannot write extended attributes, or the
+  platform cannot write extended attributes on the kind of the node.
 - `ErrorKind::UnexpectedEof`: the file body ends before the size of the
   entry.
 - Other errors from the system or from the body reader pass through.
@@ -203,9 +214,9 @@ fn main() -> std::io::Result<()> {
     };
     smol::block_on(async {
         // DIR must exist. If it does not exist, the sink gives a NotFound
-        // error at the first entry. forward() calls finish() at the end of
-        // the stream. finish() sets the mode and the modification time of
-        // the directories.
+        // error at the first entry that it writes. forward() calls finish()
+        // at the end of the stream. finish() sets the mode and the
+        // modification time of the directories.
         TarReader::new(BufReader::new(File::open(input).await?))
             .forward(FsSink::new(dir))
             .await
@@ -228,8 +239,9 @@ Refer to [docs.rs](https://docs.rs/smol-tar-fs) for the full API.
 `FsSink::new(dir)`
 : A `Sink` of `TarEntry` that writes the entries to a directory. It also
   has the methods `write(entry)` and `finish()`. Its options are
-  `with_missing_link_target`, `with_owner`, `with_special_bits`,
-  `with_xattrs`, and `with_unsupported_xattr`.
+  `with_missing_link_target`, `with_device_nodes`, `with_owner`,
+  `with_special_bits`, `with_xattrs`, `with_unsupported_xattr`, and
+  `with_xattr_filter`.
 
 ## License
 

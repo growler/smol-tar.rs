@@ -59,6 +59,27 @@ use {
 ///   the same archive. The target must not be a directory. For another
 ///   target, [`with_missing_link_target`](Self::with_missing_link_target)
 ///   sets the action. A link to its own path does nothing.
+/// - By default, the sink skips character and block device entries and
+///   creates no device nodes. A device node gives access to the device
+///   through the extracted tree.
+///   [`with_device_nodes`](Self::with_device_nodes) sets the action for a
+///   device entry. The policy does not apply to FIFO entries. A device entry
+///   with a path that is not valid gives an [`InvalidData`] error with each
+///   policy.
+/// - With [`DeviceNodes::Skip`], the sink does not change the destination
+///   for a device entry. A later hard link to the path of the entry has no
+///   target. [`with_missing_link_target`](Self::with_missing_link_target)
+///   sets the action for that link.
+/// - With [`with_xattrs(true)`](Self::with_xattrs), the sink writes only the
+///   extended attributes that the filter of
+///   [`with_xattr_filter`](Self::with_xattr_filter) accepts. On Apple
+///   platforms, the default filter accepts all names. On Linux and Android,
+///   it accepts only the names that start with `user.`. Thus the sink does
+///   not write `security.*`, `system.*` and `trusted.*` attributes, for
+///   example file capabilities and ACLs. On other Unix platforms, the sink
+///   cannot write extended attributes.
+///   [`with_unsupported_xattr`](Self::with_unsupported_xattr) sets the
+///   action for them.
 ///
 /// # Metadata
 ///
@@ -80,7 +101,14 @@ use {
 /// - The sink writes extended attributes only with
 ///   [`with_xattrs`](Self::with_xattrs).
 ///   [`with_unsupported_xattr`](Self::with_unsupported_xattr) sets the
-///   action for an attribute that the sink cannot write.
+///   action for an attribute that the sink cannot write. This action does
+///   not apply to an attribute that the filter of
+///   [`with_xattr_filter`](Self::with_xattr_filter) removes.
+/// - With [`DeviceNodes::Create`], the sink sets the metadata of a device
+///   node by the same rules as for other nodes. The sink cannot write
+///   extended attributes on a device node.
+///   [`with_unsupported_xattr`](Self::with_unsupported_xattr) sets the
+///   action for the attributes of a device entry.
 /// - A hard link gets no metadata and no extended attributes, because it
 ///   shares the node of its target.
 ///
@@ -118,10 +146,12 @@ use {
 /// - [`NotFound`]: the target of a hard link is not available, and the
 ///   policy is [`MissingLinkTarget::Error`].
 /// - [`PermissionDenied`]: the sink cannot set the owner, create a device,
-///   or write an extended attribute.
+///   or write an extended attribute. A device entry with the policy
+///   [`DeviceNodes::Error`] also gives this error. The message is
+///   "PATH: device entries are not allowed".
 /// - [`Unsupported`]: the filesystem does not support extended attributes,
-///   or the platform cannot write extended attributes on the kind of the
-///   node.
+///   the platform cannot write extended attributes, or the platform cannot
+///   write extended attributes on the kind of the node.
 /// - [`UnexpectedEof`]: the file body ends before the size of the entry.
 /// - Another error from the system or from the body reader.
 ///
@@ -161,7 +191,8 @@ enum SinkState<'a> {
 /// State and options of the sink.
 struct Inner {
     dest: PathBuf,
-    /// Destination directory. It opens on the first entry.
+    /// Destination directory. It opens on the first entry that the sink
+    /// writes.
     root: Option<sys::Dir>,
     /// Normalized paths of the nodes that are not directories and that the
     /// sink created.
@@ -195,7 +226,7 @@ struct DirMeta {
 
 impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
     /// Make a sink that writes to the directory `dest`. The sink opens the
-    /// directory on the first entry.
+    /// directory on the first entry that it writes.
     pub fn new(dest: impl Into<PathBuf>) -> Self {
         let inner = Inner {
             dest: dest.into(),
@@ -297,9 +328,13 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
     ///
     /// - Apple platforms: all names. Apple names have no namespace prefix, for
     ///   example `com.apple.FinderInfo`.
-    /// - Other platforms: the names that start with `user.`. Thus the sink
+    /// - Linux and Android: the names that start with `user.`. Thus the sink
     ///   does not write `security.*`, `system.*` and `trusted.*` attributes,
     ///   for example file capabilities and ACLs.
+    /// - Other Unix platforms: the names that start with `user.`. The sink
+    ///   cannot write extended attributes on these platforms.
+    ///   [`with_unsupported_xattr`](Self::with_unsupported_xattr) sets the
+    ///   action for them.
     ///
     /// Call the options before the first entry.
     pub fn with_xattr_filter<F>(mut self, filter: F) -> Self
