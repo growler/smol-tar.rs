@@ -1,5 +1,5 @@
 # smol-tar-fs
-[![Docs](https://docs.rs/smol-tar-fs/badge.svg)](https://docs.rs/smol-tar-fs) [![Crates.io](https://img.shields.io/crates/v/smol-tar-fs.svg?maxAge=2592000)](https://crates.io/crates/smol-tar-fs)
+[![Tests](https://github.com/growler/smol-tar.rs/actions/workflows/test.yml/badge.svg)](https://github.com/growler/smol-tar.rs/actions/workflows/test.yml) ![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/growler/afe6b562550658e432029a3999ff9a8d/raw/smol-tar.rs-coverage.json) [![Docs](https://docs.rs/smol-tar-fs/badge.svg)](https://docs.rs/smol-tar-fs) [![Crates.io](https://img.shields.io/crates/v/smol-tar-fs.svg?maxAge=2592000)](https://crates.io/crates/smol-tar-fs)
 
 smol-tar-fs gives a `Stream` of tar entries from a directory tree and a
 `Sink` that writes a stream of tar entries to a directory. Use it with the
