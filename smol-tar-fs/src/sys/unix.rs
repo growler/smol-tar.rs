@@ -12,10 +12,7 @@ use rustix::fs::{makedev, mknodat};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{seek, RawDir, SeekFrom};
 use {
-    crate::{
-        fs::{with_path, Child, Existing, FsKind, Meta, Root, SetMeta, UnsupportedXattr},
-        AttrList,
-    },
+    crate::{with_path, Child, Existing, FsKind, Meta, Root, SetMeta, UnsupportedXattr},
     rustix::{
         fd::{AsFd, BorrowedFd, OwnedFd},
         fs::{
@@ -26,6 +23,7 @@ use {
         io::Errno,
         path::Arg,
     },
+    smol_tar::AttrList,
     std::{
         ffi::{CStr, CString, OsStr},
         io,
@@ -852,7 +850,7 @@ fn no_xattrs(attrs: &AttrList, policy: UnsupportedXattr) -> io::Result<()> {
 mod tests {
     use {
         super::*,
-        crate::fs::testutil::TempDir,
+        crate::testutil::TempDir,
         rustix::fs::fcntl_getfl,
         static_assertions::assert_impl_all,
         std::{

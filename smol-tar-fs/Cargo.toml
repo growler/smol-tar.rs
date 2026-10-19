@@ -1,0 +1,57 @@
+[package]
+name = "smol-tar-fs"
+version.workspace = true
+edition = "2021"
+authors = ["Alexey Naidyonov <alexey.naidyonov@gmail.com>"]
+description = "Async filesystem source and sink for smol-tar: a Stream of tar entries from a directory tree and a Sink that writes tar entries to a directory"
+homepage = "https://github.com/growler/smol-tar.rs"
+repository = "https://github.com/growler/smol-tar.rs"
+documentation = "https://docs.rs/smol-tar-fs"
+license = "MIT"
+keywords = ["tar", "async", "archive", "tokio", "smol"]
+categories = ["filesystem", "asynchronous", "encoding"]
+readme = "README.md"
+include = [
+    "src/**",
+    "Cargo.toml",
+    "README.md",
+]
+rust-version = "1.85"
+
+[features]
+default = ["smol"]
+smol = ["smol-tar/smol", "dep:futures-io", "dep:blocking"]
+tokio = ["smol-tar/tokio", "dep:tokio"]
+
+[dependencies]
+smol-tar.workspace = true
+futures-core = "0.3"
+futures-sink = "0.3"
+pin-project-lite = "0.2"
+futures-io = { version = "0.3", optional = true }
+blocking = { version = "1.6", optional = true }
+tokio = { version = "1", optional = true, features = ["fs", "io-util", "rt"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.5", default-features = false, features = ["fs", "std"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+smol = "2.0"
+futures = "0.3"
+static_assertions = "1.1"
+blocking = "1.6"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[[example]]
+name = "pack"
+required-features = ["smol"]
+
+[[example]]
+name = "unpack"
+required-features = ["smol"]

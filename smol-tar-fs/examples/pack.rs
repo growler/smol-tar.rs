@@ -1,13 +1,11 @@
 //! Pack a directory tree into a new tar archive with smol.
 //!
-//! Run: cargo run --example pack --features fs -- OUT.tar DIR
+//! Run: cargo run --example pack -- OUT.tar DIR
 
 use futures::{future, StreamExt, TryStreamExt};
 use smol::{fs::File, io::BufWriter};
-use smol_tar::{
-    fs::{FsSource, FsStreamExt},
-    TarWriter,
-};
+use smol_tar::TarWriter;
+use smol_tar_fs::{FsSource, FsStreamExt};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

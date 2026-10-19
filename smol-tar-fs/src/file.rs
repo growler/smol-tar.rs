@@ -226,7 +226,7 @@ impl AsyncRead for FsFile {
 mod tests {
     use {
         super::*,
-        crate::fs::{rt::block_on, testutil::TempDir, FsEntry, FsSource},
+        crate::{rt::block_on, testutil::TempDir, FsEntry, FsSource},
         futures::TryStreamExt,
         static_assertions::assert_impl_all,
         std::{

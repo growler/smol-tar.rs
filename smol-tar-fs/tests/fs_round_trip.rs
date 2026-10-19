@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "fs"))]
+#![cfg(unix)]
 
 mod fs_common;
 
@@ -6,10 +6,8 @@ use {
     fs_common::{block_on, make_fifo, TempDir},
     futures::StreamExt,
     rustix::fs::{utimensat, AtFlags, Timespec, Timestamps, CWD, UTIME_OMIT},
-    smol_tar::{
-        fs::{FsSink, FsSource, FsStreamExt},
-        TarReader, TarWriter,
-    },
+    smol_tar::{TarReader, TarWriter},
+    smol_tar_fs::{FsSink, FsSource, FsStreamExt},
     std::{
         fs::{self, FileType, Permissions},
         os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt},

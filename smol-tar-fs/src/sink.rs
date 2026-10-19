@@ -4,8 +4,9 @@ use {
     super::{
         resolve, rt, sys, with_path, Existing, FsKind, MissingLinkTarget, SetMeta, UnsupportedXattr,
     },
-    crate::{poll_read_compat, AsyncRead, AsyncWrite, AttrList, TarEntry, TarRegularFile},
+    crate::{poll_read_compat, AsyncRead, AsyncWrite},
     futures_sink::Sink,
+    smol_tar::{AttrList, TarEntry, TarRegularFile},
     std::{
         borrow::Cow,
         collections::HashSet,
@@ -23,7 +24,7 @@ use {
 /// Sink that writes tar entries to a directory tree.
 ///
 /// The sink takes the [`TarEntry`] values of an archive, for example from a
-/// [`TarReader`](crate::TarReader), and creates one node in the destination
+/// [`TarReader`](smol_tar::TarReader), and creates one node in the destination
 /// directory for each entry. Use it with `forward`, or call
 /// [`write`](Self::write) for each entry and then [`finish`](Self::finish).
 ///
@@ -833,11 +834,9 @@ fn make_link(
 mod tests {
     use {
         super::*,
-        crate::{
-            fs::{rt::block_on, testutil::TempDir, FsFile},
-            TarDirectory, TarLink, TarReader, TarRegularFileReader, TarWriter,
-        },
+        crate::{rt::block_on, testutil::TempDir, FsFile},
         futures::StreamExt,
+        smol_tar::{TarDirectory, TarLink, TarReader, TarRegularFileReader, TarWriter},
         static_assertions::assert_impl_all,
         std::{
             fs,
@@ -887,7 +886,11 @@ mod tests {
     #[test]
     fn pax_archive_is_extracted() {
         let tmp = TempDir::new();
-        let data = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/pax.tar")).unwrap();
+        let data = fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../smol-tar/tests/data/pax.tar"
+        ))
+        .unwrap();
         extract(&data, tmp.path()).unwrap();
         let mut dir = tmp.path().join("pax");
         for _ in 0..10 {

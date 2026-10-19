@@ -413,6 +413,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
+name = "picotar"
+version = "0.1.10"
+dependencies = [
+ "futures",
+ "futures-lite",
+ "smol",
+ "smol-tar",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -519,6 +531,21 @@ version = "0.1.10"
 dependencies = [
  "async-compression",
  "async-lock",
+ "futures",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "pin-project-lite",
+ "smol",
+ "static_assertions",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
+name = "smol-tar-fs"
+version = "0.1.10"
+dependencies = [
  "blocking",
  "futures",
  "futures-core",
@@ -528,9 +555,9 @@ dependencies = [
  "pin-project-lite",
  "rustix",
  "smol",
+ "smol-tar",
  "static_assertions",
  "tokio",
- "tokio-stream",
 ]
 
 [[package]]

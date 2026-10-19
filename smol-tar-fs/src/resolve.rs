@@ -2,7 +2,7 @@
 //! parent directories.
 
 use {
-    crate::fs::{sys, with_path},
+    crate::{sys, with_path},
     std::{io, ops::Deref},
 };
 
@@ -69,7 +69,7 @@ pub(crate) fn open_parent<'a>(
 
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::fs::testutil::TempDir, std::io::ErrorKind};
+    use {super::*, crate::testutil::TempDir, std::io::ErrorKind};
 
     #[test]
     fn normalize_removes_empty_and_dot() {

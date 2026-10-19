@@ -12,7 +12,7 @@ smol = "2"
 libfuzzer-sys = "0.4"
 
 [dependencies.smol-tar]
-path = ".."
+path = "../smol-tar"
 
 [[bin]]
 name = "tar"

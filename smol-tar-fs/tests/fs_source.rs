@@ -1,14 +1,12 @@
-#![cfg(all(unix, feature = "fs"))]
+#![cfg(unix)]
 
 mod fs_common;
 
 use {
     fs_common::{block_on, collect, make_fifo, TempDir},
     futures::{future, Stream, StreamExt, TryStreamExt},
-    smol_tar::{
-        fs::{FsEntry, FsKind, FsSource, FsStreamExt},
-        TarEntry, TarReader, TarWriter,
-    },
+    smol_tar::{TarEntry, TarReader, TarWriter},
+    smol_tar_fs::{FsEntry, FsKind, FsSource, FsStreamExt},
     std::{
         fs,
         io::{self, ErrorKind},

@@ -2,8 +2,8 @@
 
 use {
     super::{rt, sys, walk, with_path, Child, FsFile, FsKind, Meta, Root},
-    crate::AttrList,
     futures_core::stream::Stream,
+    smol_tar::AttrList,
     std::{
         collections::VecDeque,
         future::Future,

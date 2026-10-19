@@ -21,7 +21,7 @@ compile_error!("enable only one runtime feature for CLI tests");
 compile_error!("CLI tests require a runtime feature");
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_smol-tar")
+    env!("CARGO_BIN_EXE_picotar")
 }
 
 struct TempDir {
@@ -226,7 +226,7 @@ fn invalid_invocation_reports_usage() -> io::Result<()> {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("option -f is required"));
     assert!(stderr.contains("usage:"));
-    assert!(stderr.contains("smol-tar-bin"));
+    assert!(stderr.contains("picotar"));
     Ok(())
 }
 
@@ -237,7 +237,7 @@ fn help_flag_prints_usage() -> io::Result<()> {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("usage:"));
-    assert!(stdout.contains("smol-tar-bin -c -f ARCHIVE"));
+    assert!(stdout.contains("picotar -c -f ARCHIVE"));
     Ok(())
 }
 

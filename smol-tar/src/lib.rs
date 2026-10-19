@@ -4,9 +4,8 @@
 
 //! A minimal async streaming tar reader and writer.
 //!
-//! Without the `fs` feature, the crate does not access the filesystem. It
-//! reads archives from an [`AsyncRead`] source and writes archives to an
-//! [`AsyncWrite`] sink.
+//! The crate does not access the filesystem. It reads archives from an
+//! [`AsyncRead`] source and writes archives to an [`AsyncWrite`] sink.
 //!
 //! [`TarReader`] is a [`Stream`] of [`TarEntry`] values. It keeps little data
 //! in memory. A regular file entry gives its body through [`TarRegularFile`],
@@ -218,19 +217,9 @@
 //!
 //! # Filesystem
 //!
-//! With the `fs` feature, the `fs` module packs a directory tree into an
-//! archive and unpacks an archive into a directory. The module is available
-//! only on Unix.
-//!
-//! - `fs::FsSource` is a stream of the nodes in a directory tree.
-//!   `fs::FsStreamExt::into_tar` converts the nodes to [`TarEntry`] values
-//!   for [`TarWriter`].
-//! - `fs::FsSink` is a sink of [`TarEntry`] values, for example from
-//!   [`TarReader`]. It writes each entry to a directory.
-//!
-//! The source and the sink run the filesystem calls on the blocking thread
-//! pool of the runtime. The close of a file or a directory can occur on the
-//! thread that drops it.
+//! The [`smol-tar-fs`](https://docs.rs/smol-tar-fs) crate gives a `Stream`
+//! of tar entries from a directory tree and a `Sink` that writes tar entries
+//! to a directory. It is available only on Unix.
 //!
 //! # Feature flags
 //!
@@ -239,16 +228,12 @@
 //! - `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`.
 //! - `futures`: add the `futures` crate as a dependency. The library code does
 //!   not use it.
-//! - `fs`: add the `fs` module. It packs a directory tree into an archive and
-//!   unpacks an archive into a directory. The module is available only on
-//!   Unix. On Apple platforms, the `fs` feature needs macOS 13, iOS 16,
-//!   tvOS 16, or watchOS 9 or later.
 //!
 //! Enable `smol` or `tokio`. If you enable neither feature, the build fails.
 //! If you enable both features, the crate uses the `tokio` traits.
 //!
 //! The documentation on docs.rs uses the default features and the `futures`
-//! and `fs` features. It shows the `futures-io` traits.
+//! feature. It shows the `futures-io` traits.
 //!
 //! # Sequential use
 //!
@@ -277,9 +262,6 @@
 
 #[cfg(not(any(feature = "smol", feature = "tokio")))]
 compile_error!("either feature `smol` or `tokio` must be enabled");
-
-#[cfg(all(unix, feature = "fs"))]
-pub mod fs;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

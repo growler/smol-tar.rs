@@ -23,7 +23,12 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Publish to crates.io
-        run: cargo publish --locked
+      - name: Publish smol-tar to crates.io
+        run: cargo publish --locked -p smol-tar
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish smol-tar-fs to crates.io
+        run: cargo publish --locked -p smol-tar-fs
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -24,7 +24,7 @@ pub(crate) fn read_sorted(
 mod tests {
     use {
         super::*,
-        crate::fs::{testutil::TempDir, Root},
+        crate::{testutil::TempDir, Root},
     };
 
     fn names(list: &VecDeque<Child>) -> Vec<&str> {

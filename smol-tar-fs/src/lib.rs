@@ -1,6 +1,46 @@
-//! Filesystem source and sink for tar archives.
+#![cfg(unix)]
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(rustdoc::invalid_rust_codeblocks)]
+
+//! Filesystem source and sink for [`smol_tar`] archives.
 //!
-//! This module is available only on Unix, with the `fs` feature.
+//! The crate gives a `Stream` of tar entries from a directory tree and a
+//! `Sink` that writes a stream of tar entries to a directory. Use it with the
+//! [`smol_tar`] reader and writer. The crate is available only on Unix. On other
+//! platforms, the crate is empty. On Apple platforms, the crate needs
+//! macOS 13, iOS 16, tvOS 16, or watchOS 9 or later.
+//!
+//! - [`FsSource`] is a stream of the nodes in a directory tree.
+//!   [`FsStreamExt::into_tar`] converts the nodes to [`TarEntry`] values
+//!   for [`TarWriter`].
+//! - [`FsSink`] is a sink of [`TarEntry`] values, for example from
+//!   [`TarReader`]. It writes each entry to a directory.
+//!
+//! The source and the sink run the filesystem calls on the blocking thread
+//! pool of the runtime. The close of a file or a directory can occur on the
+//! thread that drops it.
+//!
+//! # Feature flags
+//!
+//! - `smol` (default): use the `futures-io` traits `AsyncRead` and
+//!   `AsyncWrite`, and the thread pool of the `blocking` crate. This feature
+//!   enables the `smol` feature of `smol-tar`.
+//! - `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`, and
+//!   the blocking thread pool of Tokio. This feature enables the `tokio`
+//!   feature of `smol-tar`.
+//!
+//! Enable `smol` or `tokio`. If you enable neither feature, the build fails.
+//! If you enable both features, the crate uses `tokio`. Enable the same
+//! runtime feature for `smol-tar` and `smol-tar-fs`. If `smol-tar` uses
+//! `tokio` and `smol-tar-fs` uses `smol`, the build fails.
+//!
+//! [`TarEntry`]: smol_tar::TarEntry
+//! [`TarReader`]: smol_tar::TarReader
+//! [`TarWriter`]: smol_tar::TarWriter
+
+#[cfg(not(any(feature = "smol", feature = "tokio")))]
+compile_error!("either feature `smol` or `tokio` must be enabled");
 
 mod file;
 mod into_tar;
@@ -21,9 +61,42 @@ pub use {
 };
 
 use {
-    crate::AttrList,
-    std::{io, time::SystemTime},
+    smol_tar::AttrList,
+    std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+        time::SystemTime,
+    },
 };
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+use futures_io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "tokio")]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+fn poll_read_compat<R: AsyncRead + ?Sized>(
+    reader: Pin<&mut R>,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+) -> Poll<io::Result<usize>> {
+    reader.poll_read(cx, buf)
+}
+
+#[cfg(feature = "tokio")]
+fn poll_read_compat<R: AsyncRead + ?Sized>(
+    reader: Pin<&mut R>,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+) -> Poll<io::Result<usize>> {
+    let mut read_buf = ReadBuf::new(buf);
+    match reader.poll_read(cx, &mut read_buf) {
+        Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        Poll::Pending => Poll::Pending,
+    }
+}
 
 /// Kind of a filesystem node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

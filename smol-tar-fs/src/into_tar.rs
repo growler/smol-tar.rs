@@ -2,9 +2,9 @@
 
 use {
     super::{sys, FsEntry, FsFile, FsKind},
-    crate::{TarDevice, TarDirectory, TarEntry, TarFifo, TarLink, TarRegularFile, TarSymlink},
     futures_core::stream::{Stream, TryStream},
     pin_project_lite::pin_project,
+    smol_tar::{TarDevice, TarDirectory, TarEntry, TarFifo, TarLink, TarRegularFile, TarSymlink},
     std::{
         collections::{hash_map::Entry, HashMap},
         io,
@@ -31,7 +31,7 @@ pin_project! {
     /// Stream of tar entries from a stream of [`FsEntry`] values.
     ///
     /// Use [`FsStreamExt::into_tar`] to make it. Send the entries to a
-    /// [`TarWriter`](crate::TarWriter). Each full entry has the archive path,
+    /// [`TarWriter`](smol_tar::TarWriter). Each full entry has the archive path,
     /// the mode, the owner, the modification time and the extended attributes
     /// of the node. The body of a regular file is an [`FsFile`].
     ///
@@ -39,7 +39,7 @@ pin_project! {
     ///
     /// The stream finds the paths of each node that is not a directory and
     /// that has more than one link. The first of these paths gives the full
-    /// entry. Each later path gives a [`TarLink`](crate::TarLink) to the
+    /// entry. Each later path gives a [`TarLink`](smol_tar::TarLink) to the
     /// first path. A `TarLink` has no metadata and no extended attributes.
     ///
     /// Filter the entries before `into_tar`. A filter after `into_tar` can
@@ -184,7 +184,7 @@ fn whole_seconds(time: SystemTime) -> SystemTime {
 mod tests {
     use {
         super::*,
-        crate::fs::{rt::block_on, testutil::TempDir, FsSource},
+        crate::{rt::block_on, testutil::TempDir, FsSource},
         futures::StreamExt,
         static_assertions::assert_impl_all,
     };

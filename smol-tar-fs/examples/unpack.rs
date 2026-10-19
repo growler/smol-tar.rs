@@ -1,10 +1,11 @@
 //! Unpack a tar archive into a directory with smol.
 //!
-//! Run: cargo run --example unpack --features fs -- IN.tar DIR
+//! Run: cargo run --example unpack -- IN.tar DIR
 
 use futures::StreamExt;
 use smol::{fs::File, io::BufReader};
-use smol_tar::{fs::FsSink, TarReader};
+use smol_tar::TarReader;
+use smol_tar_fs::FsSink;
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

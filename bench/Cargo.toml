@@ -16,7 +16,7 @@ tokio = [
 ]
 
 [dependencies]
-smol-tar = { path = "..", default-features = false }
+smol-tar = { path = "../smol-tar", default-features = false }
 futures = "0.3"
 tar = { version = "0.4.46", default-features = false }
 smol = { version = "2", optional = true }

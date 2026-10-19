@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "fs"))]
+#![cfg(unix)]
 
 mod fs_common;
 
@@ -6,10 +6,10 @@ use {
     fs_common::{block_on, TempDir},
     futures::{future, StreamExt, TryStreamExt},
     smol_tar::{
-        fs::{FsSink, MissingLinkTarget},
         TarDirectory, TarEntry, TarLink, TarReader, TarRegularFile, TarRegularFileReader,
         TarSymlink, TarWriter,
     },
+    smol_tar_fs::{FsSink, MissingLinkTarget},
     std::{
         fs::{self, Permissions},
         io::{self, ErrorKind},
@@ -517,7 +517,7 @@ mod xattr {
     #[cfg(target_os = "linux")]
     #[test]
     fn xattr_policy_skip() {
-        use smol_tar::fs::UnsupportedXattr;
+        use smol_tar_fs::UnsupportedXattr;
 
         let tmp = TempDir::new();
         if !user_xattrs_supported(tmp.path()) {

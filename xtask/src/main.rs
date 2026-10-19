@@ -53,7 +53,7 @@ fn print_usage() {
 }
 
 fn gen_fuzz_seeds() -> io::Result<()> {
-    let out_dir = repo_root().join("tests/data");
+    let out_dir = repo_root().join("smol-tar/tests/data");
     fs::create_dir_all(&out_dir)?;
 
     write_seed(

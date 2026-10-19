@@ -1,27 +1,27 @@
-# smol-tar-bin
+# picotar
 
-`smol-tar-bin` is a small tar-like example CLI built on top of `smol-tar`.
+`picotar` is a small tar-like example CLI built on top of `smol-tar`.
 
 ## Runtime selection
 
 The example defaults to the `smol` runtime:
 
 ```sh
-cargo run --manifest-path examples/smol-tar-bin/Cargo.toml -- --help
+cargo run -p picotar -- --help
 ```
 
 Run the same example with Tokio:
 
 ```sh
-cargo run --manifest-path examples/smol-tar-bin/Cargo.toml --no-default-features --features tokio -- --help
+cargo run -p picotar --no-default-features --features tokio -- --help
 ```
 
 ## Usage
 
 ```text
-smol-tar-bin -c -f ARCHIVE [-C DIR] PATH
-smol-tar-bin -x -f ARCHIVE [-C DIR] [PATH]
-smol-tar-bin -t -f ARCHIVE
+picotar -c -f ARCHIVE [-C DIR] PATH
+picotar -x -f ARCHIVE [-C DIR] [PATH]
+picotar -t -f ARCHIVE
 ```
 
 - `-c` creates an archive from exactly one input path.
@@ -37,32 +37,32 @@ smol-tar-bin -t -f ARCHIVE
 List the contents of an archive:
 
 ```sh
-cargo run --manifest-path examples/smol-tar-bin/Cargo.toml -- -tf archive.tar
+cargo run -p picotar -- -tf archive.tar
 ```
 
 Create an archive from `tree` beneath `src`:
 
 ```sh
-cargo run --manifest-path examples/smol-tar-bin/Cargo.toml -- -cf archive.tar -C src tree
+cargo run -p picotar -- -cf archive.tar -C src tree
 ```
 
 Extract an archive into `out`:
 
 ```sh
-cargo run --manifest-path examples/smol-tar-bin/Cargo.toml -- -xf archive.tar -C out
+cargo run -p picotar -- -xf archive.tar -C out
 ```
 
 Extract a single subtree:
 
 ```sh
-cargo run --manifest-path examples/smol-tar-bin/Cargo.toml -- -xf archive.tar -C out tree/nested
+cargo run -p picotar -- -xf archive.tar -C out tree/nested
 ```
 
 Stream via stdout/stdin:
 
 ```sh
-cargo run --manifest-path examples/smol-tar-bin/Cargo.toml -- -cf - -C src tree > archive.tar
-cargo run --manifest-path examples/smol-tar-bin/Cargo.toml -- -xf - -C out < archive.tar
+cargo run -p picotar -- -cf - -C src tree > archive.tar
+cargo run -p picotar -- -xf - -C out < archive.tar
 ```
 
 ## Notes
