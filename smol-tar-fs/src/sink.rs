@@ -2,7 +2,8 @@
 
 use {
     super::{
-        resolve, rt, sys, with_path, Existing, FsKind, MissingLinkTarget, SetMeta, UnsupportedXattr,
+        resolve, rt, sys, with_path, DeviceNodes, Existing, FsKind, MissingLinkTarget, SetMeta,
+        UnsupportedXattr,
     },
     crate::{poll_read_compat, AsyncRead, AsyncWrite},
     futures_sink::Sink,
@@ -168,6 +169,7 @@ struct Inner {
     /// Metadata of the directory entries, for the finish.
     dirs: Vec<DirMeta>,
     missing_link: MissingLinkTarget,
+    device_nodes: DeviceNodes,
     owner: bool,
     special_bits: bool,
     xattrs: bool,
@@ -199,6 +201,7 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
             created: HashSet::new(),
             dirs: Vec::new(),
             missing_link: MissingLinkTarget::default(),
+            device_nodes: DeviceNodes::default(),
             owner: false,
             special_bits: false,
             xattrs: false,
@@ -219,6 +222,17 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
     pub fn with_missing_link_target(mut self, policy: MissingLinkTarget) -> Self {
         if let SinkState::Idle(inner) = &mut self.state {
             inner.missing_link = policy;
+        }
+        self
+    }
+
+    /// Set the action for a character or block device entry. The default is
+    /// [`DeviceNodes::Skip`].
+    ///
+    /// Call the options before the first entry.
+    pub fn with_device_nodes(mut self, policy: DeviceNodes) -> Self {
+        if let SinkState::Idle(inner) = &mut self.state {
+            inner.device_nodes = policy;
         }
         self
     }
@@ -529,6 +543,19 @@ async fn process<R: AsyncRead + Unpin + Send>(
             .await
         }
         TarEntry::Device(mut dev) => {
+            match inner.device_nodes {
+                DeviceNodes::Create => {}
+                DeviceNodes::Skip => {
+                    inner.created.remove(&key);
+                    return Ok(inner);
+                }
+                DeviceNodes::Error => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("{key}: device entries are not allowed"),
+                    ));
+                }
+            }
             let meta = inner.set_meta(
                 dev.mode(),
                 dev.uid(),

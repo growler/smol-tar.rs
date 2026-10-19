@@ -6,10 +6,10 @@ use {
     fs_common::{block_on, TempDir},
     futures::{future, StreamExt, TryStreamExt},
     smol_tar::{
-        TarDirectory, TarEntry, TarLink, TarReader, TarRegularFile, TarRegularFileReader,
-        TarSymlink, TarWriter,
+        TarDevice, TarDirectory, TarEntry, TarLink, TarReader, TarRegularFile,
+        TarRegularFileReader, TarSymlink, TarWriter,
     },
-    smol_tar_fs::{FsSink, MissingLinkTarget},
+    smol_tar_fs::{DeviceNodes, FsSink, MissingLinkTarget},
     std::{
         fs::{self, Permissions},
         io::{self, ErrorKind},
@@ -630,18 +630,120 @@ fn fifo_created() {
 }
 
 #[test]
-fn device_needs_privilege() {
-    use smol_tar::TarDevice;
+fn device_skipped_by_default() {
+    let data = archive(vec![
+        TarDevice::new_char("dev/null", 1, 3).into(),
+        TarDevice::new_block("sda", 8, 0).into(),
+        file("f", b"f"),
+    ]);
+    for policy in [None, Some(DeviceNodes::Skip)] {
+        let tmp = TempDir::new();
+        let mut sink = FsSink::new(tmp.path());
+        if let Some(policy) = policy {
+            sink = sink.with_device_nodes(policy);
+        }
+        extract_into(&data, sink).unwrap();
+        assert!(!tmp.path().join("dev").exists());
+        assert!(!tmp.path().join("sda").exists());
+        assert_eq!(fs::read(tmp.path().join("f")).unwrap(), b"f");
+        assert_eq!(count(tmp.path()), 1, "{policy:?}");
+    }
+}
+
+#[test]
+fn device_policy_error() {
+    let tmp = TempDir::new();
+    let data = archive(vec![
+        file("a", b"a"),
+        TarDevice::new_char("./d//null", 1, 3).into(),
+        file("b", b"b"),
+    ]);
+    let sink = FsSink::new(tmp.path()).with_device_nodes(DeviceNodes::Error);
+    let err = extract_into(&data, sink).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert!(err.to_string().starts_with("d/null: "), "{err}");
+    assert!(!tmp.path().join("d").exists());
+    assert!(!tmp.path().join("b").exists());
+    assert_eq!(fs::read(tmp.path().join("a")).unwrap(), b"a");
+}
+
+#[test]
+fn device_policy_create() {
+    use {
+        rustix::fs::{major, minor},
+        std::os::unix::fs::FileTypeExt,
+    };
 
     let tmp = TempDir::new();
-    if owner_in(tmp.path()).0 == 0 {
-        eprintln!("skip: the process runs as root");
+    let entry = TarDevice::new_char("null", 1, 3)
+        .with_mode(0o640)
+        .with_mtime(mtime());
+    let data = archive(vec![entry.into()]);
+    let sink = FsSink::new(tmp.path()).with_device_nodes(DeviceNodes::Create);
+    let result = extract_into(&data, sink);
+    if owner_in(tmp.path()).0 != 0 {
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().starts_with("null: "), "{err}");
+        assert!(!err.to_string().contains("not allowed"), "{err}");
         return;
     }
-    let entry = TarDevice::new_char("null", 1, 3);
-    let err = extract(&archive(vec![entry.into()]), tmp.path()).unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
-    assert!(err.to_string().starts_with("null: "), "{err}");
+    if let Err(err) = &result {
+        if err.kind() == ErrorKind::PermissionDenied && !err.to_string().contains("not allowed") {
+            eprintln!("skip: no CAP_MKNOD");
+            return;
+        }
+    }
+    result.unwrap();
+    let meta = fs::symlink_metadata(tmp.path().join("null")).unwrap();
+    assert!(meta.file_type().is_char_device());
+    assert_eq!((major(meta.rdev() as _), minor(meta.rdev() as _)), (1, 3));
+    assert_eq!(meta.mode() & 0o7777, 0o640);
+    assert_eq!(meta.mtime(), MTIME as i64);
+}
+
+#[test]
+fn device_path_checked_before_policy() {
+    let data = archive(vec![TarDevice::new_char("../x", 1, 3).into()]);
+    for policy in [DeviceNodes::Create, DeviceNodes::Skip, DeviceNodes::Error] {
+        let tmp = TempDir::new();
+        let dest = subdir(&tmp, "dest");
+        let sink = FsSink::new(&dest).with_device_nodes(policy);
+        let err = extract_into(&data, sink).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "{policy:?}: {err}");
+        assert!(err.to_string().starts_with("../x: "), "{err}");
+        assert!(!tmp.path().join("x").exists());
+        assert_eq!(count(&dest), 0);
+    }
+}
+
+#[test]
+fn link_to_skipped_device() {
+    let data = archive(vec![
+        TarDevice::new_char("null", 1, 3).into(),
+        link("l", "null"),
+    ]);
+    let tmp = TempDir::new();
+    let err = extract(&data, tmp.path()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    let tmp = TempDir::new();
+    let sink = FsSink::new(tmp.path()).with_missing_link_target(MissingLinkTarget::Skip);
+    extract_into(&data, sink).unwrap();
+    assert_eq!(count(tmp.path()), 0);
+}
+
+#[test]
+fn skipped_device_is_not_link_target() {
+    let tmp = TempDir::new();
+    let data = archive(vec![
+        file("x", b"x"),
+        TarDevice::new_char("x", 1, 3).into(),
+        link("y", "x"),
+    ]);
+    let err = extract(&data, tmp.path()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    assert_eq!(fs::read(tmp.path().join("x")).unwrap(), b"x");
+    assert!(!tmp.path().join("y").exists());
 }
 
 #[test]

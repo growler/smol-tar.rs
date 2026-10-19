@@ -135,6 +135,23 @@ pub enum MissingLinkTarget {
     Skip,
 }
 
+/// Action of the sink for a character or block device entry.
+///
+/// A device node gives access to the device through the extracted tree.
+/// The policy does not apply to FIFO entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DeviceNodes {
+    /// Create the device node. Without privileges, the entry gives a
+    /// [`PermissionDenied`](std::io::ErrorKind::PermissionDenied) error.
+    Create,
+    /// Do not create the node, and continue.
+    #[default]
+    Skip,
+    /// Stop with a [`PermissionDenied`](std::io::ErrorKind::PermissionDenied)
+    /// error. The error message starts with the entry path.
+    Error,
+}
+
 /// Action of the sink when it cannot write an extended attribute.
 ///
 /// The sink cannot write an attribute in these conditions:
