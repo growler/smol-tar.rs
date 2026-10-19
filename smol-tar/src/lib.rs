@@ -2733,6 +2733,17 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                         }
                         Kind::Symlink => {
                             let info = take_pax_info(this.exts, this.globs)?;
+                            // POSIX requires size 0 for a symlink. Other
+                            // parsers read data after such a header, so
+                            // reject it before the position moves past the
+                            // header and a caller that keeps polling cannot
+                            // reach that data.
+                            if effective_size(this.header, info.size)? != 0 {
+                                return Poll::Ready(Some(Err(Error::new(
+                                    ErrorKind::InvalidData,
+                                    "symlink entry has a non-zero size",
+                                ))));
+                            }
                             let uid = effective_uid(this.header, info.uid)?;
                             let gid = effective_gid(this.header, info.gid)?;
                             let times = effective_times(this.header, &info)?;
@@ -3150,6 +3161,9 @@ fn ustar_name_fits(name: &str) -> bool {
 fn parse_octal(field: &'_ [u8]) -> std::result::Result<u64, &'_ [u8]> {
     let mut n = 0u64;
     let mut rest = field;
+    while let [b' ', r @ ..] = rest {
+        rest = r;
+    }
     while let [d, r @ ..] = rest {
         if d == &0 || d == &b' ' {
             break;
@@ -3895,6 +3909,17 @@ mod tests {
             parse_numeric(&[0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
             Ok(u64::MAX)
         );
+    }
+
+    #[test]
+    fn parse_numeric_skips_leading_spaces() {
+        assert_eq!(parse_numeric(b"    0002000\0"), Ok(0o2000));
+        assert_eq!(parse_numeric(b"  644 \0"), Ok(0o644));
+        assert_eq!(parse_numeric(b"  64 4\0"), Ok(0o64));
+        assert_eq!(parse_numeric(b"        "), Ok(0));
+        assert_eq!(parse_numeric(b"   \0\0\0\0"), Ok(0));
+        assert_eq!(parse_numeric(b"\0\0\0\0"), Ok(0));
+        assert_eq!(parse_numeric(b"  8\0"), Err(&b"  8\0"[..]));
     }
 
     #[test]

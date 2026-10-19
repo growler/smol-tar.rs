@@ -303,6 +303,23 @@ fn link_with_data() {
 }
 
 #[test]
+fn symlink_with_data() {
+    let tmp = TempDir::new();
+    let mut hidden = Vec::new();
+    push_raw(&mut hidden, "smuggled.txt", b'0', "", b"pwned\n");
+    let mut data = Vec::new();
+    push_raw(&mut data, "visible0.txt", b'0', "", b"first\n");
+    push_raw(&mut data, "sl", b'2', "visible0.txt", &hidden);
+    push_raw(&mut data, "visible1.txt", b'0', "", b"second\n");
+    data.extend_from_slice(&[0; 1024]);
+    let err = extract(&data, tmp.path()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    let msg = err.to_string();
+    assert!(msg.contains("symlink entry has a non-zero size"), "{msg}");
+    assert!(!tmp.path().join("smuggled.txt").exists());
+}
+
+#[test]
 fn file_mode_and_mtime() {
     let tmp = TempDir::new();
     let entry = TarRegularFile::new("f", 1, &b"f"[..])

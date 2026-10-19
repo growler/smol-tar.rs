@@ -520,7 +520,9 @@ fn smuggled_entry() -> Vec<u8> {
     entry
 }
 
-fn hardlink_data_archive(
+fn link_archive(
+    name: &str,
+    typeflag: u8,
     flavor: HeaderFlavor,
     header_size: u64,
     pax_size: Option<u64>,
@@ -536,7 +538,7 @@ fn hardlink_data_archive(
         let pax = pax_record_bytes("size", size.to_string().as_bytes());
         append_pax_entry(&mut archive, b'x', &pax);
     }
-    let mut header = build_header(b"hl", b'1', header_size, flavor);
+    let mut header = build_header(name.as_bytes(), typeflag, header_size, flavor);
     set_bytes(&mut header, LINKNAME_START, 100, b"visible0.txt");
     finalize_checksum(&mut header);
     append_entry(&mut archive, header, data);
@@ -549,7 +551,7 @@ fn hardlink_data_archive(
     archive
 }
 
-fn hardlink_data_entries() -> Vec<ObservedEntry> {
+fn link_entries(kind: &'static str, name: &str) -> Vec<ObservedEntry> {
     vec![
         ObservedEntry {
             kind: "file",
@@ -559,8 +561,8 @@ fn hardlink_data_entries() -> Vec<ObservedEntry> {
             attrs: Vec::new(),
         },
         ObservedEntry {
-            kind: "hardlink",
-            path: "hl".to_string(),
+            kind,
+            path: name.to_string(),
             link: Some("visible0.txt".to_string()),
             data: Vec::new(),
             attrs: Vec::new(),
@@ -2482,14 +2484,14 @@ fn dropping_pax_sized_file_skips_over_embedded_tar_headers() -> Result<()> {
 #[test]
 fn reader_skips_hardlink_data() -> Result<()> {
     let hidden = smuggled_entry();
-    let archive = hardlink_data_archive(HeaderFlavor::Ustar, 1024, None, &hidden);
+    let archive = link_archive("hl", b'1', HeaderFlavor::Ustar, 1024, None, &hidden);
     assert_eq!(
         collect_entries(Cursor::new(archive.clone()))?,
-        hardlink_data_entries()
+        link_entries("hardlink", "hl")
     );
     assert_eq!(
         collect_entries(ChunkedReader::new(Cursor::new(archive), 17))?,
-        hardlink_data_entries()
+        link_entries("hardlink", "hl")
     );
     Ok(())
 }
@@ -2498,10 +2500,17 @@ fn reader_skips_hardlink_data() -> Result<()> {
 fn reader_skips_hardlink_data_with_pax_size() -> Result<()> {
     let hidden = smuggled_entry();
     for header_size in [0, 2048] {
-        let archive = hardlink_data_archive(HeaderFlavor::Ustar, header_size, Some(1024), &hidden);
+        let archive = link_archive(
+            "hl",
+            b'1',
+            HeaderFlavor::Ustar,
+            header_size,
+            Some(1024),
+            &hidden,
+        );
         assert_eq!(
             collect_entries(Cursor::new(archive))?,
-            hardlink_data_entries()
+            link_entries("hardlink", "hl")
         );
     }
     Ok(())
@@ -2511,10 +2520,10 @@ fn reader_skips_hardlink_data_with_pax_size() -> Result<()> {
 fn reader_skips_hardlink_data_in_gnu_and_old_headers() -> Result<()> {
     let hidden = smuggled_entry();
     for flavor in [HeaderFlavor::Gnu, HeaderFlavor::Old] {
-        let archive = hardlink_data_archive(flavor, 1024, None, &hidden);
+        let archive = link_archive("hl", b'1', flavor, 1024, None, &hidden);
         assert_eq!(
             collect_entries(Cursor::new(archive))?,
-            hardlink_data_entries()
+            link_entries("hardlink", "hl")
         );
     }
     Ok(())
@@ -2523,10 +2532,148 @@ fn reader_skips_hardlink_data_in_gnu_and_old_headers() -> Result<()> {
 #[test]
 fn reader_skips_unaligned_hardlink_data_and_padding() -> Result<()> {
     let hidden = smuggled_entry();
-    let archive = hardlink_data_archive(HeaderFlavor::Ustar, 513, None, &hidden[..513]);
+    let archive = link_archive("hl", b'1', HeaderFlavor::Ustar, 513, None, &hidden[..513]);
     assert_eq!(
         collect_entries(Cursor::new(archive))?,
-        hardlink_data_entries()
+        link_entries("hardlink", "hl")
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_symlink_with_size() {
+    let hidden = smuggled_entry();
+    for flavor in [HeaderFlavor::Ustar, HeaderFlavor::Gnu, HeaderFlavor::Old] {
+        let archive = link_archive("sl", b'2', flavor, 1024, None, &hidden);
+        assert_archive_error(
+            Cursor::new(archive.as_slice()),
+            ErrorKind::InvalidData,
+            "symlink entry has a non-zero size",
+        );
+        assert_archive_error(
+            ChunkedReader::new(Cursor::new(archive), 17),
+            ErrorKind::InvalidData,
+            "symlink entry has a non-zero size",
+        );
+    }
+}
+
+#[test]
+fn reader_rejects_symlink_with_pax_size() {
+    let hidden = smuggled_entry();
+    let archive = link_archive("sl", b'2', HeaderFlavor::Ustar, 0, Some(1024), &hidden);
+    assert_archive_error(
+        Cursor::new(archive),
+        ErrorKind::InvalidData,
+        "symlink entry has a non-zero size",
+    );
+}
+
+#[test]
+fn reader_reads_symlink_with_zero_size() -> Result<()> {
+    for pax_size in [None, Some(0)] {
+        let archive = link_archive("sl", b'2', HeaderFlavor::Ustar, 0, pax_size, &[]);
+        assert_eq!(
+            collect_entries(Cursor::new(archive))?,
+            link_entries("symlink", "sl")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn reader_prefers_pax_size_for_symlink() -> Result<()> {
+    let archive = link_archive("sl", b'2', HeaderFlavor::Ustar, 1024, Some(0), &[]);
+    assert_eq!(
+        &archive[4 * BLOCK_SIZE + SIZE_START..][..12],
+        b"00000002000\0"
+    );
+    assert_eq!(
+        collect_entries(Cursor::new(archive))?,
+        link_entries("symlink", "sl")
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_symlink_with_space_padded_size() {
+    let hidden = smuggled_entry();
+    let mut archive = link_archive("sl", b'2', HeaderFlavor::Ustar, 1024, None, &hidden);
+    let header: &mut [u8; BLOCK_SIZE] = (&mut archive[2 * BLOCK_SIZE..3 * BLOCK_SIZE])
+        .try_into()
+        .unwrap();
+    assert_eq!(&header[SIZE_START..][..12], b"00000002000\0");
+    set_bytes(header, SIZE_START, 12, b"    0002000\0");
+    finalize_checksum(header);
+    assert_archive_error(
+        Cursor::new(archive.as_slice()),
+        ErrorKind::InvalidData,
+        "symlink entry has a non-zero size",
+    );
+}
+
+#[test]
+fn reader_returns_no_entry_after_symlink_size_error() {
+    let hidden = smuggled_entry();
+    let archive = link_archive("sl", b'2', HeaderFlavor::Ustar, 1024, None, &hidden);
+    block_on_test(async {
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive.as_slice())));
+        match stream.next().await {
+            Some(Ok(entry)) => assert_eq!(entry.path(), "visible0.txt"),
+            other => panic!("expected visible0.txt, got {:?}", other),
+        }
+        let err = match stream.next().await {
+            Some(Err(err)) => err,
+            other => panic!("expected symlink error, got {:?}", other),
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("symlink entry has a non-zero size"),
+            "{err}"
+        );
+        for _ in 0..5 {
+            match stream.next().await {
+                None => break,
+                Some(Ok(entry)) => panic!("unexpected entry {} after error", entry.path()),
+                Some(Err(_)) => {}
+            }
+        }
+    });
+}
+
+#[test]
+fn reader_reads_file_with_space_padded_size() -> Result<()> {
+    let hidden = smuggled_entry();
+    let mut archive = Vec::new();
+    let mut header = build_header(b"data.bin", b'0', 0, HeaderFlavor::Ustar);
+    set_bytes(&mut header, SIZE_START, 12, b"    0002000\0");
+    finalize_checksum(&mut header);
+    append_entry(&mut archive, header, &hidden);
+    append_entry(
+        &mut archive,
+        build_header(b"visible1.txt", b'0', 7, HeaderFlavor::Ustar),
+        b"second\n",
+    );
+    append_eof(&mut archive);
+    assert_eq!(
+        collect_entries(Cursor::new(archive.as_slice()))?,
+        vec![
+            ObservedEntry {
+                kind: "file",
+                path: "data.bin".to_string(),
+                link: None,
+                data: hidden,
+                attrs: Vec::new(),
+            },
+            ObservedEntry {
+                kind: "file",
+                path: "visible1.txt".to_string(),
+                link: None,
+                data: b"second\n".to_vec(),
+                attrs: Vec::new(),
+            },
+        ]
     );
     Ok(())
 }
@@ -2970,7 +3117,7 @@ fn reader_rejects_pax_size_causing_position_overflow() {
 
 #[test]
 fn reader_rejects_pax_hardlink_size_causing_position_overflow() {
-    let archive = hardlink_data_archive(HeaderFlavor::Ustar, 0, Some(u64::MAX), &[]);
+    let archive = link_archive("hl", b'1', HeaderFlavor::Ustar, 0, Some(u64::MAX), &[]);
     assert_archive_error(
         Cursor::new(archive),
         ErrorKind::InvalidData,
@@ -3029,6 +3176,13 @@ fn reader_rejects_invalid_header_numeric_fields() {
             SIZE_START,
             12,
             b'1',
+            HeaderFlavor::Ustar,
+            "invalid numeric field",
+        ),
+        (
+            SIZE_START,
+            12,
+            b'2',
             HeaderFlavor::Ustar,
             "invalid numeric field",
         ),

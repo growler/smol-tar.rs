@@ -112,6 +112,11 @@ fn gen_fuzz_seeds() -> io::Result<()> {
         "seed_invalid_header_uname_utf8.tar",
         seed_invalid_header_uname_utf8(),
     )?;
+    write_seed(
+        &out_dir,
+        "seed_invalid_symlink_size.tar",
+        seed_invalid_symlink_size(),
+    )?;
 
     Ok(())
 }
@@ -281,13 +286,18 @@ fn seed_hardlink_ignores_pax_metadata() -> Vec<u8> {
     archive
 }
 
-fn seed_hardlink_data() -> Vec<u8> {
-    let mut hidden = Vec::new();
+fn smuggled_entry() -> Vec<u8> {
+    let mut entry = Vec::new();
     append_entry(
-        &mut hidden,
+        &mut entry,
         build_header(b"smuggled.txt", b'0', 6, HeaderFlavor::Ustar),
         b"pwned\n",
     );
+    entry
+}
+
+fn seed_hardlink_data() -> Vec<u8> {
+    let hidden = smuggled_entry();
 
     let mut archive = Vec::new();
     let local = pax_record_bytes("mtime", b"1");
@@ -350,6 +360,28 @@ fn seed_invalid_header_uname_utf8() -> Vec<u8> {
     set_bytes(&mut header, UNAME_START, 32, &[0xff]);
     finalize_checksum(&mut header);
     append_entry(&mut archive, header, b"");
+    append_eof(&mut archive);
+    archive
+}
+
+fn seed_invalid_symlink_size() -> Vec<u8> {
+    let hidden = smuggled_entry();
+
+    let mut archive = Vec::new();
+    append_entry(
+        &mut archive,
+        build_header(b"visible0.txt", b'0', 6, HeaderFlavor::Ustar),
+        b"first\n",
+    );
+    let mut header = build_header(b"sl", b'2', hidden.len() as u64, HeaderFlavor::Ustar);
+    set_bytes(&mut header, LINKNAME_START, 100, b"visible0.txt");
+    finalize_checksum(&mut header);
+    append_entry(&mut archive, header, &hidden);
+    append_entry(
+        &mut archive,
+        build_header(b"visible1.txt", b'0', 7, HeaderFlavor::Ustar),
+        b"second\n",
+    );
     append_eof(&mut archive);
     archive
 }
