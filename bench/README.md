@@ -128,20 +128,22 @@ Time:
 - With the large corpus (4 files of 64 MiB), all libraries have the same
   time within 5%. The memory copy sets the time.
 - In `read_all` and `read_skip`, smol-tar has the lowest time for the pax,
-  gnu-long, and mixed corpora in both builds. For pax, smol-tar reads the
-  archive in 9.9 ms and `tar` reads it in 21.0 ms.
-- In `read_all` with the small corpus, `tar` has the lowest time: 3.9 ms.
-  smol-tar takes 4.5 ms.
-- In `write` with the small corpus, smol-tar takes 1.9 ms, `tar` takes
-  3.2 ms, and async-tar takes 4.2 ms.
+  gnu-long, and mixed corpora in both builds. There is one exception: in
+  the tokio build, `tar` has the lowest time in `read_all` with the
+  gnu-long corpus. For pax, smol-tar reads the archive in 9.2 ms and `tar`
+  reads it in 19.8 ms.
+- In `read_all` with the small corpus, `tar` has the lowest time: 4.0 ms.
+  smol-tar takes 4.6 ms.
+- In `write` with the small corpus, smol-tar takes 2.1 ms, `tar` takes
+  3.3 ms, and async-tar takes 4.3 ms.
 - In `filter` with the small corpus, `tar` has the lowest time: 4.6 ms.
-  smol-tar takes 5.1 ms. With the mixed corpus, smol-tar and `tar` both take
-  10.9 ms.
+  smol-tar takes 5.3 ms. With the mixed corpus, `tar` takes 10.9 ms and
+  smol-tar takes 11.1 ms.
 
 Allocations:
 
 - `read_all`: smol-tar makes 1 allocation for each ustar entry, 2 for each
-  GNU long-name entry, and 8 for each PAX entry. The other libraries make 2
+  GNU long-name entry, and 4 for each PAX entry. The other libraries make 2
   for each ustar entry, 5 for each GNU long-name entry, and 5 or 6 for each
   PAX entry.
 - `write` with the small corpus: smol-tar makes 1 allocation for each entry,
@@ -159,38 +161,38 @@ smol build (`--features smol`):
 
 | Benchmark | Corpus   | smol-tar | async-tar | tar   |
 | --------- | -------- | -------: | --------: | ----: |
-| read_all  | small    |     4.46 |      4.89 |  3.91 |
-| read_all  | large    |    13.82 |     13.78 | 13.80 |
-| read_all  | pax      |     9.90 |     14.74 | 20.99 |
-| read_all  | gnu-long |     7.44 |     10.84 |  7.81 |
-| read_all  | mixed    |     7.52 |     10.55 |  9.36 |
-| read_skip | small    |     3.61 |      4.56 |  3.73 |
-| read_skip | large    |    13.73 |     13.77 | 13.77 |
-| read_skip | pax      |     9.03 |     14.11 | 20.86 |
-| read_skip | gnu-long |     6.64 |     10.15 |  7.67 |
-| read_skip | mixed    |     6.79 |      8.21 |  7.41 |
-| write     | small    |     1.85 |      4.22 |  3.19 |
-| write     | large    |    25.78 |     25.17 | 25.47 |
-| write     | mixed    |     6.55 |      9.17 |  8.01 |
-| filter    | small    |     5.13 |      6.95 |  4.60 |
-| filter    | mixed    |    10.86 |     12.65 | 10.93 |
+| read_all  | small    |     4.57 |      4.85 |  4.00 |
+| read_all  | large    |    13.61 |     13.49 | 13.46 |
+| read_all  | pax      |     9.25 |     14.76 | 19.79 |
+| read_all  | gnu-long |     7.68 |     10.74 |  7.91 |
+| read_all  | mixed    |     7.67 |     10.63 |  9.40 |
+| read_skip | small    |     3.83 |      4.72 |  3.87 |
+| read_skip | large    |    13.43 |     13.46 | 13.38 |
+| read_skip | pax      |     8.55 |     14.33 | 19.39 |
+| read_skip | gnu-long |     6.91 |     10.27 |  7.54 |
+| read_skip | mixed    |     7.06 |      8.35 |  7.34 |
+| write     | small    |     2.06 |      4.34 |  3.26 |
+| write     | large    |    25.93 |     26.34 | 25.88 |
+| write     | mixed    |     6.77 |      9.22 |  7.95 |
+| filter    | small    |     5.30 |      7.12 |  4.63 |
+| filter    | mixed    |    11.07 |     13.03 | 10.89 |
 
 tokio build (`--no-default-features --features tokio`):
 
 | Benchmark | Corpus   | smol-tar | async-tar | astral-tokio-tar | tar   |
 | --------- | -------- | -------: | --------: | ---------------: | ----: |
-| read_all  | small    |     4.91 |      4.72 |             5.75 |  4.15 |
-| read_all  | large    |    14.09 |     13.89 |            13.94 | 13.88 |
-| read_all  | pax      |    10.17 |     15.12 |            14.65 | 19.64 |
-| read_all  | gnu-long |     7.76 |     10.42 |            12.52 |  8.09 |
-| read_all  | mixed    |     8.14 |     10.65 |            11.57 |  9.54 |
-| read_skip | small    |     3.73 |      4.69 |             5.27 |  3.80 |
-| read_skip | large    |    13.87 |     13.93 |            13.95 | 13.97 |
-| read_skip | pax      |     9.04 |     14.62 |            14.33 | 19.22 |
-| read_skip | gnu-long |     6.55 |     10.08 |            12.05 |  7.69 |
-| read_skip | mixed    |     6.86 |      8.58 |             9.04 |  7.49 |
-| write     | small    |     1.91 |      4.21 |             4.18 |  3.37 |
-| write     | large    |    25.32 |     26.31 |            25.44 | 25.12 |
-| write     | mixed    |     6.59 |      9.25 |             9.47 |  8.12 |
-| filter    | small    |     5.99 |      6.91 |             8.06 |  4.62 |
-| filter    | mixed    |    11.73 |     12.76 |            13.76 | 10.92 |
+| read_all  | small    |     4.96 |      5.22 |             5.58 |  4.06 |
+| read_all  | large    |    13.80 |     13.58 |            13.63 | 13.55 |
+| read_all  | pax      |     9.43 |     14.92 |            13.72 | 19.43 |
+| read_all  | gnu-long |     8.17 |     10.78 |            11.93 |  7.88 |
+| read_all  | mixed    |     8.26 |     10.67 |            11.64 |  9.43 |
+| read_skip | small    |     4.00 |      4.75 |             5.30 |  3.87 |
+| read_skip | large    |    13.80 |     13.57 |            13.61 | 13.98 |
+| read_skip | pax      |     8.49 |     13.98 |            13.25 | 19.42 |
+| read_skip | gnu-long |     7.18 |     10.05 |            11.34 |  8.44 |
+| read_skip | mixed    |     7.27 |      8.36 |             9.07 |  7.68 |
+| write     | small    |     2.04 |      4.30 |             4.13 |  3.21 |
+| write     | large    |    25.93 |     26.29 |            25.51 | 25.39 |
+| write     | mixed    |     6.72 |      9.12 |             9.07 |  8.00 |
+| filter    | small    |     5.67 |      7.00 |             8.12 |  4.64 |
+| filter    | mixed    |    11.49 |     12.95 |            13.95 | 10.84 |
