@@ -3,7 +3,7 @@
 use {
     super::{
         resolve, rt, sys, with_path, DeviceNodes, Existing, FsKind, MissingLinkTarget, SetMeta,
-        UnsupportedXattr,
+        UnsupportedXattr, XattrFilter,
     },
     crate::{poll_read_compat, AsyncRead, AsyncWrite},
     futures_sink::Sink,
@@ -17,6 +17,7 @@ use {
         mem,
         path::{Path, PathBuf},
         pin::Pin,
+        sync::Arc,
         task::{ready, Context, Poll},
         time::SystemTime,
     },
@@ -206,7 +207,7 @@ struct Inner {
     xattrs: bool,
     xattr_policy: UnsupportedXattr,
     /// Gives `true` for an attribute name that the sink writes.
-    xattr_filter: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    xattr_filter: XattrFilter,
     finished: bool,
     /// Buffer for file bodies. It is empty until the first file body that
     /// is not empty.
@@ -239,7 +240,7 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
             special_bits: false,
             xattrs: false,
             xattr_policy: UnsupportedXattr::default(),
-            xattr_filter: Box::new(default_xattr_filter),
+            xattr_filter: Arc::new(default_xattr_filter),
             finished: false,
             buf: Box::default(),
         };
@@ -320,7 +321,9 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
     /// Set the filter for the extended attribute names. With
     /// [`with_xattrs(true)`](Self::with_xattrs), the sink calls `filter` for
     /// each attribute name of an entry that it writes. It writes only the
-    /// attributes for which `filter` gives `true`. The policy of
+    /// attributes for which `filter` gives `true`. The sink can call `filter`
+    /// more than one time for a name, so `filter` must give the same result
+    /// each time. The policy of
     /// [`with_unsupported_xattr`](Self::with_unsupported_xattr) does not apply
     /// to an attribute that the filter removes.
     ///
@@ -342,7 +345,7 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
         F: Fn(&str) -> bool + Send + Sync + 'static,
     {
         if let SinkState::Idle(inner) = &mut self.state {
-            inner.xattr_filter = Box::new(filter);
+            inner.xattr_filter = Arc::new(filter);
         }
         self
     }
@@ -468,17 +471,15 @@ impl Inner {
             mode: Some(mode & mask),
             owner: self.owner.then_some((uid, gid)),
             mtime,
-            xattrs: if self.xattrs {
-                let mut attrs = mem::take(attrs);
-                attrs.retain(|name, _| (self.xattr_filter)(name));
-                if attrs.is_empty() {
-                    AttrList::new()
-                } else {
-                    attrs
-                }
+            // The list keeps the names that the filter removes. A list from
+            // `TarReader` shares the global PAX records, and a copy would
+            // not. The writes apply the filter.
+            xattrs: if self.xattrs && attrs.iter().any(|(name, _)| (self.xattr_filter)(name)) {
+                mem::take(attrs)
             } else {
                 AttrList::new()
             },
+            xattr_filter: Arc::clone(&self.xattr_filter),
             xattr_policy: self.xattr_policy,
         }
     }

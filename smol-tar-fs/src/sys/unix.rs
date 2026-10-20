@@ -695,7 +695,7 @@ fn set_meta_fd(fd: BorrowedFd<'_>, meta: &SetMeta) -> io::Result<()> {
         let (uid, gid) = owner_ids(owner);
         fchown(fd, uid, gid)?;
     }
-    set_fd_xattrs(fd, &meta.xattrs, meta.xattr_policy)?;
+    set_fd_xattrs(fd, meta.filtered_xattrs(), meta.xattr_policy)?;
     if let Some(mode) = meta.mode {
         fchmod(fd, Mode::from_raw_mode(mode as _))?;
     }
@@ -788,25 +788,29 @@ fn set_xattrs_at(parent: &Dir, name: &str, kind: FsKind, meta: &SetMeta) -> io::
         return Ok(());
     }
     let Some(fd) = open_for_xattrs(parent, name, kind)? else {
-        return no_xattrs(&meta.xattrs, meta.xattr_policy);
+        return no_xattrs(meta.filtered_xattrs(), meta.xattr_policy);
     };
     if kind_of(&fstat(&fd)?) != Some(kind) {
         return Err(file_changed());
     }
-    set_fd_xattrs(fd.as_fd(), &meta.xattrs, meta.xattr_policy)
+    set_fd_xattrs(fd.as_fd(), meta.filtered_xattrs(), meta.xattr_policy)
 }
 
 /// Write the xattrs of `meta` on a node. This target has no xattrs.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn set_xattrs_at(_parent: &Dir, _name: &str, _kind: FsKind, meta: &SetMeta) -> io::Result<()> {
-    no_xattrs(&meta.xattrs, meta.xattr_policy)
+    no_xattrs(meta.filtered_xattrs(), meta.xattr_policy)
 }
 
 /// Write `attrs` on `fd`. `EPERM` and `ENOTSUP` apply `policy`. With
 /// `UnsupportedXattr::Error`, `ENOTSUP` gives `Unsupported`.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn set_fd_xattrs(fd: BorrowedFd<'_>, attrs: &AttrList, policy: UnsupportedXattr) -> io::Result<()> {
-    for (name, value) in attrs.iter() {
+fn set_fd_xattrs<'a>(
+    fd: BorrowedFd<'_>,
+    attrs: impl Iterator<Item = (&'a str, &'a [u8])>,
+    policy: UnsupportedXattr,
+) -> io::Result<()> {
+    for (name, value) in attrs {
         match fsetxattr(fd, name, value, XattrFlags::empty()) {
             Ok(()) => {}
             Err(Errno::PERM | Errno::NOTSUP) if policy == UnsupportedXattr::Skip => {}
@@ -826,9 +830,9 @@ fn set_fd_xattrs(fd: BorrowedFd<'_>, attrs: &AttrList, policy: UnsupportedXattr)
 
 /// Write `attrs` on `fd`. This target has no xattrs.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn set_fd_xattrs(
+fn set_fd_xattrs<'a>(
     _fd: BorrowedFd<'_>,
-    attrs: &AttrList,
+    attrs: impl Iterator<Item = (&'a str, &'a [u8])>,
     policy: UnsupportedXattr,
 ) -> io::Result<()> {
     no_xattrs(attrs, policy)
@@ -836,8 +840,11 @@ fn set_fd_xattrs(
 
 /// Apply `policy` to `attrs` for a node that cannot have xattrs. A list that
 /// is not empty gives `Unsupported` with `UnsupportedXattr::Error`.
-fn no_xattrs(attrs: &AttrList, policy: UnsupportedXattr) -> io::Result<()> {
-    match attrs.iter().next() {
+fn no_xattrs<'a>(
+    mut attrs: impl Iterator<Item = (&'a str, &'a [u8])>,
+    policy: UnsupportedXattr,
+) -> io::Result<()> {
+    match attrs.next() {
         Some((name, _)) if policy == UnsupportedXattr::Error => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("xattr {name}: extended attributes are not supported on this file type"),
@@ -856,6 +863,7 @@ mod tests {
         std::{
             io::{ErrorKind, Read, Write},
             os::unix::fs::MetadataExt,
+            sync::Arc,
         },
     };
 
@@ -1166,6 +1174,7 @@ mod tests {
             owner: None,
             mtime,
             xattrs: AttrList::new(),
+            xattr_filter: Arc::new(|_| true),
             xattr_policy: UnsupportedXattr::Error,
         }
     }

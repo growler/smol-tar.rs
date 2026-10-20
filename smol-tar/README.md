@@ -408,8 +408,7 @@ Not supported:
 
 The reader uses the size of an entry to find the next header. The size is
 the PAX `size` record of the entry. If the entry has no `size` record, the
-size is the `size` record of the last global PAX header that has one. If
-neither record exists, the size is the size field of the header.
+size is the size field of the header.
 
 - Regular file: the size is the length of the file body after the header.
   `TarRegularFile` gives the body.
@@ -424,9 +423,24 @@ neither record exists, the size is the size field of the header.
   is a directory entry.
 
 Other tar parsers can read data after a directory, device or FIFO header.
-They can also ignore a global `size` record. Thus they can find different
-entries in the same archive. Use the same parser to validate and to extract
-an archive.
+Thus they can find different entries in the same archive. Use the same
+parser to validate and to extract an archive.
+
+## Global PAX headers
+
+The records of a global PAX header apply to all the entries after it. A PAX
+record of the entry takes precedence over a global record with the same
+key. A later global record replaces an earlier one.
+
+- The reader ignores the `path`, `linkpath` and `size` records of a global
+  header.
+- A global record with an empty value deletes the global record of its key.
+  For a `SCHILY.xattr.*` record, an empty value is the value of the
+  attribute.
+- The reader parses each global header one time. All entries share the
+  global records.
+- An entry from the reader gives its extended attributes sorted by name,
+  with one attribute for each name.
 
 ## Limits
 
@@ -436,6 +450,7 @@ contents:
 - a GNU long name or long link that is larger than 4096 bytes
 - a PAX extension that is larger than 1 MiB
 - more than 256 global PAX extensions
+- global PAX records that are larger than 1 MiB together
 
 ## Example CLI
 

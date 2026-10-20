@@ -256,6 +256,7 @@
 //! - a GNU long name or long link that is larger than 4096 bytes
 //! - a PAX extension that is larger than 1 MiB
 //! - more than 256 global PAX extensions
+//! - global PAX records that are larger than 1 MiB together
 //!
 //! [`InvalidData`]: std::io::ErrorKind::InvalidData
 //!
@@ -940,28 +941,116 @@ enum State {
 }
 use State::*;
 
-struct PosixExtension {
-    inner: Box<[u8]>,
-}
-impl PosixExtension {
-    fn validate(ext: &[u8]) -> Result<()> {
-        parse_pax_records(ext, |_, _| Ok(()))
-    }
-    fn for_each_record(&self, cb: impl FnMut(&str, &[u8]) -> Result<()>) -> Result<()> {
-        parse_pax_records(&self.inner, cb)
-    }
+/// Key prefix of the PAX records that hold extended attributes.
+const XATTR_PREFIX: &str = "SCHILY.xattr.";
+
+/// Position of one PAX record in the buffer of a [`PaxSet`].
+#[derive(Clone, Copy)]
+struct PaxRange {
+    /// Start of the key.
+    key: u32,
+    /// Position of the `=` after the key.
+    eq: u32,
+    /// End of the value.
+    end: u32,
 }
 
-impl From<Box<[u8]>> for PosixExtension {
-    fn from(s: Box<[u8]>) -> Self {
-        Self { inner: s }
+/// PAX records sorted by key, with one record for each key.
+#[derive(Clone, Default)]
+struct PaxSet {
+    buf: Box<[u8]>,
+    index: Vec<PaxRange>,
+}
+
+impl PaxSet {
+    /// Parse the records of one extended header. The last record of a key
+    /// wins.
+    fn parse(buf: Box<[u8]>) -> Result<Self> {
+        let mut index = parse_pax_records(&buf)?;
+        let key = |r: &PaxRange| &buf[r.key as usize..r.eq as usize];
+        // The last record of a key comes first in its run.
+        index.sort_unstable_by(|a, b| key(a).cmp(key(b)).then(b.key.cmp(&a.key)));
+        index.dedup_by(|a, b| key(a) == key(b));
+        Ok(Self { buf, index })
+    }
+    fn key(&self, r: &PaxRange) -> &str {
+        // SAFETY: `parse_pax_records` checks that each key is UTF-8, and
+        // `merge` copies only such keys.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[r.key as usize..r.eq as usize]) }
+    }
+    fn value(&self, r: &PaxRange) -> &[u8] {
+        &self.buf[r.eq as usize + 1..r.end as usize]
+    }
+    /// Give the records with keys that start with [`XATTR_PREFIX`].
+    fn xattrs(&self) -> &[PaxRange] {
+        let start = self.index.partition_point(|r| self.key(r) < XATTR_PREFIX);
+        let len = self.index[start..].partition_point(|r| self.key(r).starts_with(XATTR_PREFIX));
+        &self.index[start..start + len]
+    }
+    /// Merge the newer set `new` into a copy of `self`. A record of `new`
+    /// replaces the record of `self` with the same key. If `keep` gives
+    /// `false` for a record of `new`, the result has no record for its key.
+    fn merge(&self, new: &PaxSet, mut keep: impl FnMut(&str, &[u8]) -> bool) -> Result<PaxSet> {
+        let mut buf = Vec::with_capacity(self.buf.len() + new.buf.len());
+        let mut index = Vec::with_capacity(self.index.len() + new.index.len());
+        let (mut old_recs, mut new_recs) = (&self.index[..], &new.index[..]);
+        loop {
+            let (set, r) = match (old_recs.split_first(), new_recs.split_first()) {
+                (None, None) => break,
+                (Some((r, rest)), None) => {
+                    old_recs = rest;
+                    (self, r)
+                }
+                (None, Some((r, rest))) => {
+                    new_recs = rest;
+                    (new, r)
+                }
+                (Some((a, old_rest)), Some((b, new_rest))) => match self.key(a).cmp(new.key(b)) {
+                    std::cmp::Ordering::Less => {
+                        old_recs = old_rest;
+                        (self, a)
+                    }
+                    std::cmp::Ordering::Greater => {
+                        new_recs = new_rest;
+                        (new, b)
+                    }
+                    std::cmp::Ordering::Equal => {
+                        old_recs = old_rest;
+                        new_recs = new_rest;
+                        (new, b)
+                    }
+                },
+            };
+            let (key, value) = (set.key(r), set.value(r));
+            if std::ptr::eq(set, new) && !keep(key, value) {
+                continue;
+            }
+            let start = buf.len();
+            buf.extend_from_slice(key.as_bytes());
+            let eq = buf.len();
+            buf.push(b'=');
+            buf.extend_from_slice(value);
+            let pos = |n: usize| {
+                u32::try_from(n)
+                    .map_err(|_| Error::new(ErrorKind::InvalidData, "PAX records exceed 4 GiB"))
+            };
+            index.push(PaxRange {
+                key: pos(start)?,
+                eq: pos(eq)?,
+                end: pos(buf.len())?,
+            });
+        }
+        Ok(PaxSet {
+            buf: buf.into_boxed_slice(),
+            index,
+        })
     }
 }
 
 enum ExtensionHeader {
     LongName(Box<str>),
     LongLink(Box<str>),
-    PosixExtension(PosixExtension),
+    PosixExtension(PaxSet),
 }
 
 struct ExtensionBuffer {
@@ -1017,8 +1106,10 @@ pin_project! {
         skip: Option<Box<[u8; SKIP_BUFFER_SIZE]>>,
         // list of the current extended headers
         exts: Vec<ExtensionHeader>,
-        // list of the global extended headers
-        globs: Vec<PosixExtension>,
+        // records of the global extended headers
+        globs: Arc<PaxSet>,
+        // number of the global extended headers
+        glob_count: usize,
         // the current record buffer
         header: Header,
         #[pin]
@@ -1091,9 +1182,7 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 ///
 /// The reader uses the size of an entry to find the next header. The size
 /// is the PAX `size` record of the entry. If the entry has no `size`
-/// record, the size is the `size` record of the last global PAX header that
-/// has one. If neither record exists, the size is the size field of the
-/// header.
+/// record, the size is the size field of the header.
 ///
 /// - Regular file: the size is the length of the file body after the
 ///   header. [`TarRegularFile`] gives the body.
@@ -1108,9 +1197,22 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 ///   `/` is a directory entry.
 ///
 /// Other tar parsers can read data after a directory, device or FIFO
-/// header. They can also ignore a global `size` record. Thus they can find
-/// different entries in the same archive. Use the same parser to validate
-/// and to extract an archive.
+/// header. Thus they can find different entries in the same archive. Use
+/// the same parser to validate and to extract an archive.
+///
+/// # Global PAX headers
+///
+/// The records of a global PAX header apply to all the entries after it. A
+/// PAX record of the entry takes precedence over a global record with the
+/// same key. A later global record replaces an earlier one.
+///
+/// - The reader ignores the `path`, `linkpath` and `size` records of a
+///   global header.
+/// - A global record with an empty value deletes the global record of its
+///   key. For a `SCHILY.xattr.*` record, an empty value is the value of the
+///   attribute.
+/// - The reader parses each global header one time. All entries share the
+///   global records. See [`AttrList`].
 ///
 /// # Errors
 ///
@@ -1813,10 +1915,9 @@ impl TarDirectory {
     /// Return the size stored for this directory entry.
     ///
     /// For an entry from [`TarReader`], the size is the PAX `size` record of
-    /// the entry. If the entry has no `size` record, the size is the `size`
-    /// record of the last global PAX header that has one. If neither record
-    /// exists, the size is the size field of the header. [`new`](Self::new)
-    /// sets the size to 0. No data follows a directory header.
+    /// the entry. If the entry has no `size` record, the size is the size
+    /// field of the header. [`new`](Self::new) sets the size to 0. No data
+    /// follows a directory header.
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -1931,35 +2032,76 @@ impl TarDirectory {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
 /// List of extended attributes stored in PAX records.
 ///
 /// Names map to raw byte values. When serialized, attributes are emitted as
 /// `SCHILY.xattr.*` PAX records. Replacing attributes with
 /// [`TarRegularFile::with_attrs`] or similar helpers overwrites the whole list.
+///
+/// A list that you make keeps the order of [`push`](Self::push). A list from
+/// [`TarReader`] has one attribute for each name, sorted by name. It refers
+/// to the PAX records of the entry and to the global PAX records, which all
+/// entries share. [`push`](Self::push) and [`retain`](Self::retain) copy the
+/// attributes of such a list.
+#[derive(Clone)]
 pub struct AttrList {
-    inner: Vec<(Box<str>, Box<[u8]>)>,
+    inner: Attrs,
+}
+
+#[derive(Clone)]
+enum Attrs {
+    /// Attributes in the order of `push`.
+    Owned(Vec<(Box<str>, Box<[u8]>)>),
+    /// Attributes from the PAX records of an entry. A local record takes
+    /// precedence over a global record with the same key.
+    Pax { local: PaxSet, global: Arc<PaxSet> },
 }
 
 impl AttrList {
     /// Create an empty attribute list.
     pub fn new() -> Self {
-        Self { inner: Vec::new() }
+        Self {
+            inner: Attrs::Owned(Vec::new()),
+        }
+    }
+
+    /// Give the attributes of the PAX records `local` and `global`.
+    fn from_pax(local: PaxSet, global: &Arc<PaxSet>) -> Self {
+        let local = if local.index.is_empty() || local.xattrs().is_empty() {
+            PaxSet::default()
+        } else {
+            local
+        };
+        if local.index.is_empty() && global.xattrs().is_empty() {
+            return Self::new();
+        }
+        Self {
+            inner: Attrs::Pax {
+                local,
+                global: Arc::clone(global),
+            },
+        }
     }
 
     /// Returns the number of attributes stored.
     pub fn len(&self) -> usize {
-        self.inner.len()
+        match &self.inner {
+            Attrs::Owned(attrs) => attrs.len(),
+            Attrs::Pax { .. } => self.iter().count(),
+        }
     }
 
     /// Returns true if the list is empty.
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        match &self.inner {
+            Attrs::Owned(attrs) => attrs.is_empty(),
+            Attrs::Pax { local, global } => local.xattrs().is_empty() && global.xattrs().is_empty(),
+        }
     }
 
     /// Append an attribute name/value pair.
     pub fn push<N: Into<Box<str>>, V: Into<Box<[u8]>>>(&mut self, name: N, value: V) {
-        self.inner.push((name.into(), value.into()));
+        self.owned_mut().push((name.into(), value.into()));
     }
 
     /// Append an attribute pair and return the list.
@@ -1970,21 +2112,125 @@ impl AttrList {
 
     /// Iterate over stored attributes.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.inner
-            .iter()
-            .map(|(name, value)| (name.as_ref(), value.as_ref()))
+        match &self.inner {
+            Attrs::Owned(attrs) => AttrIter::Owned(attrs.iter()),
+            Attrs::Pax { local, global } => AttrIter::Pax {
+                local,
+                local_recs: local.xattrs(),
+                global,
+                global_recs: global.xattrs(),
+            },
+        }
     }
 
     /// Keep only the attributes for which `f` gives `true`. The order of the
     /// kept attributes does not change.
     pub fn retain<F: FnMut(&str, &[u8]) -> bool>(&mut self, mut f: F) {
-        self.inner.retain(|(name, value)| f(name, value));
+        self.owned_mut().retain(|(name, value)| f(name, value));
+    }
+
+    /// Give the owned attributes. Copy the attributes of PAX records first.
+    fn owned_mut(&mut self) -> &mut Vec<(Box<str>, Box<[u8]>)> {
+        if let Attrs::Pax { .. } = self.inner {
+            let attrs = self
+                .iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect();
+            self.inner = Attrs::Owned(attrs);
+        }
+        match &mut self.inner {
+            Attrs::Owned(attrs) => attrs,
+            Attrs::Pax { .. } => unreachable!(),
+        }
+    }
+}
+
+impl Default for AttrList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for AttrList {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for AttrList {}
+
+impl std::fmt::Debug for AttrList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 
 impl From<Vec<(Box<str>, Box<[u8]>)>> for AttrList {
     fn from(inner: Vec<(Box<str>, Box<[u8]>)>) -> Self {
-        Self { inner }
+        Self {
+            inner: Attrs::Owned(inner),
+        }
+    }
+}
+
+/// Iterator over the attributes of an [`AttrList`].
+enum AttrIter<'a> {
+    Owned(std::slice::Iter<'a, (Box<str>, Box<[u8]>)>),
+    /// Merge of two sorted record lists. A local record hides the global
+    /// record with the same key.
+    Pax {
+        local: &'a PaxSet,
+        local_recs: &'a [PaxRange],
+        global: &'a PaxSet,
+        global_recs: &'a [PaxRange],
+    },
+}
+
+impl<'a> Iterator for AttrIter<'a> {
+    type Item = (&'a str, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(iter) => iter
+                .next()
+                .map(|(name, value)| (name.as_ref(), value.as_ref())),
+            Self::Pax {
+                local,
+                local_recs,
+                global,
+                global_recs,
+            } => {
+                let (set, r) = match (local_recs.split_first(), global_recs.split_first()) {
+                    (None, None) => return None,
+                    (Some((r, rest)), None) => {
+                        *local_recs = rest;
+                        (*local, r)
+                    }
+                    (None, Some((r, rest))) => {
+                        *global_recs = rest;
+                        (*global, r)
+                    }
+                    (Some((a, local_rest)), Some((b, global_rest))) => {
+                        match local.key(a).cmp(global.key(b)) {
+                            std::cmp::Ordering::Less => {
+                                *local_recs = local_rest;
+                                (*local, a)
+                            }
+                            std::cmp::Ordering::Greater => {
+                                *global_recs = global_rest;
+                                (*global, b)
+                            }
+                            std::cmp::Ordering::Equal => {
+                                *local_recs = local_rest;
+                                *global_recs = global_rest;
+                                (*local, a)
+                            }
+                        }
+                    }
+                };
+                Some((&set.key(r)[XATTR_PREFIX.len()..], set.value(r)))
+            }
+        }
     }
 }
 
@@ -2319,13 +2565,6 @@ fn ext_as_path(hdr: &Header, size: usize, ext: &Option<ExtensionBuffer>) -> Resu
         ext.as_ref().unwrap().as_null_terminated_str(..size)
     }
 }
-fn ext_bytes<'a>(hdr: &'a Header, size: usize, ext: &'a Option<ExtensionBuffer>) -> &'a [u8] {
-    if size <= BLOCK_SIZE {
-        hdr.buf(..size)
-    } else {
-        &ext.as_ref().unwrap().buf[..size]
-    }
-}
 fn ext_as_bytes(hdr: &Header, size: usize, ext: &mut Option<ExtensionBuffer>) -> Box<[u8]> {
     if size <= BLOCK_SIZE {
         hdr.buf(..size).into()
@@ -2334,7 +2573,7 @@ fn ext_as_bytes(hdr: &Header, size: usize, ext: &mut Option<ExtensionBuffer>) ->
     }
 }
 
-fn take_pax_info(exts: &mut Vec<ExtensionHeader>, globs: &[PosixExtension]) -> Result<PaxInfo> {
+fn take_pax_info(exts: &mut Vec<ExtensionHeader>, globs: &Arc<PaxSet>) -> Result<PaxInfo> {
     let mut info = PaxInfo {
         path: None,
         linkpath: None,
@@ -2348,46 +2587,47 @@ fn take_pax_info(exts: &mut Vec<ExtensionHeader>, globs: &[PosixExtension]) -> R
         gname: None,
         attrs: AttrList::default(),
     };
-    for glob in globs {
-        apply_pax_extension(glob, &mut info)?;
+    if exts.is_empty() && globs.index.is_empty() {
+        return Ok(info);
     }
+    apply_pax_set(globs, &mut info)?;
+    let mut local: Option<PaxSet> = None;
     for ext in exts.drain(..) {
         match ext {
             ExtensionHeader::LongName(name) => info.path = Some(name),
             ExtensionHeader::LongLink(name) => info.linkpath = Some(name),
-            ExtensionHeader::PosixExtension(ext) => apply_pax_extension(&ext, &mut info)?,
+            ExtensionHeader::PosixExtension(set) => {
+                apply_pax_set(&set, &mut info)?;
+                local = Some(match local {
+                    None => set,
+                    Some(prev) => prev.merge(&set, |_, _| true)?,
+                });
+            }
         }
     }
+    info.attrs = AttrList::from_pax(local.unwrap_or_default(), globs);
     Ok(info)
 }
 
-fn apply_pax_extension(ext: &PosixExtension, info: &mut PaxInfo) -> Result<()> {
-    ext.for_each_record(|key, val| {
-        if let Some(name) = key.strip_prefix("SCHILY.xattr.") {
-            attr_set(&mut info.attrs, name, val);
-        } else if key == "path" {
-            info.path = Some(pax_str(val)?.to_string().into_boxed_str());
-        } else if key == "linkpath" {
-            info.linkpath = Some(pax_str(val)?.to_string().into_boxed_str());
-        } else if key == "atime" {
-            info.atime = Some(parse_pax_time(pax_str(val)?)?);
-        } else if key == "ctime" {
-            info.ctime = Some(parse_pax_time(pax_str(val)?)?);
-        } else if key == "mtime" {
-            info.mtime = Some(parse_pax_time(pax_str(val)?)?);
-        } else if key == "size" {
-            info.size = Some(parse_pax_u64(pax_str(val)?, "size")?);
-        } else if key == "uid" {
-            info.uid = Some(parse_pax_u32(pax_str(val)?, "uid")?);
-        } else if key == "gid" {
-            info.gid = Some(parse_pax_u32(pax_str(val)?, "gid")?);
-        } else if key == "uname" {
-            info.uname = Some(pax_str(val)?.to_string().into_boxed_str());
-        } else if key == "gname" {
-            info.gname = Some(pax_str(val)?.to_string().into_boxed_str());
+/// Set the fields of `info` that the records of `set` give.
+fn apply_pax_set(set: &PaxSet, info: &mut PaxInfo) -> Result<()> {
+    for r in &set.index {
+        let val = set.value(r);
+        match set.key(r) {
+            "path" => info.path = Some(pax_str(val)?.into()),
+            "linkpath" => info.linkpath = Some(pax_str(val)?.into()),
+            "atime" => info.atime = Some(parse_pax_time(pax_str(val)?)?),
+            "ctime" => info.ctime = Some(parse_pax_time(pax_str(val)?)?),
+            "mtime" => info.mtime = Some(parse_pax_time(pax_str(val)?)?),
+            "size" => info.size = Some(parse_pax_u64(pax_str(val)?, "size")?),
+            "uid" => info.uid = Some(parse_pax_u32(pax_str(val)?, "uid")?),
+            "gid" => info.gid = Some(parse_pax_u32(pax_str(val)?, "gid")?),
+            "uname" => info.uname = Some(pax_str(val)?.into()),
+            "gname" => info.gname = Some(pax_str(val)?.into()),
+            _ => {}
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 fn pax_str(val: &[u8]) -> Result<&str> {
@@ -2494,11 +2734,13 @@ fn format_pax_time(time: SystemTime) -> String {
     }
 }
 
-fn parse_pax_records<'a>(
-    mut ext: &'a [u8],
-    mut cb: impl FnMut(&'a str, &'a [u8]) -> Result<()>,
-) -> Result<()> {
+/// Check the records of one extended header and give their positions. The
+/// header must not be larger than [`PAX_HEADER_MAX_SIZE`].
+fn parse_pax_records(buf: &[u8]) -> Result<Vec<PaxRange>> {
+    let mut ext = buf;
+    let mut index = Vec::new();
     while !ext.is_empty() {
+        let start = buf.len() - ext.len();
         let space_pos = ext.iter().position(|&b| b == b' ').ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidData,
@@ -2532,25 +2774,16 @@ fn parse_pax_records<'a>(
         let eq_pos = payload.iter().position(|&b| b == b'=').ok_or_else(|| {
             Error::new(ErrorKind::InvalidData, "malformed PAX record: missing '='")
         })?;
-        let key = from_utf8(&payload[..eq_pos])
+        from_utf8(&payload[..eq_pos])
             .map_err(|_| Error::new(ErrorKind::InvalidData, "malformed PAX record: invalid key"))?;
-        cb(key, &payload[eq_pos + 1..])?;
+        let key = start + space_pos + 1;
+        index.push(PaxRange {
+            key: key as u32,
+            eq: (key + eq_pos) as u32,
+            end: (start + len - 1) as u32,
+        });
     }
-    Ok(())
-}
-
-fn attr_set(attrs: &mut AttrList, name: &str, value: &[u8]) {
-    if let Some(pos) = attrs
-        .inner
-        .iter()
-        .position(|(existing, _)| existing.as_ref() == name)
-    {
-        attrs.inner.remove(pos);
-    }
-    attrs.inner.push((
-        name.to_string().into_boxed_str(),
-        value.to_vec().into_boxed_slice(),
-    ));
+    Ok(index)
 }
 
 impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
@@ -2562,7 +2795,8 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
             ext: None,
             skip: None,
             exts: Vec::new(),
-            globs: Vec::new(),
+            globs: Arc::default(),
+            glob_count: 0,
             header: Header::new(),
             reader: r,
             marker: std::marker::PhantomData,
@@ -2908,16 +3142,12 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                 ext_as_path(this.header, *size as usize, ext)?,
                             )),
                             Kind::PAXLocal => {
-                                PosixExtension::validate(ext_bytes(
-                                    this.header,
-                                    *size as usize,
-                                    ext,
-                                ))?;
                                 let ext = ext_as_bytes(this.header, *size as usize, ext);
-                                this.exts.push(ExtensionHeader::PosixExtension(ext.into()));
+                                this.exts
+                                    .push(ExtensionHeader::PosixExtension(PaxSet::parse(ext)?));
                             }
                             Kind::PAXGlobal => {
-                                if this.globs.len() >= PAX_GLOBAL_MAX_COUNT {
+                                if *this.glob_count >= PAX_GLOBAL_MAX_COUNT {
                                     return Poll::Ready(Some(Err(Error::new(
                                         ErrorKind::InvalidData,
                                         format!(
@@ -2925,13 +3155,25 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                         ),
                                     ))));
                                 }
-                                PosixExtension::validate(ext_bytes(
-                                    this.header,
-                                    *size as usize,
-                                    ext,
-                                ))?;
+                                *this.glob_count += 1;
                                 let ext = ext_as_bytes(this.header, *size as usize, ext);
-                                this.globs.push(ext.into());
+                                let new = PaxSet::parse(ext)?;
+                                // A global record with an empty value deletes
+                                // the key. An empty attribute value is a
+                                // value.
+                                let globs = this.globs.merge(&new, |key, value| {
+                                    !matches!(key, "path" | "linkpath" | "size")
+                                        && (!value.is_empty() || key.starts_with(XATTR_PREFIX))
+                                })?;
+                                if globs.buf.len() > PAX_HEADER_MAX_SIZE {
+                                    return Poll::Ready(Some(Err(Error::new(
+                                        ErrorKind::InvalidData,
+                                        format!(
+                                            "global PAX records exceed {PAX_HEADER_MAX_SIZE} bytes"
+                                        ),
+                                    ))));
+                                }
+                                *this.globs = Arc::new(globs);
                             }
                             _ => unreachable!(),
                         };
@@ -3791,9 +4033,9 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> Sink<TarEntry<'b, R>
         let header_len = item.write_header(this.buf)?;
         *this.len = header_len;
 
-        if let TarEntry::File(file) = item {
-            this.reader.replace(file.inner);
-            *this.eof = *this.total + (header_len as u64) + file.size;
+        if let TarEntry::File(TarRegularFile { inner, size, .. }) = item {
+            this.reader.replace(inner);
+            *this.eof = *this.total + (header_len as u64) + size;
         }
 
         Ok(())
@@ -3844,6 +4086,58 @@ mod tests {
     assert_eq_align!(Header, OldHeader);
     assert_eq_size!(Header, OldHeader);
 
+    fn pax_set(records: &[(&str, &[u8])]) -> PaxSet {
+        let mut buf = Vec::new();
+        for (key, value) in records {
+            let len = pax_record_len(key, value.len());
+            let start = buf.len();
+            buf.resize(start + len, 0);
+            write_pax_record(&mut buf[start..], key, value, len).unwrap();
+        }
+        PaxSet::parse(buf.into_boxed_slice()).unwrap()
+    }
+
+    fn pax_records(set: &PaxSet) -> Vec<(&str, &[u8])> {
+        set.index
+            .iter()
+            .map(|r| (set.key(r), set.value(r)))
+            .collect()
+    }
+
+    #[test]
+    fn pax_set_sorts_and_keeps_the_last_record() {
+        let set = pax_set(&[
+            ("path", b"one"),
+            ("SCHILY.xattr.user.b", b"1"),
+            ("path", b"two"),
+            ("SCHILY.xattr.user.a", b""),
+            ("SCHILY.xattr.user.b", b"2"),
+        ]);
+        assert_eq!(
+            pax_records(&set),
+            [
+                ("SCHILY.xattr.user.a", &b""[..]),
+                ("SCHILY.xattr.user.b", b"2"),
+                ("path", b"two"),
+            ]
+        );
+        assert_eq!(set.xattrs().len(), 2);
+        assert!(PaxSet::default().xattrs().is_empty());
+    }
+
+    #[test]
+    fn pax_set_merge_replaces_and_drops_records() {
+        let old = pax_set(&[("a", b"old"), ("b", b"old"), ("c", b"old")]);
+        let new = pax_set(&[("b", b""), ("c", b"new"), ("d", b"new")]);
+        let merged = old.merge(&new, |_, value| !value.is_empty()).unwrap();
+        assert_eq!(
+            pax_records(&merged),
+            [("a", &b"old"[..]), ("c", b"new"), ("d", b"new")]
+        );
+        let merged = PaxSet::default().merge(&new, |_, _| true).unwrap();
+        assert_eq!(pax_records(&merged), pax_records(&new));
+    }
+
     #[test]
     fn low_level_format_helpers_cover_edge_cases() {
         assert_eq!(padded_size(0), 0);
@@ -3863,21 +4157,7 @@ mod tests {
     }
 
     #[test]
-    fn posix_extension_and_kind_helpers_are_exercised() {
-        let ext = PosixExtension::from(b"13 path=file\n".to_vec().into_boxed_slice());
-        let mut records = Vec::new();
-        ext.for_each_record(|key, val| {
-            records.push((key.to_string(), val.to_vec()));
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(records, [("path".to_string(), b"file".to_vec())]);
-
-        let pax = ExtensionHeader::PosixExtension(ext);
-        assert!(
-            matches!(&pax, ExtensionHeader::PosixExtension(ext) if &*ext.inner == b"13 path=file\n")
-        );
-
+    fn kind_helpers_are_exercised() {
         for (kind, expected) in [
             (Kind::File, "regular file"),
             (Kind::Link, "link"),

@@ -677,7 +677,9 @@ mod xattr {
             .with_xattr_filter(filter.clone());
         extract_into(&data, sink).unwrap();
         assert!(user_attrs(&tmp.path().join("f")).is_empty());
-        let names: Vec<_> = attrs.iter().map(|(name, _)| name.to_string()).collect();
+        // The reader gives the attributes sorted by name.
+        let mut names: Vec<_> = attrs.iter().map(|(name, _)| name.to_string()).collect();
+        names.sort();
         assert_eq!(*seen.lock().unwrap(), names);
 
         let tmp = TempDir::new();

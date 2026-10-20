@@ -65,6 +65,7 @@ use {
     std::{
         io,
         pin::Pin,
+        sync::Arc,
         task::{Context, Poll},
         time::SystemTime,
     },
@@ -217,8 +218,22 @@ pub(crate) struct SetMeta {
     mtime: SystemTime,
     /// Empty: do not write xattrs.
     xattrs: AttrList,
+    /// Gives `true` for an attribute name that the sink writes.
+    xattr_filter: XattrFilter,
     xattr_policy: UnsupportedXattr,
 }
+
+impl SetMeta {
+    /// Give the xattrs that the filter accepts.
+    fn filtered_xattrs(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.xattrs
+            .iter()
+            .filter(|(name, _)| (self.xattr_filter)(name))
+    }
+}
+
+/// Filter of xattr names. It gives `true` for a name that the sink writes.
+pub(crate) type XattrFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Root of a source walk.
 #[derive(Debug)]

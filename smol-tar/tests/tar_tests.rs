@@ -2349,8 +2349,8 @@ fn reader_applies_global_and_local_pax_precedence() -> Result<()> {
     assert_eq!(
         entries[0].attrs,
         vec![
-            ("user.scope".to_string(), b"local".to_vec()),
             ("user.dupe".to_string(), b"second".to_vec()),
+            ("user.scope".to_string(), b"local".to_vec()),
         ]
     );
     assert_eq!(entries[1].path, "second.txt");
@@ -2359,6 +2359,213 @@ fn reader_applies_global_and_local_pax_precedence() -> Result<()> {
         vec![("user.scope".to_string(), b"global".to_vec())]
     );
     Ok(())
+}
+
+fn attr(name: &str, value: &[u8]) -> (String, Vec<u8>) {
+    (name.to_string(), value.to_vec())
+}
+
+#[test]
+fn reader_gives_attrs_sorted_by_name() -> Result<()> {
+    let mut archive = Vec::new();
+    append_pax_entry(
+        &mut archive,
+        b'g',
+        &pax_record_bytes("SCHILY.xattr.user.bb", b"g"),
+    );
+    let mut local = Vec::new();
+    for name in ["user.c", "user.a", "user.b"] {
+        local.extend_from_slice(&pax_record_bytes(&format!("SCHILY.xattr.{name}"), b"l"));
+    }
+    append_pax_entry(&mut archive, b'x', &local);
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+
+    let entries = collect_entries(Cursor::new(archive))?;
+    assert_eq!(
+        entries[0].attrs,
+        vec![
+            attr("user.a", b"l"),
+            attr("user.b", b"l"),
+            attr("user.bb", b"g"),
+            attr("user.c", b"l"),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_applies_later_global_pax_values() -> Result<()> {
+    let mut archive = Vec::new();
+    let mut first = Vec::new();
+    first.extend_from_slice(&pax_record_bytes("SCHILY.xattr.user.a", b"1"));
+    first.extend_from_slice(&pax_record_bytes("SCHILY.xattr.user.b", b"1"));
+    append_pax_entry(&mut archive, b'g', &first);
+    append_entry(
+        &mut archive,
+        build_header(b"first.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_pax_entry(
+        &mut archive,
+        b'g',
+        &pax_record_bytes("SCHILY.xattr.user.a", b"2"),
+    );
+    append_entry(
+        &mut archive,
+        build_header(b"second.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+
+    let entries = collect_entries(Cursor::new(archive))?;
+    assert_eq!(
+        entries[0].attrs,
+        vec![attr("user.a", b"1"), attr("user.b", b"1")]
+    );
+    assert_eq!(
+        entries[1].attrs,
+        vec![attr("user.a", b"2"), attr("user.b", b"1")]
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_deletes_global_pax_value_with_empty_value() -> Result<()> {
+    block_on_test(async {
+        let mut archive = Vec::new();
+        append_pax_entry(&mut archive, b'g', &pax_record_bytes("mtime", b"7"));
+        append_pax_entry(&mut archive, b'g', &pax_record_bytes("mtime", b""));
+        let mut header = build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar);
+        write_octal(3, &mut header[MTIME_START..MTIME_START + 12]);
+        finalize_checksum(&mut header);
+        append_entry(&mut archive, header, &[]);
+        append_eof(&mut archive);
+
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+        match stream.next().await.unwrap()? {
+            TarEntry::File(file) => assert_eq!(file.mtime(), ts(3, 0)),
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn reader_keeps_empty_xattr_values() -> Result<()> {
+    let mut archive = Vec::new();
+    let mut global = Vec::new();
+    global.extend_from_slice(&pax_record_bytes("SCHILY.xattr.user.g", b""));
+    global.extend_from_slice(&pax_record_bytes("SCHILY.xattr.user.over", b"global"));
+    append_pax_entry(&mut archive, b'g', &global);
+    let mut local = Vec::new();
+    local.extend_from_slice(&pax_record_bytes("SCHILY.xattr.user.l", b""));
+    local.extend_from_slice(&pax_record_bytes("SCHILY.xattr.user.over", b""));
+    append_pax_entry(&mut archive, b'x', &local);
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+
+    let entries = collect_entries(Cursor::new(archive))?;
+    assert_eq!(
+        entries[0].attrs,
+        vec![
+            attr("user.g", b""),
+            attr("user.l", b""),
+            attr("user.over", b""),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_ignores_global_pax_path_linkpath_and_size() -> Result<()> {
+    let mut archive = Vec::new();
+    let mut global = Vec::new();
+    global.extend_from_slice(&pax_record_bytes("path", b"global-name"));
+    global.extend_from_slice(&pax_record_bytes("linkpath", b"global-target"));
+    global.extend_from_slice(&pax_record_bytes("size", b"5"));
+    append_pax_entry(&mut archive, b'g', &global);
+    let mut link = build_header(b"link", b'2', 0, HeaderFlavor::Ustar);
+    set_bytes(&mut link, LINKNAME_START, 100, b"target");
+    finalize_checksum(&mut link);
+    append_entry(&mut archive, link, &[]);
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 2, HeaderFlavor::Ustar),
+        b"hi",
+    );
+    append_eof(&mut archive);
+
+    let entries = collect_entries(Cursor::new(archive))?;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].kind, "symlink");
+    assert_eq!(entries[0].path, "link");
+    assert_eq!(entries[0].link.as_deref(), Some("target"));
+    assert_eq!(entries[1].path, "file.txt");
+    assert_eq!(entries[1].data, b"hi");
+    Ok(())
+}
+
+#[test]
+fn reader_merges_local_pax_headers() -> Result<()> {
+    let mut archive = Vec::new();
+    let mut first = Vec::new();
+    first.extend_from_slice(&pax_record_bytes("path", b"first.txt"));
+    first.extend_from_slice(&pax_record_bytes("SCHILY.xattr.user.a", b"1"));
+    first.extend_from_slice(&pax_record_bytes("SCHILY.xattr.user.b", b"1"));
+    append_pax_entry(&mut archive, b'x', &first);
+    append_pax_entry(
+        &mut archive,
+        b'x',
+        &pax_record_bytes("SCHILY.xattr.user.a", b"2"),
+    );
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+
+    let entries = collect_entries(Cursor::new(archive))?;
+    assert_eq!(entries[0].path, "first.txt");
+    assert_eq!(
+        entries[0].attrs,
+        vec![attr("user.a", b"2"), attr("user.b", b"1")]
+    );
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_large_global_pax_records() {
+    let mut archive = Vec::new();
+    let value = vec![b'v'; PAX_HEADER_MAX_SIZE / 2];
+    for name in ["user.a", "user.b", "user.c"] {
+        append_pax_entry(
+            &mut archive,
+            b'g',
+            &pax_record_bytes(&format!("SCHILY.xattr.{name}"), &value),
+        );
+    }
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+
+    assert_archive_error(
+        Cursor::new(archive),
+        ErrorKind::InvalidData,
+        "global PAX records exceed",
+    );
 }
 
 #[test]
