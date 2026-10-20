@@ -8,3 +8,4 @@ version = "0.1.10"
 
 [workspace.dependencies]
 smol-tar = { version = "0.1.10", path = "smol-tar", default-features = false }
+smol-tar-fs = { version = "0.1.10", path = "smol-tar-fs", default-features = false }

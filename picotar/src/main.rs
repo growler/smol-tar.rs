@@ -4,43 +4,40 @@ compile_error!("features `smol` and `tokio` are mutually exclusive");
 compile_error!("either feature `smol` or `tokio` must be enabled");
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
-use ::smol::fs::{
-    self,
-    unix::{symlink, FileTypeExt, MetadataExt, PermissionsExt},
-    File,
-};
+use ::smol::fs::{self, File};
 use ::smol_tar::{
-    TarDirectory, TarEntry, TarLink, TarReader, TarRegularFile, TarSymlink, TarWriter,
+    TarDevice, TarDirectory, TarEntry, TarFifo, TarLink, TarReader, TarRegularFile, TarSymlink,
+    TarWriter,
+};
+use ::smol_tar_fs::{
+    DeviceNodes, FsEntry, FsKind, FsSink, FsSource, FsStreamExt, MissingLinkTarget,
 };
 #[cfg(feature = "tokio")]
 use ::tokio::{
     fs::{self, File},
-    io::{copy, AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, BufReader, BufWriter},
     runtime::Builder,
 };
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+use async_compression::futures::{bufread as decode, write as encode};
 #[cfg(feature = "tokio")]
-use futures::SinkExt;
+use async_compression::tokio::{bufread as decode, write as encode};
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 use futures::{
     executor::block_on,
-    io::{copy, AllowStdIo, AsyncRead, AsyncWrite, AsyncWriteExt},
-    SinkExt, StreamExt,
+    io::{AllowStdIo, AsyncRead, AsyncWrite, BufReader, BufWriter},
 };
+use futures::{future, stream, StreamExt, TryStreamExt};
 use std::{
-    collections::HashMap,
     ffi::OsString,
-    io,
+    io, mem,
+    os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     process::ExitCode,
-    time::{Duration, SystemTime},
 };
-#[cfg(feature = "tokio")]
-use std::{
-    fs::Metadata,
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
-};
-#[cfg(feature = "tokio")]
-use tokio_stream::StreamExt;
+
+/// Size of the buffer around the archive file or stream.
+const ARCHIVE_BUFFER_SIZE: usize = 256 * 1024;
 
 fn program_name() -> &'static str {
     env!("CARGO_PKG_NAME")
@@ -48,7 +45,25 @@ fn program_name() -> &'static str {
 
 fn usage(program_name: &str) -> String {
     format!(
-        "usage:\n  {program_name} -c -f ARCHIVE [-C DIR] PATH\n  {program_name} -x -f ARCHIVE [-C DIR] [PATH]\n  {program_name} -t -f ARCHIVE"
+        "usage:
+  {program_name} -c -f ARCHIVE [-C DIR] [OPTIONS] PATH...
+  {program_name} -x -f ARCHIVE [-C DIR] [OPTIONS] [PATH...]
+  {program_name} -t -f ARCHIVE [OPTIONS]
+
+options:
+  -f ARCHIVE                  archive file, or - for stdin or stdout
+  -C DIR                      source directory (-c) or destination (-x)
+  -z, --gzip                  use gzip compression
+  -J, --xz, --xzip            use xz compression
+      --zstd                  use zstd compression
+  -v, --verbose               write each entry path to stderr (-c, -x)
+      --exclude PATH          skip the entries at or below PATH (-c, -x)
+      --xattrs                read or write extended attributes (-c, -x)
+  -p, --preserve-permissions  keep the setuid, setgid and sticky bits (-x)
+      --same-owner            set the owner from the archive (-x)
+      --devices               create device nodes (-x)
+      --skip-missing-links    skip hard links without a target (-x)
+      --strip-components N    remove N leading path components (-x)"
     )
 }
 
@@ -90,53 +105,33 @@ pub enum Mode {
     List,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Compression {
+    Gzip,
+    Xz,
+    Zstd,
+}
+
 #[derive(Debug)]
 pub struct Cli {
     pub mode: Mode,
     pub archive: OsString,
     pub chdir: Option<PathBuf>,
-    pub path: Option<PathBuf>,
+    pub paths: Vec<PathBuf>,
+    pub options: Options,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct UnixMeta {
-    pub mode: u32,
-    pub mtime: u32,
-    pub uid: u32,
-    pub gid: u32,
-}
-
-pub(crate) enum CreateNode {
-    Directory {
-        archive_path: String,
-        meta: UnixMeta,
-    },
-    File {
-        archive_path: String,
-        fs_path: PathBuf,
-        meta: UnixMeta,
-        size: u64,
-    },
-    Symlink {
-        archive_path: String,
-        target: String,
-        meta: UnixMeta,
-    },
-    Hardlink {
-        archive_path: String,
-        target: String,
-    },
-}
-
-pub(crate) struct DeferredHardlink {
-    pub path: PathBuf,
-    pub target: String,
-}
-
-pub(crate) struct DeferredDirectory {
-    pub path: PathBuf,
-    pub mode: u32,
-    pub mtime: std::time::SystemTime,
+#[derive(Debug, Default)]
+pub struct Options {
+    pub compression: Option<Compression>,
+    pub verbose: bool,
+    pub excludes: Vec<PathBuf>,
+    pub xattrs: bool,
+    pub preserve_permissions: bool,
+    pub same_owner: bool,
+    pub devices: bool,
+    pub skip_missing_links: bool,
+    pub strip_components: usize,
 }
 
 pub fn parse_cli<I>(args: I) -> Result<Cli, String>
@@ -146,7 +141,8 @@ where
     let mut mode = None;
     let mut archive = None;
     let mut chdir = None;
-    let mut positional = Vec::new();
+    let mut options = Options::default();
+    let mut paths = Vec::new();
     let mut end_of_options = false;
     let mut iter = args.into_iter();
 
@@ -158,6 +154,11 @@ where
             }
 
             if let Some(text) = arg.to_str() {
+                if let Some(option) = text.strip_prefix("--") {
+                    parse_long_option(option, &mut iter, &mut options)?;
+                    continue;
+                }
+
                 if text.starts_with('-') && text.len() > 1 {
                     let mut chars = text[1..].char_indices().peekable();
                     while let Some((offset, flag)) = chars.next() {
@@ -165,6 +166,10 @@ where
                             'c' => set_mode(&mut mode, Mode::Create)?,
                             'x' => set_mode(&mut mode, Mode::Extract)?,
                             't' => set_mode(&mut mode, Mode::List)?,
+                            'z' => set_compression(&mut options.compression, Compression::Gzip)?,
+                            'J' => set_compression(&mut options.compression, Compression::Xz)?,
+                            'v' => options.verbose = true,
+                            'p' => options.preserve_permissions = true,
                             'f' | 'C' => {
                                 let value_start = 1 + offset + flag.len_utf8();
                                 let value = if value_start < text.len() {
@@ -196,43 +201,118 @@ where
             }
         }
 
-        positional.push(PathBuf::from(arg));
+        paths.push(PathBuf::from(arg));
     }
 
     let mode = mode.ok_or_else(|| String::from("one of -c, -x, or -t is required"))?;
     let archive = archive.ok_or_else(|| String::from("option -f is required"))?;
 
-    if chdir.is_some() && mode == Mode::List {
-        return Err(String::from("option -C is only valid with -c or -x"));
+    if mode == Mode::List {
+        for (used, option) in [
+            (chdir.is_some(), "-C"),
+            (options.verbose, "-v"),
+            (!options.excludes.is_empty(), "--exclude"),
+            (options.xattrs, "--xattrs"),
+        ] {
+            if used {
+                return Err(format!("option {option} is only valid with -c or -x"));
+            }
+        }
     }
 
-    let path = match mode {
-        Mode::Create => {
-            if positional.len() != 1 {
-                return Err(String::from("mode -c requires exactly one PATH argument"));
+    if mode != Mode::Extract {
+        for (used, option) in [
+            (options.preserve_permissions, "-p"),
+            (options.same_owner, "--same-owner"),
+            (options.devices, "--devices"),
+            (options.skip_missing_links, "--skip-missing-links"),
+            (options.strip_components > 0, "--strip-components"),
+        ] {
+            if used {
+                return Err(format!("option {option} is only valid with -x"));
             }
-            Some(positional.remove(0))
         }
-        Mode::Extract => {
-            if positional.len() > 1 {
-                return Err(String::from("mode -x accepts at most one PATH argument"));
-            }
-            positional.pop()
+    }
+
+    match mode {
+        Mode::Create if paths.is_empty() => {
+            return Err(String::from("mode -c requires at least one PATH argument"));
         }
-        Mode::List => {
-            if !positional.is_empty() {
-                return Err(String::from("mode -t does not accept PATH arguments"));
-            }
-            None
+        Mode::List if !paths.is_empty() => {
+            return Err(String::from("mode -t does not accept PATH arguments"));
         }
-    };
+        _ => {}
+    }
 
     Ok(Cli {
         mode,
         archive,
         chdir,
-        path,
+        paths,
+        options,
     })
+}
+
+/// Parse one long option. `option` is the argument without the leading `--`.
+fn parse_long_option(
+    option: &str,
+    args: &mut impl Iterator<Item = OsString>,
+    options: &mut Options,
+) -> Result<(), String> {
+    let (name, inline) = match option.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (option, None),
+    };
+
+    match name {
+        "gzip" => set_compression(&mut options.compression, Compression::Gzip)?,
+        "xz" | "xzip" => set_compression(&mut options.compression, Compression::Xz)?,
+        "zstd" => set_compression(&mut options.compression, Compression::Zstd)?,
+        "verbose" => options.verbose = true,
+        "xattrs" => options.xattrs = true,
+        "preserve-permissions" => options.preserve_permissions = true,
+        "same-owner" => options.same_owner = true,
+        "devices" => options.devices = true,
+        "skip-missing-links" => options.skip_missing_links = true,
+        "exclude" => {
+            let value = option_value(name, inline, args)?;
+            options.excludes.push(PathBuf::from(value));
+            return Ok(());
+        }
+        "strip-components" => {
+            let value = option_value(name, inline, args)?;
+            options.strip_components = value
+                .to_str()
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| {
+                    format!(
+                        "option --strip-components requires a number: {}",
+                        value.to_string_lossy()
+                    )
+                })?;
+            return Ok(());
+        }
+        _ => return Err(format!("unknown option --{name}")),
+    }
+
+    if inline.is_some() {
+        return Err(format!("option --{name} does not take an argument"));
+    }
+    Ok(())
+}
+
+/// Give the value of a long option: the text after `=`, or the next argument.
+fn option_value(
+    name: &str,
+    inline: Option<&str>,
+    args: &mut impl Iterator<Item = OsString>,
+) -> Result<OsString, String> {
+    match inline {
+        Some(value) => Ok(OsString::from(value)),
+        None => args
+            .next()
+            .ok_or_else(|| format!("option --{name} requires an argument")),
+    }
 }
 
 fn set_mode(mode: &mut Option<Mode>, next: Mode) -> Result<(), String> {
@@ -246,6 +326,18 @@ fn set_mode(mode: &mut Option<Mode>, next: Mode) -> Result<(), String> {
         *mode = Some(next);
     }
     Ok(())
+}
+
+fn set_compression(compression: &mut Option<Compression>, next: Compression) -> Result<(), String> {
+    match compression {
+        Some(current) if *current != next => Err(String::from(
+            "only one of -z, -J, or --zstd may be specified",
+        )),
+        _ => {
+            *compression = Some(next);
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn resolve_source_path(base_dir: &Path, input: &Path) -> io::Result<PathBuf> {
@@ -265,29 +357,11 @@ pub(crate) fn normalize_input_path(path: &Path) -> io::Result<String> {
     normalize_relative_path(path)
 }
 
-pub(crate) fn sanitize_archive_member(path: &str) -> io::Result<PathBuf> {
-    Ok(PathBuf::from(normalize_relative_path(Path::new(path))?))
-}
-
-pub(crate) fn sanitize_symlink_target(target: &str) -> io::Result<&str> {
-    for component in Path::new(target).components() {
-        match component {
-            Component::ParentDir => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("symlink target escapes destination: {target}"),
-                ));
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("absolute symlink target is not allowed: {target}"),
-                ));
-            }
-            _ => {}
-        }
-    }
-    Ok(target)
+fn normalize_input_paths(paths: &[PathBuf]) -> io::Result<Vec<String>> {
+    paths
+        .iter()
+        .map(|path| normalize_input_path(path))
+        .collect()
 }
 
 fn normalize_relative_path(path: &Path) -> io::Result<String> {
@@ -336,32 +410,107 @@ fn normalize_relative_path(path: &Path) -> io::Result<String> {
     Ok(parts.join("/"))
 }
 
-pub(crate) fn ensure_directory_path(path: &str) -> String {
+/// Give `true` if `path` is `prefix` or is below `prefix`. Empty and `.`
+/// components do not count. The prefix `.` matches all paths.
+pub(crate) fn is_under(path: &str, prefix: &str) -> bool {
+    let mut path = path_components(path);
+    path_components(prefix).all(|component| path.next() == Some(component))
+}
+
+/// Give the components of `path` without the empty and `.` components.
+fn path_components(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+}
+
+/// Give `true` if `path` is below one of `filters` and below none of
+/// `excludes`. An empty `filters` selects all paths.
+pub(crate) fn is_selected(path: &str, filters: &[String], excludes: &[String]) -> bool {
+    (filters.is_empty() || filters.iter().any(|filter| is_under(path, filter)))
+        && !excludes.iter().any(|exclude| is_under(path, exclude))
+}
+
+/// Remove the first `count` components of `path`. Empty components count
+/// as nothing. Give `None` if no component stays. A path that starts with
+/// `/` or has a `..` component does not change. Thus `FsSink` rejects it.
+pub(crate) fn strip_path(path: &str, count: usize) -> Option<String> {
+    if path.starts_with('/') || path.split('/').any(|component| component == "..") {
+        return Some(path.to_owned());
+    }
+    let rest = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .skip(count)
+        .collect::<Vec<_>>();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut stripped = rest.join("/");
     if path.ends_with('/') {
-        path.to_string()
-    } else {
-        format!("{path}/")
+        stripped.push('/');
     }
+    Some(stripped)
 }
 
-pub(crate) fn join_archive_path(parent: &str, child: &str) -> String {
-    if parent.is_empty() {
-        child.to_string()
-    } else {
-        format!("{parent}/{child}")
-    }
+/// Copy the metadata that `FsSink` uses from the entry `$old` to `$new`.
+/// The macro reads the metadata before `$new`, thus `$new` can move `$old`.
+macro_rules! with_metadata {
+    ($new:expr, $old:ident) => {{
+        let (mode, uid, gid, mtime) = ($old.mode(), $old.uid(), $old.gid(), $old.mtime());
+        let attrs = mem::take($old.attrs_mut());
+        $new.with_mode(mode)
+            .with_uid(uid)
+            .with_gid(gid)
+            .with_mtime(mtime)
+            .with_attrs(attrs)
+    }};
 }
 
-pub(crate) fn matches_filter(path: &str, filter: Option<&str>) -> bool {
-    let Some(filter) = filter else {
-        return true;
+/// Remove the first `count` components from the path of `entry`, and from
+/// the target of a hard link. Give `None` if no component stays. For a hard
+/// link whose target has no component that stays, give `None` if
+/// `skip_missing_links` is `true`, and an error if it is `false`.
+fn strip_entry<'a, R: AsyncRead + Unpin + 'a>(
+    entry: TarEntry<'a, R>,
+    count: usize,
+    skip_missing_links: bool,
+) -> io::Result<Option<TarEntry<'a, TarRegularFile<'a, R>>>> {
+    let Some(path) = strip_path(entry.path(), count) else {
+        return Ok(None);
     };
-    let path = path.trim_end_matches('/');
-    let filter = filter.trim_end_matches('/');
-    path == filter
-        || path
-            .strip_prefix(filter)
-            .is_some_and(|rest| rest.starts_with('/'))
+    Ok(Some(match entry {
+        // The old entry is the body of the new entry.
+        TarEntry::File(mut file) => {
+            with_metadata!(TarRegularFile::new(path, file.size(), file), file).into()
+        }
+        TarEntry::Directory(mut dir) => with_metadata!(TarDirectory::new(path), dir).into(),
+        TarEntry::Symlink(mut link) => {
+            with_metadata!(TarSymlink::new(path, link.link()), link).into()
+        }
+        TarEntry::Fifo(mut fifo) => with_metadata!(TarFifo::new(path), fifo).into(),
+        TarEntry::Device(mut device) => {
+            let stripped = if device.is_char() {
+                TarDevice::new_char(path, device.major(), device.minor())
+            } else {
+                TarDevice::new_block(path, device.major(), device.minor())
+            };
+            with_metadata!(stripped, device).into()
+        }
+        TarEntry::Link(link) => match strip_path(link.link(), count) {
+            Some(target) => TarLink::new(path, target).into(),
+            None if skip_missing_links => return Ok(None),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{}: link target {} has no component after --strip-components",
+                        link.path(),
+                        link.link()
+                    ),
+                ))
+            }
+        },
+    }))
 }
 
 fn run(cli: Cli) -> io::Result<()> {
@@ -389,74 +538,146 @@ async fn run_async(cli: Cli) -> io::Result<()> {
 }
 
 async fn run_create(cli: Cli) -> io::Result<()> {
-    let source_arg = cli.path.expect("create mode requires a path");
     let base_dir = cli.chdir.unwrap_or_else(|| PathBuf::from("."));
-    let source_path = resolve_source_path(&base_dir, &source_arg)?;
-    let archive_root = normalize_input_path(&source_arg)?;
-    let mut nodes = Vec::new();
-    let mut hardlinks = HashMap::new();
-    collect_create_nodes(&source_path, &archive_root, &mut nodes, &mut hardlinks).await?;
+    let options = cli.options;
+    let excludes = normalize_input_paths(&options.excludes)?;
+    let mut sources = Vec::with_capacity(cli.paths.len());
+    for path in &cli.paths {
+        let excludes = excludes.clone();
+        sources.push(
+            FsSource::new(resolve_source_path(&base_dir, path)?)
+                .with_prefix(normalize_input_path(path)?)
+                .with_xattrs(options.xattrs)
+                // The source does not read or walk an excluded node.
+                .with_filter(move |path| is_selected(path, &[], &excludes)),
+        );
+    }
+    let target = open_create_target(&cli.archive).await?;
+    let mut tar = TarWriter::new(archive_writer(target.writer, options.compression));
 
-    let mut tar = TarWriter::new(open_archive_writer(&cli.archive).await?);
+    // One `into_tar` for all sources also finds the hard links between them.
+    let result = stream::iter(sources)
+        .flatten()
+        .try_filter(|entry| future::ready(!is_archive_file(entry, &target.skip)))
+        .into_tar()
+        .inspect_ok(|entry| {
+            if options.verbose {
+                eprintln!("{}", entry.path());
+            }
+        })
+        .forward(&mut tar)
+        .await;
 
-    for node in nodes {
-        match node {
-            CreateNode::Directory { archive_path, meta } => {
-                tar.send(TarEntry::from(
-                    TarDirectory::new(archive_path)
-                        .with_uid(meta.uid)
-                        .with_gid(meta.gid)
-                        .with_mode(meta.mode)
-                        .with_mtime(unix_time(meta.mtime)),
-                ))
-                .await?;
-            }
-            CreateNode::File {
-                archive_path,
-                fs_path,
-                meta,
-                size,
-            } => {
-                let reader: Box<dyn AsyncRead + Unpin + Send> =
-                    Box::new(File::open(&fs_path).await?);
-                tar.send(TarEntry::from(
-                    TarRegularFile::new(archive_path, size, reader)
-                        .with_uid(meta.uid)
-                        .with_gid(meta.gid)
-                        .with_mode(meta.mode)
-                        .with_mtime(unix_time(meta.mtime)),
-                ))
-                .await?;
-            }
-            CreateNode::Symlink {
-                archive_path,
-                target,
-                meta,
-            } => {
-                tar.send(TarEntry::from(
-                    TarSymlink::new(archive_path, target)
-                        .with_uid(meta.uid)
-                        .with_gid(meta.gid)
-                        .with_mode(meta.mode)
-                        .with_mtime(unix_time(meta.mtime)),
-                ))
-                .await?;
-            }
-            CreateNode::Hardlink {
-                archive_path,
-                target,
-            } => {
-                tar.send(TarEntry::from(TarLink::new(archive_path, target)))
-                    .await?;
-            }
+    let Some((temp, path)) = target.rename else {
+        return result;
+    };
+    let result = match result {
+        Ok(()) => fs::rename(&temp, &path).await,
+        Err(err) => Err(err),
+    };
+    if result.is_err() {
+        // The old archive, if any, does not change.
+        let _ = fs::remove_file(&temp).await;
+    }
+    result
+}
+
+/// Archive file of create mode.
+struct CreateTarget {
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+    /// Temporary file, and the path that it replaces after a successful run.
+    rename: Option<(PathBuf, PathBuf)>,
+    /// Name, device and inode of each file that the archive must not hold.
+    skip: Vec<(OsString, u64, u64)>,
+}
+
+/// Open the archive file of create mode. For `-`, write to stdout. For a
+/// regular file or a missing file, write to a temporary file in the same
+/// directory. For another kind of file, for example a FIFO, write to the
+/// file.
+async fn open_create_target(archive: &OsString) -> io::Result<CreateTarget> {
+    let mut target = CreateTarget {
+        writer: stdout_archive_writer(),
+        rename: None,
+        skip: Vec::new(),
+    };
+    if archive == "-" {
+        return Ok(target);
+    }
+    let archive = PathBuf::from(archive);
+    let (path, permissions) = match fs::metadata(&archive).await {
+        Ok(metadata) if !metadata.is_file() => {
+            target.writer = Box::new(File::create(&archive).await?);
+            return Ok(target);
+        }
+        // Replace the file, not a symlink to it.
+        Ok(metadata) => {
+            let path = fs::canonicalize(&archive).await?;
+            target.skip.push(file_key(&path, &metadata));
+            (path, Some(metadata.permissions()))
+        }
+        // A symlink to a missing file. Create the file through the symlink.
+        Err(err)
+            if err.kind() == io::ErrorKind::NotFound
+                && fs::symlink_metadata(&archive).await.is_ok() =>
+        {
+            let file = File::create(&archive).await?;
+            let path = fs::canonicalize(&archive).await?;
+            target.skip.push(file_key(&path, &file.metadata().await?));
+            target.writer = Box::new(file);
+            return Ok(target);
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (archive, None),
+        Err(err) => return Err(err),
+    };
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("archive path has no file name: {}", path.display()),
+        )
+    })?;
+    let mut temp_name = OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(format!(".{}.tmp", std::process::id()));
+    let temp = path.with_file_name(temp_name);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .await?;
+    // The new archive keeps the permissions of the old archive.
+    if let Some(permissions) = permissions {
+        if let Err(err) = fs::set_permissions(&temp, permissions).await {
+            let _ = fs::remove_file(&temp).await;
+            return Err(err);
         }
     }
+    target.skip.push(file_key(&temp, &file.metadata().await?));
+    target.writer = Box::new(file);
+    target.rename = Some((temp, path));
+    Ok(target)
+}
 
-    tar.close().await
+/// Give the name, the device and the inode of the file at `path`.
+fn file_key(path: &Path, metadata: &std::fs::Metadata) -> (OsString, u64, u64) {
+    let name = path.file_name().unwrap_or_default().to_owned();
+    (name, metadata.dev(), metadata.ino())
+}
+
+/// Give `true` if `entry` is one of the files in `skip`.
+fn is_archive_file(entry: &FsEntry, skip: &[(OsString, u64, u64)]) -> bool {
+    entry.kind() == FsKind::File
+        && skip.iter().any(|(name, dev, ino)| {
+            // The blocking call runs only for a file with the name of an
+            // archive file.
+            entry.fs_path().file_name() == Some(name.as_os_str())
+                && std::fs::symlink_metadata(entry.fs_path())
+                    .is_ok_and(|metadata| metadata.dev() == *dev && metadata.ino() == *ino)
+        })
 }
 
 async fn run_list(cli: Cli) -> io::Result<()> {
-    let mut tar = TarReader::new(open_archive_reader(&cli.archive).await?);
+    let mut tar = TarReader::new(open_archive_reader(&cli.archive, cli.options.compression).await?);
     let mut stdout = io::stdout().lock();
 
     while let Some(entry) = tar.next().await {
@@ -477,207 +698,101 @@ async fn run_list(cli: Cli) -> io::Result<()> {
 
 async fn run_extract(cli: Cli) -> io::Result<()> {
     let destination = cli.chdir.unwrap_or_else(|| PathBuf::from("."));
-    let filter = match cli.path {
-        Some(path) => Some(normalize_input_path(&path)?),
-        None => None,
-    };
-    let mut tar = TarReader::new(open_archive_reader(&cli.archive).await?);
-    let mut hardlinks = Vec::new();
-    let mut directories = Vec::new();
+    let options = cli.options;
+    let filters = normalize_input_paths(&cli.paths)?;
+    let excludes = normalize_input_paths(&options.excludes)?;
+    let reader = open_archive_reader(&cli.archive, options.compression).await?;
+    fs::create_dir_all(&destination).await?;
 
-    while let Some(entry) = tar.next().await {
-        match entry? {
-            TarEntry::Directory(dir) => {
-                if !matches_filter(dir.path(), filter.as_deref()) {
-                    continue;
-                }
-                let relative = sanitize_archive_member(dir.path())?;
-                let full_path = destination.join(&relative);
-                create_or_reuse_directory(&full_path).await?;
-                directories.push(DeferredDirectory {
-                    path: full_path,
-                    mode: dir.mode(),
-                    mtime: dir.mtime(),
-                });
-            }
-            TarEntry::File(mut file) => {
-                if !matches_filter(file.path(), filter.as_deref()) {
-                    continue;
-                }
-                let relative = sanitize_archive_member(file.path())?;
-                let full_path = destination.join(&relative);
-                create_parent_directories(&full_path).await?;
-                remove_existing_non_directory(&full_path).await?;
-                let mut out = File::create(&full_path).await?;
-                copy(&mut file, &mut out).await?;
-                finalize_extracted_file(&mut out).await?;
-                drop(out);
-                set_mode_and_mtime(&full_path, file.mode(), file.mtime()).await?;
-            }
-            TarEntry::Symlink(link) => {
-                if !matches_filter(link.path(), filter.as_deref()) {
-                    continue;
-                }
-                let relative = sanitize_archive_member(link.path())?;
-                let full_path = destination.join(&relative);
-                create_parent_directories(&full_path).await?;
-                remove_existing_non_directory(&full_path).await?;
-                let target = sanitize_symlink_target(link.link())?;
-                create_symlink(target, &full_path).await?;
-            }
-            TarEntry::Link(link) => {
-                if !matches_filter(link.path(), filter.as_deref()) {
-                    continue;
-                }
-                let relative = sanitize_archive_member(link.path())?;
-                hardlinks.push(DeferredHardlink {
-                    path: destination.join(relative),
-                    target: link.link().to_string(),
-                });
-            }
-            TarEntry::Fifo(fifo) => {
-                return Err(io::Error::other(format!(
-                    "unsupported fifo entry during extraction: {}",
-                    fifo.path()
-                )));
-            }
-            TarEntry::Device(device) => {
-                return Err(io::Error::other(format!(
-                    "unsupported device entry during extraction: {}",
-                    device.path()
-                )));
-            }
-        }
+    let entries = TarReader::new(reader)
+        .try_filter(|entry| future::ready(is_selected(entry.path(), &filters, &excludes)));
+
+    let count = options.strip_components;
+    if count == 0 {
+        entries
+            .inspect_ok(|entry| print_entry(entry, &options))
+            .forward(fs_sink(&destination, &options))
+            .await
+    } else {
+        entries
+            .try_filter_map(|entry| {
+                future::ready(strip_entry(entry, count, options.skip_missing_links))
+            })
+            .inspect_ok(|entry| print_entry(entry, &options))
+            .forward(fs_sink(&destination, &options))
+            .await
     }
-
-    for hardlink in hardlinks {
-        let target = destination.join(sanitize_archive_member(&hardlink.target)?);
-        match fs::symlink_metadata(&target).await {
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "hardlink target does not exist: {} -> {}",
-                        hardlink.path.display(),
-                        hardlink.target
-                    ),
-                ));
-            }
-            Err(err) => return Err(err),
-        }
-        create_parent_directories(&hardlink.path).await?;
-        remove_existing_non_directory(&hardlink.path).await?;
-        fs::hard_link(&target, &hardlink.path).await?;
-    }
-
-    for dir in directories.into_iter().rev() {
-        set_mode_and_mtime(&dir.path, dir.mode, dir.mtime).await?;
-    }
-
-    Ok(())
 }
 
-async fn collect_create_nodes(
-    fs_path: &Path,
-    archive_path: &str,
-    nodes: &mut Vec<CreateNode>,
-    hardlinks: &mut HashMap<(u64, u64), String>,
-) -> io::Result<()> {
-    let mut stack = vec![(fs_path.to_path_buf(), archive_path.to_string())];
+/// With `-v`, write the path of `entry` to stderr. Do not write the path of
+/// a device entry that `FsSink` skips.
+fn print_entry<R: AsyncRead + Unpin>(entry: &TarEntry<'_, R>, options: &Options) {
+    if options.verbose && (options.devices || !matches!(entry, TarEntry::Device(_))) {
+        eprintln!("{}", entry.path());
+    }
+}
 
-    while let Some((fs_path, archive_path)) = stack.pop() {
-        let metadata = fs::symlink_metadata(&fs_path).await?;
-        let meta = unix_meta(&metadata);
-        let file_type = metadata.file_type();
-
-        if file_type.is_dir() {
-            nodes.push(CreateNode::Directory {
-                archive_path: ensure_directory_path(&archive_path),
-                meta,
-            });
-
-            let mut children = collect_directory_children(&fs_path).await?;
-            children.sort_by(|left, right| left.0.cmp(&right.0));
-
-            for (name, child_path) in children.into_iter().rev() {
-                let child_archive_path = join_archive_path(&archive_path, &name);
-                stack.push((child_path, child_archive_path));
-            }
-
-            continue;
-        }
-
-        if file_type.is_symlink() {
-            let target = fs::read_link(&fs_path).await?;
-            let target = target.to_str().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "non-UTF-8 symlink target is not supported",
-                )
-            })?;
-            nodes.push(CreateNode::Symlink {
-                archive_path: archive_path.to_string(),
-                target: target.to_string(),
-                meta,
-            });
-            continue;
-        }
-
-        if file_type.is_file() {
-            if metadata.nlink() > 1 {
-                let key = (metadata.dev(), metadata.ino());
-                if let Some(first_path) = hardlinks.get(&key) {
-                    nodes.push(CreateNode::Hardlink {
-                        archive_path: archive_path.to_string(),
-                        target: first_path.clone(),
-                    });
-                    continue;
-                }
-                hardlinks.insert(key, archive_path.to_string());
-            }
-
-            nodes.push(CreateNode::File {
-                archive_path: archive_path.to_string(),
-                fs_path,
-                meta,
-                size: metadata.len(),
-            });
-            continue;
-        }
-
-        let kind = if file_type.is_char_device() {
-            "character device"
-        } else if file_type.is_block_device() {
-            "block device"
-        } else if file_type.is_fifo() {
-            "fifo"
-        } else if file_type.is_socket() {
-            "socket"
+fn fs_sink<'a, R: AsyncRead + Unpin + Send + 'a>(
+    destination: &Path,
+    options: &Options,
+) -> FsSink<'a, R> {
+    FsSink::new(destination)
+        .with_special_bits(options.preserve_permissions)
+        .with_owner(options.same_owner)
+        .with_xattrs(options.xattrs)
+        .with_device_nodes(if options.devices {
+            DeviceNodes::Create
         } else {
-            "unknown file type"
-        };
-        return Err(io::Error::other(format!(
-            "unsupported filesystem entry for archiving: {} ({kind})",
-            fs_path.display()
-        )));
-    }
-
-    Ok(())
+            DeviceNodes::Skip
+        })
+        .with_missing_link_target(if options.skip_missing_links {
+            MissingLinkTarget::Skip
+        } else {
+            MissingLinkTarget::Error
+        })
 }
 
-async fn open_archive_reader(archive: &OsString) -> io::Result<Box<dyn AsyncRead + Unpin + Send>> {
-    if archive == "-" {
-        return Ok(stdin_archive_reader());
+async fn open_archive_reader(
+    archive: &OsString,
+    compression: Option<Compression>,
+) -> io::Result<Box<dyn AsyncRead + Unpin + Send>> {
+    let source: Box<dyn AsyncRead + Unpin + Send> = if archive == "-" {
+        stdin_archive_reader()
+    } else {
+        Box::new(File::open(PathBuf::from(archive)).await?)
+    };
+    let source = BufReader::with_capacity(ARCHIVE_BUFFER_SIZE, source);
+    // A compressed file can hold more than one member or frame, for example
+    // the output of pigz or of `cat a.gz b.gz`.
+    macro_rules! decoder {
+        ($decoder:ident) => {{
+            let mut decoder = decode::$decoder::new(source);
+            decoder.multiple_members(true);
+            Box::new(decoder)
+        }};
     }
-    Ok(Box::new(File::open(PathBuf::from(archive)).await?))
+    let reader: Box<dyn AsyncRead + Unpin + Send> = match compression {
+        None => Box::new(source),
+        Some(Compression::Gzip) => decoder!(GzipDecoder),
+        Some(Compression::Xz) => decoder!(XzDecoder),
+        Some(Compression::Zstd) => decoder!(ZstdDecoder),
+    };
+    Ok(reader)
 }
 
-async fn open_archive_writer(archive: &OsString) -> io::Result<Box<dyn AsyncWrite + Unpin + Send>> {
-    if archive == "-" {
-        return Ok(stdout_archive_writer());
-    }
-    Ok(Box::new(File::create(PathBuf::from(archive)).await?))
+fn archive_writer(
+    target: Box<dyn AsyncWrite + Unpin + Send>,
+    compression: Option<Compression>,
+) -> Box<dyn AsyncWrite + Unpin + Send> {
+    let target: Box<dyn AsyncWrite + Unpin + Send> = match compression {
+        None => target,
+        Some(Compression::Gzip) => Box::new(encode::GzipEncoder::new(target)),
+        Some(Compression::Xz) => Box::new(encode::XzEncoder::new(target)),
+        Some(Compression::Zstd) => Box::new(encode::ZstdEncoder::new(target)),
+    };
+    // TarWriter writes each header and each part of a body separately. The
+    // close of the TarWriter flushes the buffer and ends the compression.
+    Box::new(BufWriter::with_capacity(ARCHIVE_BUFFER_SIZE, target))
 }
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
@@ -700,164 +815,9 @@ fn stdout_archive_writer() -> Box<dyn AsyncWrite + Unpin + Send> {
     Box::new(::tokio::io::stdout())
 }
 
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
-async fn collect_directory_children(fs_path: &Path) -> io::Result<Vec<(String, PathBuf)>> {
-    let mut children = Vec::new();
-    let mut read_dir = fs::read_dir(fs_path).await?;
-    while let Some(child) = read_dir.next().await {
-        let child = child?;
-        let name = child.file_name();
-        let name = name.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "non-UTF-8 path is not supported",
-            )
-        })?;
-        children.push((name.to_string(), child.path()));
-    }
-    Ok(children)
-}
-
-#[cfg(feature = "tokio")]
-async fn collect_directory_children(fs_path: &Path) -> io::Result<Vec<(String, PathBuf)>> {
-    let mut children = Vec::new();
-    let mut read_dir = fs::read_dir(fs_path).await?;
-    while let Some(child) = read_dir.next_entry().await? {
-        let name = child.file_name();
-        let name = name.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "non-UTF-8 path is not supported",
-            )
-        })?;
-        children.push((name.to_string(), child.path()));
-    }
-    Ok(children)
-}
-
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
-fn unix_meta(metadata: &fs::Metadata) -> UnixMeta {
-    let raw_mtime = metadata.mtime();
-    let mtime = if raw_mtime < 0 {
-        0
-    } else {
-        raw_mtime.min(i64::from(u32::MAX)) as u32
-    };
-    UnixMeta {
-        mode: metadata.mode() & 0o7777,
-        mtime,
-        uid: metadata.uid(),
-        gid: metadata.gid(),
-    }
-}
-
-#[cfg(feature = "tokio")]
-fn unix_meta(metadata: &Metadata) -> UnixMeta {
-    let raw_mtime = metadata.mtime();
-    let mtime = if raw_mtime < 0 {
-        0
-    } else {
-        raw_mtime.min(i64::from(u32::MAX)) as u32
-    };
-    UnixMeta {
-        mode: metadata.mode() & 0o7777,
-        mtime,
-        uid: metadata.uid(),
-        gid: metadata.gid(),
-    }
-}
-
-async fn create_parent_directories(path: &Path) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    Ok(())
-}
-
-async fn create_or_reuse_directory(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path).await {
-        Ok(metadata) => {
-            if metadata.file_type().is_dir() {
-                Ok(())
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "cannot replace non-directory with directory: {}",
-                        path.display()
-                    ),
-                ))
-            }
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(path).await?;
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
-}
-
-async fn remove_existing_non_directory(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path).await {
-        Ok(metadata) => {
-            if metadata.file_type().is_dir() {
-                Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("cannot overwrite directory: {}", path.display()),
-                ))
-            } else {
-                fs::remove_file(path).await
-            }
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
-async fn create_symlink(target: &str, path: &Path) -> io::Result<()> {
-    symlink(target, path).await
-}
-
-#[cfg(feature = "tokio")]
-async fn create_symlink(target: &str, path: &Path) -> io::Result<()> {
-    fs::symlink(target, path).await
-}
-
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
-async fn finalize_extracted_file<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
-    writer.close().await
-}
-
-#[cfg(feature = "tokio")]
-async fn finalize_extracted_file<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
-    writer.flush().await
-}
-
-async fn set_mode_and_mtime(path: &Path, mode: u32, mtime: SystemTime) -> io::Result<()> {
-    fs::set_permissions(path, permissions_from_mode(mode)).await?;
-    let times = std::fs::FileTimes::new().set_modified(mtime);
-    std::fs::File::open(path)?.set_times(times)?;
-    Ok(())
-}
-
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
-fn permissions_from_mode(mode: u32) -> fs::Permissions {
-    fs::Permissions::from_mode(mode)
-}
-
-#[cfg(feature = "tokio")]
-fn permissions_from_mode(mode: u32) -> std::fs::Permissions {
-    std::fs::Permissions::from_mode(mode)
-}
-
-fn unix_time(secs: u32) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(secs))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_cli, Cli, Mode};
+    use super::{is_selected, parse_cli, strip_path, Cli, Compression, Mode};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -871,7 +831,7 @@ mod tests {
         assert_eq!(cli.mode, Mode::Create);
         assert_eq!(cli.archive, "archive.tar");
         assert_eq!(cli.chdir, Some(PathBuf::from("src")));
-        assert_eq!(cli.path, Some(PathBuf::from("tree")));
+        assert_eq!(cli.paths, vec![PathBuf::from("tree")]);
     }
 
     #[test]
@@ -891,6 +851,125 @@ mod tests {
         let cli = parse(&["-cf-", "."]).unwrap();
         assert_eq!(cli.mode, Mode::Create);
         assert_eq!(cli.archive, "-");
-        assert_eq!(cli.path, Some(PathBuf::from(".")));
+        assert_eq!(cli.paths, vec![PathBuf::from(".")]);
+    }
+
+    #[test]
+    fn parse_create_options() {
+        let cli = parse(&[
+            "-czvf",
+            "archive.tar.gz",
+            "--xattrs",
+            "--exclude",
+            "tree/a",
+            "--exclude=tree/b",
+            "tree",
+            "other",
+        ])
+        .unwrap();
+        assert_eq!(cli.options.compression, Some(Compression::Gzip));
+        assert!(cli.options.verbose);
+        assert!(cli.options.xattrs);
+        assert_eq!(
+            cli.options.excludes,
+            vec![PathBuf::from("tree/a"), PathBuf::from("tree/b")]
+        );
+        assert_eq!(
+            cli.paths,
+            vec![PathBuf::from("tree"), PathBuf::from("other")]
+        );
+    }
+
+    #[test]
+    fn parse_extract_options() {
+        let cli = parse(&[
+            "-xpJf",
+            "archive.tar.xz",
+            "--same-owner",
+            "--devices",
+            "--skip-missing-links",
+            "--strip-components=2",
+        ])
+        .unwrap();
+        assert_eq!(cli.options.compression, Some(Compression::Xz));
+        assert!(cli.options.preserve_permissions);
+        assert!(cli.options.same_owner);
+        assert!(cli.options.devices);
+        assert!(cli.options.skip_missing_links);
+        assert_eq!(cli.options.strip_components, 2);
+        assert!(cli.paths.is_empty());
+
+        let cli = parse(&["-x", "--xzip", "--strip-components", "1", "-f", "a"]).unwrap();
+        assert_eq!(cli.options.compression, Some(Compression::Xz));
+        assert_eq!(cli.options.strip_components, 1);
+    }
+
+    #[test]
+    fn parse_rejects_extract_options_for_create() {
+        let err = parse(&["-cpf", "archive.tar", "tree"]).unwrap_err();
+        assert_eq!(err, "option -p is only valid with -x");
+        let err = parse(&["-tf", "archive.tar", "--strip-components=1"]).unwrap_err();
+        assert_eq!(err, "option --strip-components is only valid with -x");
+    }
+
+    #[test]
+    fn parse_rejects_create_options_for_list() {
+        let err = parse(&["-tvf", "archive.tar"]).unwrap_err();
+        assert_eq!(err, "option -v is only valid with -c or -x");
+        let err = parse(&["-tf", "archive.tar", "--exclude=a"]).unwrap_err();
+        assert_eq!(err, "option --exclude is only valid with -c or -x");
+    }
+
+    #[test]
+    fn parse_rejects_two_compressions() {
+        let err = parse(&["-tzf", "archive.tar", "--zstd"]).unwrap_err();
+        assert!(err.contains("only one of -z, -J, or --zstd"));
+    }
+
+    #[test]
+    fn parse_rejects_bad_long_options() {
+        let err = parse(&["-tf", "a", "--gzip=1"]).unwrap_err();
+        assert_eq!(err, "option --gzip does not take an argument");
+        let err = parse(&["-tf", "a", "--bogus"]).unwrap_err();
+        assert_eq!(err, "unknown option --bogus");
+        let err = parse(&["-xf", "a", "--strip-components=x"]).unwrap_err();
+        assert!(err.contains("requires a number"));
+        let err = parse(&["-xf", "a", "--exclude"]).unwrap_err();
+        assert_eq!(err, "option --exclude requires an argument");
+    }
+
+    #[test]
+    fn parse_requires_create_path() {
+        let err = parse(&["-cf", "archive.tar"]).unwrap_err();
+        assert_eq!(err, "mode -c requires at least one PATH argument");
+    }
+
+    #[test]
+    fn selection_ignores_leading_current_directory() {
+        let filters = [String::from("tree/nested")];
+        let excludes = [String::from("tree/nested/skip")];
+        assert!(is_selected("./tree/nested/a.txt", &filters, &excludes));
+        assert!(is_selected("tree/nested/", &filters, &excludes));
+        assert!(!is_selected("tree/nested-other", &filters, &excludes));
+        assert!(!is_selected("./tree/nested/skip/b", &filters, &excludes));
+        assert!(is_selected("./", &[String::from(".")], &[]));
+        assert!(!is_selected("./tree", &[], &[String::from(".")]));
+    }
+
+    #[test]
+    fn selection_ignores_all_current_directory_components() {
+        let secret = [String::from("tree/secret")];
+        assert!(!is_selected("././tree/secret", &[], &secret));
+        assert!(!is_selected("tree/./secret", &[], &secret));
+        assert!(is_selected("tree/./secret/x", &secret, &[]));
+    }
+
+    #[test]
+    fn strip_path_removes_leading_components() {
+        assert_eq!(strip_path("a/b/c", 1).as_deref(), Some("b/c"));
+        assert_eq!(strip_path("./a/b/", 2).as_deref(), Some("b/"));
+        assert_eq!(strip_path("a//b", 1).as_deref(), Some("b"));
+        assert_eq!(strip_path("a/", 1), None);
+        assert_eq!(strip_path("a/b", 2), None);
     }
 }
