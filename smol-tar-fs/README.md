@@ -230,7 +230,7 @@ Refer to [docs.rs](https://docs.rs/smol-tar-fs) for the full API.
 
 `FsSource::new(dir)`
 : A `Stream` of the nodes in a directory tree. Its options are
-  `with_prefix` and `with_xattrs`.
+  `with_prefix`, `with_xattrs`, and `with_filter`.
 
 `FsStreamExt::into_tar()`
 : Converts the nodes to `TarEntry` values. The body of a regular file is an

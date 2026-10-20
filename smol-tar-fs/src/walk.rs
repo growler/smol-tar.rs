@@ -5,15 +5,16 @@ use {
     std::{collections::VecDeque, io, path::Path},
 };
 
-/// Read the children of `dir`. Give the non-directories and the directories
-/// in two lists. Each list is sorted by name, in the order of the UTF-8
-/// bytes.
+/// Read the children of `dir` for which `keep` gives `true`. Give the
+/// non-directories and the directories in two lists. Each list is sorted by
+/// name, in the order of the UTF-8 bytes.
 pub(crate) fn read_sorted(
     dir: &sys::Dir,
     fs_path: &Path,
     xattrs: bool,
+    keep: &dyn Fn(&str, FsKind) -> bool,
 ) -> io::Result<(VecDeque<Child>, VecDeque<Child>)> {
-    let mut all = sys::read_dir(dir, fs_path, xattrs)?;
+    let mut all = sys::read_dir(dir, fs_path, xattrs, keep)?;
     let is_dir = |child: &Child| child.meta.kind == FsKind::Directory;
     all.sort_unstable_by(|a, b| (is_dir(a), &a.name).cmp(&(is_dir(b), &b.name)));
     let dirs = all.split_off(all.partition_point(|child| !is_dir(child)));
@@ -47,7 +48,7 @@ mod tests {
         let Root::Dir { dir, .. } = sys::open_root(path, false).unwrap() else {
             panic!("root is not a directory");
         };
-        let (files, dirs) = read_sorted(&dir, path, false).unwrap();
+        let (files, dirs) = read_sorted(&dir, path, false, &|_, _| true).unwrap();
         assert_eq!(names(&files), ["B", "a", "a.txt", "c"]);
         assert_eq!(names(&dirs), ["b"]);
     }

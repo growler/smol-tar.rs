@@ -1,7 +1,7 @@
 //! Filesystem source: a stream of the nodes in a directory tree.
 
 use {
-    super::{rt, sys, walk, with_path, Child, FsFile, FsKind, Meta, Root},
+    super::{rt, sys, walk, with_path, Child, FsFile, FsKind, Meta, PathFilter, Root},
     futures_core::stream::Stream,
     smol_tar::AttrList,
     std::{
@@ -51,7 +51,8 @@ use {
 /// The source does not stop at mount points.
 ///
 /// The source does not read extended attributes by default. Use
-/// [`with_xattrs`](Self::with_xattrs) to read them.
+/// [`with_xattrs`](Self::with_xattrs) to read them. Use
+/// [`with_filter`](Self::with_filter) to skip nodes and the trees below them.
 ///
 /// The source runs the filesystem calls on the blocking thread pool of the
 /// runtime. The close of a directory can occur on the thread that drops it.
@@ -66,6 +67,7 @@ pub struct FsSource {
     root: PathBuf,
     prefix: String,
     xattrs: bool,
+    filter: Option<PathFilter>,
     stack: Vec<Frame>,
     state: State,
 }
@@ -91,15 +93,30 @@ struct Listing {
 }
 
 impl Listing {
-    /// Read and sort the children of `dir`.
-    fn read(dir: sys::Dir, fs_path: &Path, xattrs: bool) -> io::Result<Self> {
-        let (files, dirs) = walk::read_sorted(&dir, fs_path, xattrs)?;
+    /// Read and sort the children of `dir` that `filter` accepts. `path` is
+    /// the archive path of `dir`. It ends with `/` or is empty.
+    fn read(
+        dir: sys::Dir,
+        fs_path: &Path,
+        path: &str,
+        xattrs: bool,
+        filter: Option<&PathFilter>,
+    ) -> io::Result<Self> {
+        let keep = |name: &str, kind| {
+            filter.is_none_or(|filter| {
+                let suffix = if kind == FsKind::Directory { "/" } else { "" };
+                filter(&format!("{path}{name}{suffix}"))
+            })
+        };
+        let (files, dirs) = walk::read_sorted(&dir, fs_path, xattrs, &keep)?;
         Ok(Self { dir, files, dirs })
     }
 }
 
 /// Result of one call on the blocking thread pool.
 enum Step {
+    /// The filter rejects the root.
+    Skipped,
     /// The root is a directory.
     RootDir {
         root: PathBuf,
@@ -145,6 +162,7 @@ impl FsSource {
             root: root.into(),
             prefix: String::new(),
             xattrs: false,
+            filter: None,
             stack: Vec::new(),
             state: State::Start,
         }
@@ -164,33 +182,85 @@ impl FsSource {
     ///
     /// With `true`, the source opens each regular file and each FIFO one
     /// time to read its attributes, also if a later filter drops the entry.
-    /// A regular file that the process cannot open gives an error.
+    /// A regular file that the process cannot open gives an error. The
+    /// filter of [`with_filter`](Self::with_filter) runs before this read.
     pub fn with_xattrs(mut self, read: bool) -> Self {
         self.xattrs = read;
+        self
+    }
+
+    /// Set the filter for the archive paths. The default filter accepts all
+    /// paths.
+    ///
+    /// The source calls `filter` with the archive path of each node. The
+    /// path of a directory ends with `/`. For a path for which `filter`
+    /// gives `false`, the source gives no entry. It also does not read the
+    /// symlink target or the extended attributes, and it does not open or
+    /// walk a directory. Thus a node that the process cannot read gives no
+    /// error if `filter` gives `false` for it. The source reads the metadata
+    /// of a node before it calls `filter`.
+    ///
+    /// With an empty prefix, the root directory has no entry, and the source
+    /// does not call `filter` for it. The source calls `filter` on the
+    /// blocking thread pool.
+    pub fn with_filter<F>(mut self, filter: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        self.filter = Some(Arc::new(filter));
         self
     }
 
     /// Start the read of the root on the blocking thread pool.
     fn read_root(&mut self) -> StepFuture {
         let root = mem::take(&mut self.root);
+        // Without a prefix, the root gives no entry. Thus the filter and the
+        // xattrs do not apply to it.
+        let mut path = self.prefix.clone();
         let xattrs = self.xattrs;
-        // Without a prefix, the root gives no entry.
-        let root_xattrs = xattrs && !self.prefix.is_empty();
+        let filter = self.filter.clone();
         Box::pin(rt::unblock(move || {
-            Ok(match sys::open_root(&root, root_xattrs)? {
-                Root::Dir { dir, meta } => {
-                    let listing = Listing::read(dir, &root, xattrs)?;
+            let context = |err| with_path(err, &root.to_string_lossy());
+            let accept = |path: &str| filter.as_ref().is_none_or(|filter| filter(path));
+            Ok(match sys::open_root(&root, false)? {
+                Root::Dir { dir, mut meta } => {
+                    if !path.is_empty() {
+                        path.push('/');
+                        if !accept(&path) {
+                            return Ok(Step::Skipped);
+                        }
+                        if xattrs {
+                            meta.xattrs = sys::read_xattrs_dir(&dir).map_err(context)?;
+                        }
+                    }
+                    let listing = Listing::read(dir, &root, &path, xattrs, filter.as_ref())?;
                     Step::RootDir {
                         root,
                         meta,
                         listing,
                     }
                 }
-                Root::Other { parent, child } => Step::RootOther {
-                    root,
-                    parent,
-                    child,
-                },
+                Root::Other { parent, mut child } => {
+                    if !path.is_empty() {
+                        if !accept(&path) {
+                            return Ok(Step::Skipped);
+                        }
+                        if xattrs {
+                            child.meta.xattrs = sys::read_xattrs_at(
+                                &parent,
+                                &child.name,
+                                child.meta.kind,
+                                child.meta.id,
+                            )
+                            .map_err(context)?;
+                        }
+                    }
+                    Step::RootOther {
+                        root,
+                        parent,
+                        child,
+                    }
+                }
             })
         }))
     }
@@ -199,6 +269,7 @@ impl FsSource {
     /// that directory or of the root, if it has one.
     fn apply(&mut self, step: Step) -> Option<io::Result<FsEntry>> {
         match step {
+            Step::Skipped => None,
             Step::RootDir {
                 root,
                 meta,
@@ -307,7 +378,7 @@ impl Frame {
 
     /// Start to open and read the subdirectory `child` on the blocking thread
     /// pool.
-    fn read_dir(&self, mut child: Child, xattrs: bool) -> StepFuture {
+    fn read_dir(&self, mut child: Child, xattrs: bool, filter: Option<PathFilter>) -> StepFuture {
         let path = self.child_path(&child.name, "/");
         let fs_path = self.child_fs_path(&child.name);
         let parent = Arc::clone(&self.dir);
@@ -317,7 +388,7 @@ impl Frame {
             if xattrs {
                 child.meta.xattrs = sys::read_xattrs_dir(&dir).map_err(context)?;
             }
-            let listing = Listing::read(dir, &fs_path, xattrs)?;
+            let listing = Listing::read(dir, &fs_path, &path, xattrs, filter.as_ref())?;
             Ok(Step::Dir {
                 parent,
                 child,
@@ -353,7 +424,8 @@ impl Stream for FsSource {
                         frame.files = VecDeque::new();
                     }
                     if let Some(child) = frame.dirs.pop_front() {
-                        this.state = State::Busy(frame.read_dir(child, this.xattrs));
+                        this.state =
+                            State::Busy(frame.read_dir(child, this.xattrs, this.filter.clone()));
                     } else {
                         this.stack.pop();
                         this.state = State::Walk;

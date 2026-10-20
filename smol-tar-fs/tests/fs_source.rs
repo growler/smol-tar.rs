@@ -13,6 +13,7 @@ use {
         os::unix::fs::{symlink, MetadataExt, PermissionsExt},
         path::Path,
         pin::pin,
+        sync::{Arc, Mutex},
         time::{Duration, UNIX_EPOCH},
     },
 };
@@ -199,6 +200,95 @@ fn try_filter_drops_entries() {
         paths(source),
         ["pkg/", "pkg/a.txt", "pkg/b", "pkg/a/", "pkg/a/x", "pkg/e/"]
     );
+}
+
+#[test]
+fn with_filter_skips_subtree() {
+    let tmp = TempDir::new();
+    make_tree(tmp.path(), TREE);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let source = FsSource::new(tmp.path()).with_prefix("pkg").with_filter({
+        let calls = Arc::clone(&calls);
+        move |path| {
+            calls.lock().unwrap().push(path.to_owned());
+            path != "pkg/c/" && path != "pkg/b"
+        }
+    });
+    assert_eq!(
+        paths(source),
+        ["pkg/", "pkg/a.txt", "pkg/a/", "pkg/a/x", "pkg/e/"]
+    );
+    // The source does not walk below a rejected directory.
+    let mut calls = calls.lock().unwrap().clone();
+    calls.sort();
+    assert_eq!(
+        calls,
+        [
+            "pkg/",
+            "pkg/a.txt",
+            "pkg/a/",
+            "pkg/a/x",
+            "pkg/b",
+            "pkg/c/",
+            "pkg/e/"
+        ]
+    );
+}
+
+#[test]
+fn with_filter_rejects_root() {
+    let tmp = TempDir::new();
+    make_tree(tmp.path(), TREE);
+    let source = FsSource::new(tmp.path())
+        .with_prefix("pkg")
+        .with_filter(|path| path != "pkg/");
+    assert!(paths(source).is_empty());
+    let source = FsSource::new(tmp.path().join("a.txt"))
+        .with_prefix("f")
+        .with_filter(|path| path != "f");
+    assert!(paths(source).is_empty());
+}
+
+#[test]
+fn with_filter_without_prefix_skips_root() {
+    let tmp = TempDir::new();
+    make_tree(tmp.path(), ["a.txt", "e/"]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let source = FsSource::new(tmp.path()).with_filter({
+        let calls = Arc::clone(&calls);
+        move |path| {
+            calls.lock().unwrap().push(path.to_owned());
+            true
+        }
+    });
+    assert_eq!(paths(source), ["a.txt", "e/"]);
+    assert_eq!(*calls.lock().unwrap(), ["a.txt", "e/"]);
+}
+
+#[test]
+fn with_filter_does_not_read_rejected_nodes() {
+    let tmp = TempDir::new();
+    make_tree(tmp.path(), ["locked/f", "secret", "keep"]);
+    let locked = tmp.path().join("locked");
+    let secret = tmp.path().join("secret");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read_dir(&locked).is_ok() || fs::File::open(&secret).is_ok();
+    let source = FsSource::new(tmp.path())
+        .with_xattrs(true)
+        .with_filter(|path| path == "keep");
+    let result = collect(source);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+    if readable {
+        eprintln!("skip: the process can read nodes with mode 000");
+        return;
+    }
+    let paths: Vec<_> = result
+        .into_iter()
+        .map(|entry| entry.unwrap().path().to_owned())
+        .collect();
+    assert_eq!(paths, ["keep"]);
 }
 
 /// Tar entry in a form that tests can compare.

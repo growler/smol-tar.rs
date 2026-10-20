@@ -151,12 +151,14 @@ struct XattrBufs {
 /// Read the node `name` in `dir`. A node with no `FsKind` gives `None`.
 /// With `expect` set, the kind and the identity of the node must be equal
 /// to it. With `bufs` set, read the xattrs of a node that is not a
-/// directory.
+/// directory. If `keep` gives `false` for the name and the kind, give
+/// `None` before the read of the symlink target and the xattrs.
 fn read_child(
     dir: &Dir,
     name: &CStr,
     expect: Option<(FsKind, FileId)>,
     bufs: Option<&mut XattrBufs>,
+    keep: &dyn Fn(&str, FsKind) -> bool,
 ) -> io::Result<Option<Child>> {
     let st = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
     if let Some((kind, id)) = expect {
@@ -168,6 +170,9 @@ fn read_child(
     let utf8_name = name
         .to_str()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "name is not valid UTF-8"))?;
+    if !keep(utf8_name, meta.kind) {
+        return Ok(None);
+    }
     let link = if meta.kind == FsKind::Symlink {
         Some(read_link(dir, name)?)
     } else {
@@ -217,9 +222,15 @@ fn read_link(dir: &Dir, name: &CStr) -> io::Result<Box<str>> {
 }
 
 /// Read the children of `dir`, without `.` and `..`, in directory order.
-/// Skip nodes with no `FsKind`. `fs_path` is the path of `dir` for error
+/// Skip nodes with no `FsKind`, and nodes for which `keep` gives `false`
+/// for the name and the kind. `fs_path` is the path of `dir` for error
 /// messages.
-pub(crate) fn read_dir(dir: &Dir, fs_path: &Path, xattrs: bool) -> io::Result<Vec<Child>> {
+pub(crate) fn read_dir(
+    dir: &Dir,
+    fs_path: &Path,
+    xattrs: bool,
+    keep: &dyn Fn(&str, FsKind) -> bool,
+) -> io::Result<Vec<Child>> {
     let mut bufs = XattrBufs::default();
     let mut bufs = xattrs.then_some(&mut bufs);
     let mut children = Vec::new();
@@ -228,7 +239,7 @@ pub(crate) fn read_dir(dir: &Dir, fs_path: &Path, xattrs: bool) -> io::Result<Ve
         if raw == b"." || raw == b".." {
             return Ok(());
         }
-        let child = read_child(dir, name, None, bufs.as_deref_mut())
+        let child = read_child(dir, name, None, bufs.as_deref_mut(), keep)
             .map_err(|err| path_error(err, &fs_path.join(OsStr::from_bytes(raw))))?;
         children.extend(child);
         Ok(())
@@ -301,6 +312,7 @@ fn open_root_inner(root: &Path, xattrs: bool) -> io::Result<Root> {
         &name,
         Some((kind, id)),
         xattrs.then_some(&mut bufs),
+        &|_, _| true,
     )?
     .ok_or_else(unsupported)?;
     Ok(Root::Other { parent, child })
@@ -369,7 +381,6 @@ pub(crate) fn read_xattrs_dir(_dir: &Dir) -> io::Result<AttrList> {
 /// Read the xattrs of the node `name` in `parent`. The kind must be `kind`
 /// and the identity must be `expect`. A kind that cannot be opened safely
 /// gives an empty list.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn read_xattrs_at(
     parent: &Dir,
     name: &str,
@@ -870,6 +881,10 @@ mod tests {
     assert_impl_all!(Dir: Send, Sync);
     assert_impl_all!(FileId: Copy, Eq, std::hash::Hash, Send);
 
+    fn keep_all(_: &str, _: FsKind) -> bool {
+        true
+    }
+
     fn open_dir_root(path: &Path) -> Dir {
         match open_root(path, false).unwrap() {
             Root::Dir { dir, .. } => dir,
@@ -912,7 +927,7 @@ mod tests {
         let _bad = non_utf8_node(std::os::unix::net::UnixListener::bind(
             tmp.path().join(OsStr::from_bytes(b"\xff")),
         ));
-        let children = read_dir(&open_dir_root(tmp.path()), tmp.path(), false).unwrap();
+        let children = read_dir(&open_dir_root(tmp.path()), tmp.path(), false, &keep_all).unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(&*children[0].name, "f");
     }
@@ -921,7 +936,7 @@ mod tests {
     fn read_dir_gives_symlink_target() {
         let tmp = TempDir::new();
         std::os::unix::fs::symlink("some/target", tmp.path().join("l")).unwrap();
-        let children = read_dir(&open_dir_root(tmp.path()), tmp.path(), false).unwrap();
+        let children = read_dir(&open_dir_root(tmp.path()), tmp.path(), false, &keep_all).unwrap();
         let child = find(&children, "l");
         assert_eq!(child.meta.kind, FsKind::Symlink);
         assert_eq!(child.meta.size, 0);
@@ -935,7 +950,7 @@ mod tests {
         if non_utf8_node(std::fs::write(path, b"")).is_none() {
             return;
         }
-        let err = read_dir(&open_dir_root(tmp.path()), tmp.path(), false).unwrap_err();
+        let err = read_dir(&open_dir_root(tmp.path()), tmp.path(), false, &keep_all).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         let msg = err.to_string();
         assert!(msg.contains(&*tmp.path().to_string_lossy()), "{msg}");
@@ -1106,7 +1121,7 @@ mod tests {
         let path = tmp.path().join("f");
         std::fs::write(&path, b"hello").unwrap();
         std::fs::hard_link(&path, tmp.path().join("g")).unwrap();
-        let children = read_dir(&open_dir_root(tmp.path()), tmp.path(), false).unwrap();
+        let children = read_dir(&open_dir_root(tmp.path()), tmp.path(), false, &keep_all).unwrap();
         let meta = &find(&children, "f").meta;
         let md = std::fs::symlink_metadata(&path).unwrap();
         assert_eq!(meta.kind, FsKind::File);
@@ -1131,7 +1146,7 @@ mod tests {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        let children = read_dir(&open_dir_root(tmp.path()), tmp.path(), false).unwrap();
+        let children = read_dir(&open_dir_root(tmp.path()), tmp.path(), false, &keep_all).unwrap();
         assert_eq!(find(&children, "f").meta.mtime, mtime);
     }
 
@@ -1163,7 +1178,7 @@ mod tests {
             eprintln!("skip: permission checks are bypassed");
             return;
         }
-        let children = read_dir(&dir, tmp.path(), true).unwrap();
+        let children = read_dir(&dir, tmp.path(), true, &keep_all).unwrap();
         assert!(find(&children, "p").meta.xattrs.is_empty());
     }
 
@@ -1509,7 +1524,7 @@ mod tests {
                 return;
             }
             let root = open_dir_root(tmp.path());
-            let children = read_dir(&root, tmp.path(), true).unwrap();
+            let children = read_dir(&root, tmp.path(), true, &keep_all).unwrap();
             assert!(find(&children, "d").meta.xattrs.is_empty());
             let dir = open_dir(&root, "d", id_of(&path)).unwrap();
             let list = read_xattrs_dir(&dir).unwrap();
@@ -1525,9 +1540,9 @@ mod tests {
                 return;
             }
             let dir = open_dir_root(tmp.path());
-            let children = read_dir(&dir, tmp.path(), false).unwrap();
+            let children = read_dir(&dir, tmp.path(), false, &keep_all).unwrap();
             assert!(find(&children, "f").meta.xattrs.is_empty());
-            let children = read_dir(&dir, tmp.path(), true).unwrap();
+            let children = read_dir(&dir, tmp.path(), true, &keep_all).unwrap();
             assert_eq!(
                 user_attrs(&find(&children, "f").meta.xattrs),
                 [("user.a", &b"1"[..])]

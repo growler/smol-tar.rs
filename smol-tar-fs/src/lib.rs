@@ -235,6 +235,10 @@ impl SetMeta {
 /// Filter of xattr names. It gives `true` for a name that the sink writes.
 pub(crate) type XattrFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Filter of archive paths. It gives `true` for a path that the source
+/// gives.
+pub(crate) type PathFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Root of a source walk.
 #[derive(Debug)]
 pub(crate) enum Root {

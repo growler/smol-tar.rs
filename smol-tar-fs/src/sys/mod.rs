@@ -19,7 +19,8 @@
 //!
 //! ```text
 //! pub(crate) fn open_root(root: &Path, xattrs: bool) -> io::Result<Root>;
-//! pub(crate) fn read_dir(dir: &Dir, fs_path: &Path, xattrs: bool) -> io::Result<Vec<Child>>;
+//! pub(crate) fn read_dir(dir: &Dir, fs_path: &Path, xattrs: bool,
+//!     keep: &dyn Fn(&str, FsKind) -> bool) -> io::Result<Vec<Child>>;
 //! pub(crate) fn open_dir(parent: &Dir, name: &str, expect: FileId) -> io::Result<Dir>;
 //! pub(crate) fn open_file(parent: &Dir, name: &str, expect: FileId, size: u64)
 //!     -> io::Result<std::fs::File>;
