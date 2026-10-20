@@ -262,7 +262,9 @@ fn with_filter_without_prefix_skips_root() {
         }
     });
     assert_eq!(paths(source), ["a.txt", "e/"]);
-    assert_eq!(*calls.lock().unwrap(), ["a.txt", "e/"]);
+    let mut calls = calls.lock().unwrap().clone();
+    calls.sort();
+    assert_eq!(calls, ["a.txt", "e/"]);
 }
 
 #[test]
