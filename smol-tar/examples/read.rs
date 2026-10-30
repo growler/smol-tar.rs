@@ -2,6 +2,11 @@
 //!
 //! Run: cargo run --example read -- ARCHIVE.tar
 
+// With the tokio feature, smol-tar uses the tokio traits, and the smol main
+// below cannot compile. In that case, a short main writes a message to
+// stderr and exits with status 1.
+#![cfg_attr(feature = "tokio", allow(unused_imports))]
+
 use smol::{
     fs::File,
     io::{copy, sink, BufReader},
@@ -9,6 +14,7 @@ use smol::{
 };
 use smol_tar::{TarEntry, TarReader};
 
+#[cfg(not(feature = "tokio"))]
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1).expect("usage: read ARCHIVE.tar");
     smol::block_on(async {
@@ -28,4 +34,10 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(feature = "tokio")]
+fn main() {
+    eprintln!("this example needs the smol feature without the tokio feature");
+    std::process::exit(1);
 }

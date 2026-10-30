@@ -3,15 +3,18 @@ use std::{
     io::{self, ErrorKind, Result},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex},
-    task::{Context, Poll},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use futures::Sink;
 use futures::{future, SinkExt, TryStreamExt};
+use futures::{FutureExt, Sink};
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
-use smol::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use smol::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite};
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 use smol::{io::Cursor, stream::StreamExt};
 use smol_tar::{
@@ -21,7 +24,7 @@ use smol_tar::{
 #[cfg(feature = "tokio")]
 use std::io::Cursor;
 #[cfg(feature = "tokio")]
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 #[cfg(feature = "tokio")]
 use tokio_stream::StreamExt;
 
@@ -3881,4 +3884,763 @@ fn writer_rejects_nonportable_xattr_names() {
             .to_string()
             .contains("xattr name contains non-portable characters"));
     });
+}
+
+/// Writer that keeps the size of each write.
+struct WriteSizes {
+    sizes: Arc<Mutex<Vec<usize>>>,
+}
+
+impl WriteSizes {
+    fn new() -> (Self, Arc<Mutex<Vec<usize>>>) {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                sizes: sizes.clone(),
+            },
+            sizes,
+        )
+    }
+}
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+impl AsyncWrite for WriteSizes {
+    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+        self.sizes.lock().unwrap().push(buf.len());
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncWrite for WriteSizes {
+    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+        self.sizes.lock().unwrap().push(buf.len());
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Body of `len` bytes.
+fn body_data(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// Archive with the file `a` and the file `b`.
+fn two_file_archive(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
+    block_on_test(async {
+        let (sink, bytes) = VecAsyncWriter::new();
+        let mut writer = TarWriter::new(sink);
+        for (path, body) in [("a", a), ("b", b)] {
+            writer
+                .write(TarRegularFile::new(path, body.len() as u64, body).into())
+                .await?;
+        }
+        writer.finish().await?;
+        let archive = bytes.lock().unwrap().clone();
+        Ok(archive)
+    })
+}
+
+/// Read the next entry of `tar` as a file with the path `path`.
+async fn next_file<'a, R: AsyncRead + 'a>(
+    tar: &mut TarReader<'a, R>,
+    path: &str,
+) -> Result<TarRegularFile<'a, smol_tar::TarRegularFileReader<'a, R>>> {
+    match tar.next().await.transpose()? {
+        Some(TarEntry::File(file)) if file.path() == path => Ok(file),
+        other => panic!("expected file {path}, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_body_buf_read_stops_at_end_of_body() -> Result<()> {
+    let a = body_data(3000);
+    let b = b"next entry\n";
+    let archive = two_file_archive(&a, b)?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut file = next_file(&mut tar, "a").await?;
+        let mut data = Vec::new();
+        loop {
+            let buf = file.fill_buf().await?;
+            if buf.is_empty() {
+                break;
+            }
+            // The source buffer has the full archive. The reader gives only
+            // the bytes of the body.
+            assert!(data.len() + buf.len() <= a.len());
+            let n = buf.len().min(700);
+            data.extend_from_slice(&buf[..n]);
+            file.consume(n);
+        }
+        assert_eq!(data, a);
+        assert!(file.fill_buf().await?.is_empty());
+        let mut file = next_file(&mut tar, "b").await?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).await?;
+        assert_eq!(data, b);
+        drop(file);
+        assert!(tar.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn next_entry_reads_after_partial_consume() -> Result<()> {
+    let a = body_data(3000);
+    let b = b"next entry\n";
+    let archive = two_file_archive(&a, b)?;
+    // `None` drops the file after `fill_buf` without `consume`.
+    for consumed in [None, Some(0), Some(10), Some(a.len())] {
+        block_on_test(async {
+            let mut tar = TarReader::new(Cursor::new(archive.clone()));
+            let mut file = next_file(&mut tar, "a").await?;
+            assert_eq!(file.fill_buf().await?, &a[..]);
+            if let Some(n) = consumed {
+                file.consume(n);
+            }
+            drop(file);
+            let mut file = next_file(&mut tar, "b").await?;
+            let mut data = Vec::new();
+            file.read_to_end(&mut data).await?;
+            assert_eq!(data, b, "consumed {consumed:?}");
+            drop(file);
+            assert!(tar.next().await.is_none());
+            Ok::<_, io::Error>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn file_body_read_continues_after_partial_consume() -> Result<()> {
+    let a = body_data(3000);
+    let archive = two_file_archive(&a, b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut file = next_file(&mut tar, "a").await?;
+        // A read after `fill_buf` without `consume` gives the same data.
+        let mut head = [0; 5];
+        assert_eq!(file.fill_buf().await?.len(), a.len());
+        file.read_exact(&mut head).await?;
+        assert_eq!(head, a[..5]);
+        file.fill_buf().await?;
+        file.consume(10);
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).await?;
+        assert_eq!(data, a[15..]);
+        drop(file);
+        let mut file = next_file(&mut tar, "b").await?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).await?;
+        assert_eq!(data, b"b");
+        Ok(())
+    })
+}
+
+/// Waker that counts its wakeups.
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl WakeCount {
+    fn get(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Poll `fut` one time with a waker that counts its wakeups in `wakes`.
+fn poll_once<F: Future>(fut: F, wakes: &Arc<WakeCount>) -> Poll<F::Output> {
+    let waker = Waker::from(Arc::clone(wakes));
+    std::pin::pin!(fut).poll(&mut Context::from_waker(&waker))
+}
+
+/// Number of clones of the counting waker.
+static CLONES: AtomicUsize = AtomicUsize::new(0);
+/// Number of wakeups of the counting waker.
+static WAKES: AtomicUsize = AtomicUsize::new(0);
+
+// A static gives the vtable one address, so `Waker::will_wake` can match it.
+static COUNTING_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(counting_clone, counting_wake, counting_wake, counting_drop);
+
+fn counting_clone(_: *const ()) -> RawWaker {
+    CLONES.fetch_add(1, Ordering::SeqCst);
+    RawWaker::new(std::ptr::null(), &COUNTING_VTABLE)
+}
+
+fn counting_wake(_: *const ()) {
+    WAKES.fetch_add(1, Ordering::SeqCst);
+}
+
+fn counting_drop(_: *const ()) {}
+
+/// Make a waker that counts its clones in `CLONES` and its wakeups in
+/// `WAKES`. Only one test can use it, because the counters are static.
+fn counting_waker() -> Waker {
+    // SAFETY: The vtable functions ignore the data pointer and change only
+    // static atomics, so the waker is valid on all threads for all time.
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &COUNTING_VTABLE)) }
+}
+
+/// Poll `fut` one time with `waker`.
+fn poll_with<F: Future>(fut: F, waker: &Waker) -> Poll<F::Output> {
+    std::pin::pin!(fut).poll(&mut Context::from_waker(waker))
+}
+
+#[test]
+fn pending_next_clones_same_waker_once() -> Result<()> {
+    let archive = two_file_archive(b"abcdef", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let file = next_file(&mut tar, "a").await?;
+        let waker = counting_waker();
+        for _ in 0..10 {
+            assert!(poll_with(tar.next(), &waker).is_pending());
+        }
+        assert_eq!(CLONES.load(Ordering::SeqCst), 1);
+        assert_eq!(WAKES.load(Ordering::SeqCst), 0);
+        drop(file);
+        assert_eq!(WAKES.load(Ordering::SeqCst), 1);
+        match poll_with(tar.next(), &waker) {
+            Poll::Ready(Some(Ok(entry))) => assert_eq!(entry.path(), "b"),
+            other => panic!("expected file b, got {other:?}"),
+        }
+        // The archive reader takes the returned source without a clone.
+        assert_eq!(CLONES.load(Ordering::SeqCst), 1);
+        assert!(tar.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn next_entry_wakes_when_consume_finishes_the_file() -> Result<()> {
+    let a = body_data(3000);
+    let archive = two_file_archive(&a, b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut file = next_file(&mut tar, "a").await?;
+        // The archive waits until the current body ends.
+        let len = file.fill_buf().now_or_never().unwrap()?.len();
+        assert_eq!(len, a.len());
+        let wakes = Arc::new(WakeCount::default());
+        assert!(poll_once(tar.next(), &wakes).is_pending());
+        file.consume(len);
+        assert!(wakes.get() > 0, "consume does not wake the archive reader");
+        match poll_once(tar.next(), &wakes) {
+            Poll::Ready(Some(Ok(entry))) => assert_eq!(entry.path(), "b"),
+            other => panic!("expected file b, got {other:?}"),
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn exhausted_file_reader_remains_ready_while_next_file_is_active() -> Result<()> {
+    let archive = two_file_archive(b"a", b"body")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut a = next_file(&mut tar, "a").await?;
+        a.read_to_end(&mut Vec::new()).await?;
+        let mut b = next_file(&mut tar, "b").await?;
+        assert_eq!(b.fill_buf().await?, b"body");
+        let wakes = Arc::new(WakeCount::default());
+        assert!(matches!(
+            poll_once(a.read(&mut [0]), &wakes),
+            Poll::Ready(Ok(0))
+        ));
+        assert!(matches!(
+            poll_once(a.fill_buf(), &wakes),
+            Poll::Ready(Ok(b""))
+        ));
+        b.consume(4);
+        assert!(tar.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn empty_read_finishes_zero_size_file() -> Result<()> {
+    let archive = two_file_archive(b"", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut a = next_file(&mut tar, "a").await?;
+        assert_eq!(a.read(&mut []).await?, 0);
+        let wakes = Arc::new(WakeCount::default());
+        match poll_once(tar.next(), &wakes) {
+            Poll::Ready(Some(Ok(entry))) => assert_eq!(entry.path(), "b"),
+            other => panic!("expected file b while file a is alive, got {other:?}"),
+        }
+        drop(a);
+        Ok(())
+    })
+}
+
+/// Source that gives `Poll::Pending` on every other call. It wakes the task
+/// before it gives `Poll::Pending`.
+struct InterleavePending<R> {
+    inner: R,
+    pending: bool,
+}
+
+impl<R> InterleavePending<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pending: false,
+        }
+    }
+
+    /// Give `true` on every other call. Before it gives `true`, wake the task.
+    fn next_is_pending(&mut self, cx: &mut Context<'_>) -> bool {
+        self.pending = !self.pending;
+        if self.pending {
+            cx.waker().wake_by_ref();
+        }
+        self.pending
+    }
+}
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+impl<R: AsyncRead + Unpin> AsyncRead for InterleavePending<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize>> {
+        if self.next_is_pending(cx) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<R: AsyncRead + Unpin> AsyncRead for InterleavePending<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<()>> {
+        if self.next_is_pending(cx) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<R: AsyncBufRead + Unpin> AsyncBufRead for InterleavePending<R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+        let this = self.get_mut();
+        if this.next_is_pending(cx) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_fill_buf(cx)
+    }
+
+    fn consume(mut self: Pin<&mut Self>, amt: usize) {
+        Pin::new(&mut self.inner).consume(amt)
+    }
+}
+
+#[test]
+fn exhausted_file_reader_remains_ready_while_the_source_is_pending() -> Result<()> {
+    let a = body_data(3000);
+    let b = body_data(100);
+    let archive = two_file_archive(&a, &b)?;
+    block_on_test(async {
+        let mut tar = TarReader::new(InterleavePending::new(Cursor::new(archive)));
+        let mut file_a = next_file(&mut tar, "a").await?;
+        let mut data = Vec::new();
+        file_a.read_to_end(&mut data).await?;
+        let mut file_b = next_file(&mut tar, "b").await?;
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut buf = [0; 16];
+        for _ in 0..100 {
+            // The `fill_buf` future of futures-lite calls `poll_fill_buf` two
+            // times and panics if the second call gives `Poll::Pending`. Thus
+            // call `poll_fill_buf` directly.
+            match Pin::new(&mut file_b).poll_fill_buf(&mut Context::from_waker(&waker)) {
+                Poll::Ready(data) => {
+                    assert_eq!(data?, b);
+                    return Ok(());
+                }
+                // The previous file remains at EOF while the source is pending.
+                Poll::Pending => assert!(matches!(
+                    poll_once(file_a.read(&mut buf), &wakes),
+                    Poll::Ready(Ok(0))
+                )),
+            }
+        }
+        panic!("fill_buf gives no data after 100 polls");
+    })
+}
+
+#[test]
+fn writer_writes_body_from_reader_buffer() -> Result<()> {
+    let a = body_data(100_000);
+    let padding = 512 - a.len() % 512;
+    // A `&[u8]` body gives all its data in one buffer.
+    let (sink, sizes) = WriteSizes::new();
+    block_on_test(async {
+        let mut writer = TarWriter::new(sink);
+        writer
+            .write(TarRegularFile::new("a", a.len() as u64, &a[..]).into())
+            .await
+    })?;
+    assert_eq!(*sizes.lock().unwrap(), [512, a.len(), padding]);
+    // The body of a `TarReader` entry comes from the buffer of the source.
+    let archive = two_file_archive(&a, b"b")?;
+    let (sink, sizes) = WriteSizes::new();
+    block_on_test(async {
+        let mut writer = TarWriter::new(sink);
+        let mut entries = TarReader::new(Cursor::new(archive))
+            .try_filter(|entry| future::ready(entry.path() == "a"));
+        writer.send_all(&mut entries).await?;
+        writer.close().await
+    })?;
+    assert_eq!(*sizes.lock().unwrap(), [512, a.len(), padding, 1024]);
+    Ok(())
+}
+
+#[test]
+fn cancelled_next_does_not_block_current_file() -> Result<()> {
+    let archive = two_file_archive(b"abcdef", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut file = next_file(&mut tar, "a").await?;
+        assert_eq!(file.fill_buf().await?, b"abcdef");
+        let next_wakes = Arc::new(WakeCount::default());
+        assert!(poll_once(tar.next(), &next_wakes).is_pending());
+        // The temporary next() future has now been dropped.
+        file.consume(1);
+        let file_wakes = Arc::new(WakeCount::default());
+        assert!(
+            matches!(
+                poll_once(file.fill_buf(), &file_wakes),
+                Poll::Ready(Ok(b"bcdef"))
+            ),
+            "cancelled next() prevents current file from continuing"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn body_completion_wakes_archive_waiter() -> Result<()> {
+    let archive = two_file_archive(b"abcdef", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut file = next_file(&mut tar, "a").await?;
+        assert_eq!(file.fill_buf().await?, b"abcdef");
+        let next_wakes = Arc::new(WakeCount::default());
+        assert!(poll_once(tar.next(), &next_wakes).is_pending());
+        file.consume(1);
+        assert!(poll_once(tar.next(), &next_wakes).is_pending());
+        let before = next_wakes.get();
+        let file_wakes = Arc::new(WakeCount::default());
+        assert!(matches!(
+            poll_once(file.fill_buf(), &file_wakes),
+            Poll::Ready(Ok(b"bcdef"))
+        ));
+        file.consume(5);
+        assert!(
+            next_wakes.get() > before,
+            "completion wakes file task but not waiting archive task"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn repeated_consume_advances_each_time() -> Result<()> {
+    let archive = two_file_archive(b"abcdef", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut file = next_file(&mut tar, "a").await?;
+        assert_eq!(file.fill_buf().await?, b"abcdef");
+        file.consume(1);
+        file.consume(1);
+        assert_eq!(file.fill_buf().await?, b"cdef");
+        Ok(())
+    })
+}
+
+#[test]
+fn dropping_file_wakes_latest_archive_waiter() -> Result<()> {
+    let archive = two_file_archive(b"abcdef", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(InterleavePending::new(Cursor::new(archive)));
+        let mut file = next_file(&mut tar, "a").await?;
+        let file_wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(file_wakes);
+        assert!(Pin::new(&mut file)
+            .poll_fill_buf(&mut Context::from_waker(&waker))
+            .is_pending());
+        let first = Arc::new(WakeCount::default());
+        let latest = Arc::new(WakeCount::default());
+        assert!(poll_once(tar.next(), &first).is_pending());
+        assert!(poll_once(tar.next(), &latest).is_pending());
+        drop(file);
+        assert_eq!(first.get(), 0);
+        assert_eq!(latest.get(), 1);
+        let mut b = next_file(&mut tar, "b").await?;
+        let mut data = Vec::new();
+        b.read_to_end(&mut data).await?;
+        assert_eq!(data, b"b");
+        assert!(tar.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn empty_file_fill_buf_wakes_archive_waiter() -> Result<()> {
+    let archive = two_file_archive(b"", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut file = next_file(&mut tar, "a").await?;
+        let wakes = Arc::new(WakeCount::default());
+        assert!(poll_once(tar.next(), &wakes).is_pending());
+        assert!(file.fill_buf().await?.is_empty());
+        assert_eq!(wakes.get(), 1);
+        let b = next_file(&mut tar, "b").await?;
+        assert!(file.fill_buf().await?.is_empty());
+        drop(file);
+        drop(b);
+        assert!(tar.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn empty_read_preserves_body_and_full_read_wakes_archive() -> Result<()> {
+    let archive = two_file_archive(b"abcdef", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut file = next_file(&mut tar, "a").await?;
+        let wakes = Arc::new(WakeCount::default());
+        assert!(poll_once(tar.next(), &wakes).is_pending());
+        assert_eq!(file.read(&mut []).await?, 0);
+        assert_eq!(wakes.get(), 0);
+        let mut data = [0; 6];
+        file.read_exact(&mut data).await?;
+        assert_eq!(&data, b"abcdef");
+        assert_eq!(wakes.get(), 1);
+        let b = next_file(&mut tar, "b").await?;
+        assert_eq!(file.read(&mut data).await?, 0);
+        drop(b);
+        assert!(tar.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn file_fill_buf_reports_truncated_body() -> Result<()> {
+    let mut archive = two_file_archive(b"abcdef", b"b")?;
+    archive.truncate(BLOCK_SIZE + 3);
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let mut file = next_file(&mut tar, "a").await?;
+        assert_eq!(file.fill_buf().await?, b"abc");
+        file.consume(3);
+        assert_eq!(
+            file.fill_buf().await.unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        let wakes = Arc::new(WakeCount::default());
+        assert!(poll_once(tar.next(), &wakes).is_pending());
+        drop(file);
+        assert_eq!(wakes.get(), 1);
+        assert_eq!(
+            tar.next().await.unwrap().unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        Ok(())
+    })
+}
+
+pin_project_lite::pin_project! {
+    /// Source that checks its address on each operation and stays on one thread.
+    struct PinnedSource<R> {
+        #[pin]
+        inner: R,
+        address: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+        #[pin]
+        _pin: std::marker::PhantomPinned,
+    }
+}
+
+impl<R> PinnedSource<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            address: std::rc::Rc::new(std::cell::Cell::new(None)),
+            _pin: std::marker::PhantomPinned,
+        }
+    }
+
+    fn check_address(&self) {
+        let address = std::ptr::from_ref(self) as usize;
+        if let Some(previous) = self.address.replace(Some(address)) {
+            assert_eq!(address, previous, "the source moved after its first poll");
+        }
+    }
+}
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+impl<R: AsyncRead> AsyncRead for PinnedSource<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize>> {
+        self.as_ref().get_ref().check_address();
+        self.project().inner.poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<R: AsyncRead> AsyncRead for PinnedSource<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<()>> {
+        self.as_ref().get_ref().check_address();
+        self.project().inner.poll_read(cx, buf)
+    }
+}
+
+impl<R: AsyncBufRead> AsyncBufRead for PinnedSource<R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+        self.as_ref().get_ref().check_address();
+        self.project().inner.poll_fill_buf(cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        self.as_ref().get_ref().check_address();
+        self.project().inner.consume(amt);
+    }
+}
+
+#[test]
+fn pinned_local_source_survives_transfers_and_archive_drop() -> Result<()> {
+    static_assertions::assert_not_impl_any!(PinnedSource<Cursor<Vec<u8>>>: Unpin, Send, Sync);
+    let archive = two_file_archive(b"abcdef", b"body")?;
+    block_on_test(async {
+        let source = PinnedSource::new(Cursor::new(archive.as_slice()));
+        let mut tar = TarReader::new(source);
+        let mut a = next_file(&mut tar, "a").await?;
+        assert_eq!(a.fill_buf().await?, b"abcdef");
+        a.consume(1);
+        let mut data = Vec::new();
+        a.read_to_end(&mut data).await?;
+        assert_eq!(data, b"bcdef");
+        let mut b = next_file(&mut tar, "b").await?;
+        // Dropping either handle must leave the active file usable.
+        drop(a);
+        drop(tar);
+        assert_eq!(b.fill_buf().await?, b"body");
+        b.consume(2);
+        b.consume(2);
+        assert!(b.fill_buf().await?.is_empty());
+        Ok(())
+    })
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for InterleavePending<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize>> {
+        if self.next_is_pending(cx) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    #[cfg(all(feature = "smol", not(feature = "tokio")))]
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.inner).poll_close(cx)
+    }
+
+    #[cfg(feature = "tokio")]
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[test]
+fn buffered_entries_feed_writer_with_pending_reads_and_short_writes() -> Result<()> {
+    let a = body_data(1003);
+    let b = body_data(51);
+    let archive = two_file_archive(&a, &b)?;
+    block_on_test(async {
+        let source = InterleavePending::new(Cursor::new(archive));
+        #[cfg(all(feature = "smol", not(feature = "tokio")))]
+        let source = smol::io::BufReader::with_capacity(17, source);
+        #[cfg(feature = "tokio")]
+        let source = tokio::io::BufReader::with_capacity(17, source);
+        let mut entries = TarReader::new(source);
+        let (sink, bytes) = ChunkedAsyncWriter::new(3);
+        let mut writer = TarWriter::new(InterleavePending::new(sink));
+        writer.send_all(&mut entries).await?;
+        writer.close().await?;
+        let archive = bytes.lock().unwrap().clone();
+        let mut tar = TarReader::new(Cursor::new(archive));
+        for (path, body) in [("a", a), ("b", b)] {
+            let mut file = next_file(&mut tar, path).await?;
+            let mut data = Vec::new();
+            file.read_to_end(&mut data).await?;
+            assert_eq!(data, body);
+        }
+        assert!(tar.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn invalid_file_mode_does_not_leave_an_active_file() -> Result<()> {
+    let mut header = build_header(b"bad-mode", b'0', 0, HeaderFlavor::Ustar);
+    set_bytes(&mut header, MODE_START, 8, b"invalid");
+    finalize_checksum(&mut header);
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(header.to_vec()));
+        assert_eq!(
+            tar.next().await.unwrap().unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        let wakes = Arc::new(WakeCount::default());
+        assert!(matches!(
+            poll_once(tar.next(), &wakes),
+            Poll::Ready(Some(Err(_)))
+        ));
+        Ok(())
+    })
 }

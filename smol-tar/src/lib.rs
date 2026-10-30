@@ -30,12 +30,12 @@
 //!
 //! ```toml
 //! [dependencies]
-//! smol-tar = "0.1"
+//! smol-tar = "0.2"
 //! ```
 //!
 //! ```toml
 //! [dependencies]
-//! smol-tar = { version = "0.1", default-features = false, features = ["tokio"] }
+//! smol-tar = { version = "0.2", default-features = false, features = ["tokio"] }
 //! ```
 //!
 //! Reading an archive:
@@ -211,9 +211,17 @@
 //! # Buffering
 //!
 //! [`TarReader`] does not buffer the source. Wrap a file or a socket in a
-//! `BufReader`. [`TarWriter`] writes the header, each part of the body (up
-//! to 16 KiB), and the padding of each entry as separate writes. To decrease
-//! the number of writes to a file or a socket, wrap it in a `BufWriter`.
+//! `BufReader`.
+//!
+//! [`TarWriter`] gets the file bodies as [`AsyncBufRead`]. It writes the data
+//! from the buffer of the body reader directly to the sink. Thus the size of
+//! each body write is the size of the data that the body reader gives. Wrap
+//! a body that implements only [`AsyncRead`], for example a file, in a
+//! `BufReader`.
+//!
+//! [`TarWriter`] writes the header, each part of the body, and the padding
+//! of each entry as separate writes. To decrease the number of writes to a
+//! file or a socket, wrap it in a `BufWriter`.
 //!
 //! # Filesystem
 //!
@@ -223,9 +231,11 @@
 //!
 //! # Feature flags
 //!
-//! - `smol` (default): use the `futures-io` traits `AsyncRead` and
-//!   `AsyncWrite`. `smol` and other `futures`-based runtimes use these traits.
-//! - `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`.
+//! - `smol` (default): use the `futures-io` traits `AsyncRead`,
+//!   `AsyncBufRead` and `AsyncWrite`. `smol` and other `futures`-based
+//!   runtimes use these traits.
+//! - `tokio`: use the `tokio::io` traits `AsyncRead`, `AsyncBufRead` and
+//!   `AsyncWrite`.
 //! - `futures`: add the `futures` crate as a dependency. The library code does
 //!   not use it.
 //!
@@ -264,33 +274,25 @@
 #[cfg(not(any(feature = "smol", feature = "tokio")))]
 compile_error!("either feature `smol` or `tokio` must be enabled");
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use {
     futures_core::stream::Stream,
     futures_sink::Sink,
     pin_project_lite::pin_project,
     std::{
-        future::{poll_fn, Future},
+        future::poll_fn,
         io::{Error, ErrorKind, Result},
         pin::{pin, Pin},
         str::from_utf8,
-        sync::Arc,
+        sync::{Arc, Mutex},
         task::{self, Context, Poll},
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
 };
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
-use {
-    async_lock::Mutex,
-    futures_io::{AsyncRead, AsyncWrite},
-};
+use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 #[cfg(feature = "tokio")]
-use {
-    tokio::io::{AsyncRead, AsyncWrite, ReadBuf},
-    tokio::sync::Mutex,
-};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 const BLOCK_SIZE: usize = 512;
 const SKIP_BUFFER_SIZE: usize = 64 * 1024;
@@ -337,56 +339,100 @@ fn poll_close_compat<W: AsyncWrite + ?Sized>(
     writer.poll_shutdown(cx)
 }
 
-fn poll_regular_file_reader<'a, R: AsyncRead>(
-    this: Pin<&mut TarRegularFileReader<'a, R>>,
+fn poll_regular_file_reader<R: AsyncRead>(
+    this: Pin<&mut TarRegularFileReader<'_, R>>,
     ctx: &mut Context<'_>,
     buf: &mut [u8],
 ) -> Poll<Result<usize>> {
     let this = this.get_mut();
-    let eof = this.eof;
-    let fut = this.inner.rdr.lock();
-    let mut g = task::ready!(pin!(fut).poll(ctx));
-    let inner_pin: Pin<&mut TarReaderInner<'a, R>> = g.as_mut();
-    let inner = inner_pin.project();
-    let n;
-    if *inner.pos > eof || (*inner.pos == eof && !matches!(*inner.state, Entry)) {
+    let Some(core) = this.core.get_mut().unwrap().as_mut() else {
         return Poll::Ready(Ok(0));
-    } else if *inner.pos < eof {
-        let remain = *inner.nxt - *inner.pos;
-        n = if remain > 0 {
-            let size = std::cmp::min(remain, buf.len() as u64);
-            let n = task::ready!(poll_read_compat(
-                pin!(inner.reader),
-                ctx,
-                &mut buf[0..size as usize]
-            ))?;
-            if n == 0 {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "unexpected EOF while reading archive file",
-                )));
-            }
-            n
-        } else {
-            0
-        };
-        *inner.pos += n as u64;
-        if (n as u64) < remain {
-            return Poll::Ready(Ok(n));
-        }
-    } else {
-        n = 0;
     };
-    ctx.waker().wake_by_ref();
-    let nxt = padded_size(*inner.nxt);
-    if *inner.pos == nxt {
-        *inner.nxt = nxt + BLOCK_SIZE as u64;
-        *inner.state = Header;
+    let inner = core.as_mut().project();
+    let remain = *inner.nxt - *inner.pos;
+    let n = if remain == 0 {
+        0
+    } else if buf.is_empty() {
+        return Poll::Ready(Ok(0));
     } else {
-        *inner.nxt = nxt;
-        *inner.state = Padding;
+        let len = std::cmp::min(remain, buf.len() as u64) as usize;
+        let n = task::ready!(poll_read_compat(inner.reader, ctx, &mut buf[..len]))?;
+        if n == 0 {
+            return Poll::Ready(Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "unexpected EOF while reading archive file",
+            )));
+        }
+        *inner.pos += n as u64;
+        n
+    };
+    if *inner.pos == *inner.nxt {
+        end_regular_file(*inner.pos, inner.nxt, inner.state);
+        this.return_core();
     }
     Poll::Ready(Ok(n))
+}
+
+/// Move the reader from the end of a file body to its padding or to the
+/// next header.
+fn end_regular_file(pos: u64, nxt: &mut u64, state: &mut State) {
+    let padded = padded_size(*nxt);
+    if pos == padded {
+        *nxt = padded + BLOCK_SIZE as u64;
+        *state = Header;
+    } else {
+        *nxt = padded;
+        *state = Padding;
+    }
+}
+
+/// Borrow the source buffer up to the end of the current file body.
+fn poll_regular_file_fill_buf<'s, 'a, R: AsyncBufRead>(
+    this: Pin<&'s mut TarRegularFileReader<'a, R>>,
+    ctx: &mut Context<'_>,
+) -> Poll<Result<&'s [u8]>> {
+    let this = this.get_mut();
+    let Some(core) = this.core.get_mut().unwrap().as_mut() else {
+        return Poll::Ready(Ok(&[]));
+    };
+    let remain = core.nxt - core.pos;
+    if remain == 0 {
+        let inner = core.as_mut().project();
+        end_regular_file(*inner.pos, inner.nxt, inner.state);
+        this.return_core();
+        return Poll::Ready(Ok(&[]));
+    }
+    // Borrow again after the EOF branch, which can transfer the reader.
+    let core = this.core.get_mut().unwrap().as_mut().unwrap();
+    let inner = core.as_mut().project();
+    match inner.reader.poll_fill_buf(ctx) {
+        Poll::Ready(Ok([])) => Poll::Ready(Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "unexpected EOF while reading archive file",
+        ))),
+        Poll::Ready(Ok(buf)) => {
+            let len = std::cmp::min(remain, buf.len() as u64) as usize;
+            Poll::Ready(Ok(&buf[..len]))
+        }
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+/// Advance within the file body and return the reader at the end.
+fn regular_file_consume<R: AsyncBufRead>(this: Pin<&mut TarRegularFileReader<'_, R>>, amt: usize) {
+    let this = this.get_mut();
+    let Some(core) = this.core.get_mut().unwrap().as_mut() else {
+        return;
+    };
+    let inner = core.as_mut().project();
+    let amt = std::cmp::min(amt as u64, *inner.nxt - *inner.pos);
+    inner.reader.consume(amt as usize);
+    *inner.pos += amt;
+    if *inner.pos == *inner.nxt {
+        end_regular_file(*inner.pos, inner.nxt, inner.state);
+        this.return_core();
+    }
 }
 
 macro_rules! ready_opt {
@@ -469,17 +515,10 @@ impl Header {
             })
     }
     fn calculated_checksum(&self) -> u32 {
-        self.record
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| {
-                if (148..156).contains(&index) {
-                    u32::from(b' ')
-                } else {
-                    u32::from(*byte)
-                }
-            })
-            .sum()
+        // The checksum field (bytes 148..156) counts as eight spaces. Two
+        // plain sums compile to vector code.
+        let sum = |bytes: &[u8]| bytes.iter().map(|&b| u32::from(b)).sum::<u32>();
+        sum(&self.record[..148]) + 8 * u32::from(b' ') + sum(&self.record[156..])
     }
     fn validate_checksum(&self) -> Result<()> {
         let expected = self.checksum()?;
@@ -864,7 +903,6 @@ enum Entry {
     File {
         path_name: Box<str>,
         size: u64,
-        eof: u64,
         mode: u32,
         uid: u32,
         gid: u32,
@@ -1118,9 +1156,15 @@ pin_project! {
     }
 }
 
-struct TarReaderGuard<'a, R: AsyncRead + 'a> {
-    pos: AtomicU64,
-    rdr: Mutex<Pin<Box<TarReaderInner<'a, R>>>>,
+/// Reader state that moves between the archive and its current file.
+/// Moving the pinned box keeps the source at the same address.
+type ReaderCore<'a, R> = Pin<Box<TarReaderInner<'a, R>>>;
+
+/// The file returns its reader here at EOF or drop. The archive registers
+/// its waker under the same lock, so a return cannot miss the waiter.
+struct ReturnedReader<'a, R> {
+    core: Option<ReaderCore<'a, R>>,
+    waiter: Option<task::Waker>,
 }
 
 /// Async reader for the body of the current regular-file entry.
@@ -1129,15 +1173,44 @@ struct TarReaderGuard<'a, R: AsyncRead + 'a> {
 /// [`TarEntry::File`] values. If you drop the reader before reaching EOF, the
 /// archive reader skips the remaining bytes for that file so iteration can
 /// carry on with the next entry.
+///
+/// The file owns the source reader until its body ends or the file is dropped.
+/// Either event wakes the task that awaits the next archive entry.
+///
+/// The reader implements [`AsyncBufRead`] when the source of the
+/// [`TarReader`] implements it. [`TarWriter`] needs this to write the entries
+/// of a [`TarReader`].
 pub struct TarRegularFileReader<'a, R: AsyncRead + 'a> {
-    eof: u64,
-    inner: Arc<TarReaderGuard<'a, R>>,
+    returned: Arc<Mutex<ReturnedReader<'a, R>>>,
+    // Only get_mut accesses this mutex. It preserves Sync for Send sources
+    // without a lock on the read path. None means the file has finished.
+    core: Mutex<Option<ReaderCore<'a, R>>>,
+}
+
+impl<R: AsyncRead> TarRegularFileReader<'_, R> {
+    /// Return the source and wake the archive. An unfinished body must be skipped.
+    fn return_core(&mut self) {
+        let Some(mut core) = self.core.get_mut().unwrap().take() else {
+            return;
+        };
+        if matches!(core.state, Entry) {
+            *core.as_mut().project().state = SkipEntry;
+        }
+        let wake = {
+            let mut slot = self.returned.lock().unwrap();
+            assert!(slot.core.is_none());
+            slot.core = Some(core);
+            slot.waiter.take()
+        };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+    }
 }
 
 impl<R: AsyncRead> Drop for TarRegularFileReader<'_, R> {
     fn drop(&mut self) {
-        let inner = self.inner.clone();
-        inner.pos.fetch_max(self.eof + 1, Ordering::Release);
+        self.return_core();
     }
 }
 
@@ -1170,11 +1243,25 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
     }
 }
 
+/// The buffer comes directly from the source and ends at the file boundary.
+/// The file owns the source until the body ends or the file reader is dropped.
+impl<'a, R: AsyncBufRead> AsyncBufRead for TarRegularFileReader<'a, R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+        poll_regular_file_fill_buf(self, ctx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        regular_file_consume(self, amt)
+    }
+}
+
 /// Streaming tar reader over an [`AsyncRead`] source.
 ///
 /// The reader implements [`Stream`] and yields [`TarEntry`] values one at a
 /// time. File entries remain streaming; to continue past a
 /// [`TarEntry::File`] entry, either read the file body to the end or drop it.
+/// Until then, a poll for the next entry registers a waker and returns `Pending`.
+/// Canceling that wait does not prevent further reads of the current file.
 ///
 /// The stream ends after the two zero blocks that end the archive.
 ///
@@ -1264,17 +1351,21 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 /// ```
 #[doc(alias = "Archive")]
 pub struct TarReader<'a, R: AsyncRead + 'a> {
-    inner: Arc<TarReaderGuard<'a, R>>,
+    returned: Arc<Mutex<ReturnedReader<'a, R>>>,
+    // As in the file reader, get_mut preserves Sync without locking.
+    // None means the current file owns the source or has returned it.
+    core: Mutex<Option<ReaderCore<'a, R>>>,
 }
 
 impl<'a, R: AsyncRead + 'a> TarReader<'a, R> {
     /// Construct a streaming reader that yields [`TarEntry`] values.
     pub fn new(r: R) -> Self {
         Self {
-            inner: Arc::new(TarReaderGuard {
-                pos: AtomicU64::new(0),
-                rdr: Mutex::new(Box::pin(TarReaderInner::new(r))),
-            }),
+            returned: Arc::new(Mutex::new(ReturnedReader {
+                core: None,
+                waiter: None,
+            })),
+            core: Mutex::new(Some(Box::pin(TarReaderInner::new(r)))),
         }
     }
 }
@@ -2239,7 +2330,8 @@ pin_project! {
     ///
     /// Values of this type are yielded by [`TarReader`] and can also be built
     /// manually for [`TarWriter`]. The type implements [`AsyncRead`] so callers
-    /// can stream file contents.
+    /// can stream file contents. It implements [`AsyncBufRead`] when the body
+    /// reader implements it.
     pub struct TarRegularFile<'a, R> {
         path_name: Box<str>,
         size: u64,
@@ -2806,7 +2898,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
     fn poll_read_header(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
-    ) -> Poll<Option<Result<(Entry, u64)>>> {
+    ) -> Poll<Option<Result<Entry>>> {
         let mut this = self.project();
         loop {
             match this.state {
@@ -2849,6 +2941,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             let info = take_pax_info(this.exts, this.globs)?;
                             let path_name = entry_path(this.header, info.path.clone())?;
                             let size = effective_size(this.header, info.size)?;
+                            let mode = this.header.mode()?;
                             let uid = effective_uid(this.header, info.uid)?;
                             let gid = effective_gid(this.header, info.gid)?;
                             let times = effective_times(this.header, &info)?;
@@ -2857,20 +2950,17 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             Ok(if path_name.ends_with('/') && this.header.is_old() {
                                 *this.nxt += BLOCK_SIZE as u64;
                                 *this.state = Header;
-                                (
-                                    Entry::Directory(TarDirectory {
-                                        size,
-                                        mode: this.header.mode()?,
-                                        uid,
-                                        gid,
-                                        uname,
-                                        gname,
-                                        times,
-                                        path_name,
-                                        attrs: info.attrs,
-                                    }),
-                                    *this.pos,
-                                )
+                                Entry::Directory(TarDirectory {
+                                    size,
+                                    mode,
+                                    uid,
+                                    gid,
+                                    uname,
+                                    gname,
+                                    times,
+                                    path_name,
+                                    attrs: info.attrs,
+                                })
                             } else {
                                 *this.nxt = this.nxt.checked_add(size).ok_or_else(|| {
                                     Error::new(
@@ -2879,21 +2969,17 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                     )
                                 })?;
                                 *this.state = Entry;
-                                (
-                                    Entry::File {
-                                        size,
-                                        mode: this.header.mode()?,
-                                        uid,
-                                        gid,
-                                        uname,
-                                        gname,
-                                        times,
-                                        eof: *this.nxt,
-                                        path_name,
-                                        attrs: info.attrs,
-                                    },
-                                    *this.pos,
-                                )
+                                Entry::File {
+                                    size,
+                                    mode,
+                                    uid,
+                                    gid,
+                                    uname,
+                                    gname,
+                                    times,
+                                    path_name,
+                                    attrs: info.attrs,
+                                }
                             })
                         }
                         Kind::Directory => {
@@ -2907,20 +2993,17 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
                             let path_name = entry_path(this.header, info.path)?;
-                            Ok((
-                                Entry::Directory(TarDirectory {
-                                    size,
-                                    mode: this.header.mode()?,
-                                    uid,
-                                    gid,
-                                    uname,
-                                    gname,
-                                    times,
-                                    path_name,
-                                    attrs: info.attrs,
-                                }),
-                                *this.pos,
-                            ))
+                            Ok(Entry::Directory(TarDirectory {
+                                size,
+                                mode: this.header.mode()?,
+                                uid,
+                                gid,
+                                uname,
+                                gname,
+                                times,
+                                path_name,
+                                attrs: info.attrs,
+                            }))
                         }
                         Kind::Fifo => {
                             let info = take_pax_info(this.exts, this.globs)?;
@@ -2932,19 +3015,16 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
                             let path_name = entry_path(this.header, info.path)?;
-                            Ok((
-                                Entry::Fifo(TarFifo {
-                                    path_name,
-                                    mode: this.header.mode()?,
-                                    uid,
-                                    gid,
-                                    uname,
-                                    gname,
-                                    times,
-                                    attrs: info.attrs,
-                                }),
-                                *this.pos,
-                            ))
+                            Ok(Entry::Fifo(TarFifo {
+                                path_name,
+                                mode: this.header.mode()?,
+                                uid,
+                                gid,
+                                uname,
+                                gname,
+                                times,
+                                attrs: info.attrs,
+                            }))
                         }
                         Kind::CharDevice | Kind::BlockDevice => {
                             let info = take_pax_info(this.exts, this.globs)?;
@@ -2956,26 +3036,23 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
                             let path_name = entry_path(this.header, info.path)?;
-                            Ok((
-                                Entry::Device(TarDevice {
-                                    path_name,
-                                    mode: this.header.mode()?,
-                                    uid,
-                                    gid,
-                                    uname,
-                                    gname,
-                                    times,
-                                    kind: match kind {
-                                        Kind::CharDevice => DeviceKind::Char,
-                                        Kind::BlockDevice => DeviceKind::Block,
-                                        _ => unreachable!(),
-                                    },
-                                    major: this.header.dev_major()?,
-                                    minor: this.header.dev_minor()?,
-                                    attrs: info.attrs,
-                                }),
-                                *this.pos,
-                            ))
+                            Ok(Entry::Device(TarDevice {
+                                path_name,
+                                mode: this.header.mode()?,
+                                uid,
+                                gid,
+                                uname,
+                                gname,
+                                times,
+                                kind: match kind {
+                                    Kind::CharDevice => DeviceKind::Char,
+                                    Kind::BlockDevice => DeviceKind::Block,
+                                    _ => unreachable!(),
+                                },
+                                major: this.header.dev_major()?,
+                                minor: this.header.dev_minor()?,
+                                attrs: info.attrs,
+                            }))
                         }
                         Kind::Link => {
                             let info = take_pax_info(this.exts, this.globs)?;
@@ -2997,13 +3074,10 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                 })?;
                                 *this.state = SkipEntry;
                             }
-                            Ok((
-                                Entry::Link(TarLink {
-                                    path_name,
-                                    link_name,
-                                }),
-                                *this.pos,
-                            ))
+                            Ok(Entry::Link(TarLink {
+                                path_name,
+                                link_name,
+                            }))
                         }
                         Kind::Symlink => {
                             let info = take_pax_info(this.exts, this.globs)?;
@@ -3027,20 +3101,17 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             *this.state = Header;
                             let (path_name, link_name) =
                                 entry_path_link(this.header, info.path, info.linkpath)?;
-                            Ok((
-                                Entry::Symlink(TarSymlink {
-                                    mode: this.header.mode()?,
-                                    uid,
-                                    gid,
-                                    uname,
-                                    gname,
-                                    times,
-                                    path_name,
-                                    link_name,
-                                    attrs: info.attrs,
-                                }),
-                                *this.pos,
-                            ))
+                            Ok(Entry::Symlink(TarSymlink {
+                                mode: this.header.mode()?,
+                                uid,
+                                gid,
+                                uname,
+                                gname,
+                                times,
+                                path_name,
+                                link_name,
+                                attrs: info.attrs,
+                            }))
                         }
                         Kind::PAXLocal | Kind::PAXGlobal if this.header.is_ustar() => {
                             let size = this.header.size().and_then(|size| {
@@ -3205,9 +3276,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                     continue;
                 }
                 Entry => {
-                    // there is a file entry that must be either dropped or
-                    // read fully to move further
-                    return Poll::Pending;
+                    unreachable!("the active file owns the reader");
                 }
                 SkipEntry => {
                     // skipping a entry
@@ -3290,26 +3359,32 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
 
 impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
     type Item = Result<TarEntry<'a, TarRegularFileReader<'a, R>>>;
-    fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.as_mut();
-        let fut = this.inner.rdr.lock();
-        let mut g = task::ready!(pin!(fut).poll(ctx));
-        let mut inner: Pin<&mut TarReaderInner<R>> = g.as_mut();
-        // this may hit badly if someone ever try to use TarReader and
-        // TarRegularFileReader in different treads. hopefully, no one
-        // in sane mind would ever do that
-        let guard_pos = this.inner.pos.load(Ordering::Acquire);
-        if matches!(inner.state, Entry) && inner.pos < guard_pos {
-            let this = inner.as_mut().project();
-            *this.state = SkipEntry;
-        }
-        let (entry, pos) = {
-            match inner.poll_read_header(ctx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
-                Poll::Ready(Some(Ok(data))) => data,
+    fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let local = this.core.get_mut().unwrap();
+        if local.is_none() {
+            // A changed waker is cloned under the lock. The old waker drops
+            // outside the lock.
+            let mut slot = this.returned.lock().unwrap();
+            match slot.core.take() {
+                Some(core) => *local = Some(core),
+                None => {
+                    let previous = match &slot.waiter {
+                        Some(waiter) if waiter.will_wake(ctx.waker()) => None,
+                        _ => slot.waiter.replace(ctx.waker().clone()),
+                    };
+                    drop(slot);
+                    drop(previous);
+                    return Poll::Pending;
+                }
             }
+        }
+        let inner = local.as_mut().unwrap().as_mut();
+        let entry = match inner.poll_read_header(ctx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+            Poll::Ready(Some(Ok(data))) => data,
         };
         Poll::Ready(Some(Ok(match entry {
             Entry::File {
@@ -3320,28 +3395,24 @@ impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
                 uname,
                 gname,
                 times,
-                eof,
                 path_name,
                 attrs,
-            } => {
-                this.inner.pos.store(pos, Ordering::Release);
-                TarEntry::File(TarRegularFile {
-                    path_name,
-                    size,
-                    mode,
-                    uid,
-                    gid,
-                    uname,
-                    gname,
-                    times,
-                    attrs,
-                    inner: TarRegularFileReader {
-                        eof,
-                        inner: Arc::clone(&this.inner),
-                    },
-                    marker: std::marker::PhantomData,
-                })
-            }
+            } => TarEntry::File(TarRegularFile {
+                path_name,
+                size,
+                mode,
+                uid,
+                gid,
+                uname,
+                gname,
+                times,
+                attrs,
+                inner: TarRegularFileReader {
+                    returned: Arc::clone(&this.returned),
+                    core: Mutex::new(local.take()),
+                },
+                marker: std::marker::PhantomData,
+            }),
             Entry::Directory(d) => TarEntry::Directory(d),
             Entry::Link(l) => TarEntry::Link(l),
             Entry::Symlink(l) => TarEntry::Symlink(l),
@@ -3393,6 +3464,16 @@ impl<'a, R: AsyncRead + 'a> AsyncRead for TarRegularFile<'a, R> {
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl<'a, R: AsyncBufRead + 'a> AsyncBufRead for TarRegularFile<'a, R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+        self.project().inner.poll_fill_buf(ctx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        self.project().inner.consume(amt)
     }
 }
 
@@ -3809,9 +3890,12 @@ fn format_octal(val: u64, field: &mut [u8]) -> std::io::Result<()> {
 pin_project! {
     /// Streaming tar writer that implements [`Sink`] for [`TarEntry`] values.
     ///
-    /// The writer keeps headers and file data in a fixed 16 KiB buffer inside
-    /// the struct until the output writer accepts them. Each entry starts on a
-    /// 512-byte block boundary.
+    /// The writer keeps headers and padding in a fixed 16 KiB buffer inside
+    /// the struct until the output writer accepts them. It writes the file
+    /// data from the buffer of the body reader, so the body type `R` must
+    /// implement [`AsyncBufRead`]. Wrap a body that implements only
+    /// [`AsyncRead`] in a `BufReader`. Each entry starts on a 512-byte block
+    /// boundary.
     ///
     /// The writer also has inherent methods, so you can use it without the
     /// `futures` crate. Use [`TarWriter::write`] to write each entry. When all
@@ -3857,7 +3941,7 @@ pin_project! {
     /// ```
     #[doc(alias = "Builder")]
     pub struct TarWriter<'a, 'b, W, R> {
-        // internal buffer for writing headers and file data
+        // internal buffer for writing headers and padding
         buf: [u8; BLOCK_SIZE * 32],
         // length of valid data in the buffer
         len: usize,
@@ -3879,7 +3963,7 @@ pin_project! {
     }
 }
 
-impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> TarWriter<'a, 'b, W, R> {
+impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b, W, R> {
     /// Create a writer that targets the provided [`AsyncWrite`] sink.
     pub fn new(writer: W) -> Self {
         Self {
@@ -3994,16 +4078,23 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> TarWriter<'a, 'b, W,
                         return Poll::Ready(Ok(()));
                     }
                 }
-                let buf_len = std::cmp::min(this.buf.len() as u64, remain) as usize;
-                let n = task::ready!(poll_read_compat(pin!(reader), cx, &mut this.buf[..buf_len]))?;
-                if n == 0 {
+                let data = task::ready!(Pin::new(&mut *reader).poll_fill_buf(cx))?;
+                if data.is_empty() {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "unexpected EOF while reading file",
                     )));
                 }
-                *this.pos = 0;
-                *this.len = n;
+                let len = std::cmp::min(data.len() as u64, remain) as usize;
+                let n = task::ready!(this.writer.as_mut().poll_write(cx, &data[..len]))?;
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "error writing buffer",
+                    )));
+                }
+                Pin::new(reader).consume(n);
+                *this.total += n as u64;
                 continue;
             } else {
                 return Poll::Ready(Ok(()));
@@ -4012,7 +4103,7 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> TarWriter<'a, 'b, W,
     }
 }
 
-impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> Sink<TarEntry<'b, R>>
+impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> Sink<TarEntry<'b, R>>
     for TarWriter<'a, 'b, W, R>
 {
     type Error = std::io::Error;
@@ -4067,7 +4158,10 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> Sink<TarEntry<'b, R>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use static_assertions::{assert_eq_align, assert_eq_size, assert_impl_all, assert_obj_safe};
+    use static_assertions::{
+        assert_eq_align, assert_eq_size, assert_impl_all, assert_not_impl_any, assert_obj_safe,
+    };
+    use std::rc::Rc;
 
     #[cfg(all(feature = "smol", not(feature = "tokio")))]
     type AssertFile = smol::fs::File;
@@ -4076,6 +4170,62 @@ mod tests {
 
     assert_impl_all!(TarReader<AssertFile>: Send, Sync);
     assert_impl_all!(TarEntry<AssertFile>: Send, Sync);
+    assert_impl_all!(TarReader<SendReader>: Send, Sync, Unpin);
+    assert_impl_all!(TarRegularFileReader<SendReader>: Send, Sync, Unpin);
+    assert_impl_all!(TarRegularFile<TarRegularFileReader<SendReader>>: Send, Sync, Unpin);
+    assert_not_impl_any!(TarReader<RcReader>: Send, Sync);
+    assert_not_impl_any!(TarRegularFileReader<RcReader>: Send, Sync);
+
+    /// Source that is `Send` and not `Sync`.
+    struct SendReader(std::marker::PhantomData<std::cell::Cell<u8>>);
+
+    #[cfg(all(feature = "smol", not(feature = "tokio")))]
+    impl AsyncRead for SendReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    impl AsyncRead for SendReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Source that is not `Send` and not `Sync`.
+    struct RcReader(std::marker::PhantomData<Rc<()>>);
+
+    #[cfg(all(feature = "smol", not(feature = "tokio")))]
+    impl AsyncRead for RcReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    impl AsyncRead for RcReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     assert_obj_safe!(TarReader<AssertFile>);
     assert_obj_safe!(TarEntry<AssertFile>);
 
@@ -4268,5 +4418,22 @@ mod tests {
             err.to_string().contains("out of range"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn calculated_checksum_counts_the_field_as_spaces() {
+        let mut hdr = Header::new();
+        for (i, byte) in hdr.record.iter_mut().enumerate() {
+            *byte = (i * 7 + 3) as u8;
+        }
+        let expected: u32 = (0..BLOCK_SIZE)
+            .map(|i| match i {
+                148..156 => u32::from(b' '),
+                _ => u32::from((i * 7 + 3) as u8),
+            })
+            .sum();
+        assert_eq!(hdr.calculated_checksum(), expected);
+        hdr.record = [0xff; BLOCK_SIZE];
+        assert_eq!(hdr.calculated_checksum(), 504 * 0xff + 8 * 0x20);
     }
 }

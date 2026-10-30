@@ -8,29 +8,21 @@ other `futures-io` runtimes, and with tokio. It does not access the
 filesystem.
 
 - Reads old tar, GNU tar, and POSIX ustar/pax archives.
-- Writes POSIX ustar archives with pax extension records.
-- Streams file bodies. The reader does not keep file bodies in memory.
-- Makes 1 heap allocation for each ustar entry when it reads or writes.
+- Writes POSIX ustar archives with PAX extension records.
 - The [`smol-tar-fs`](https://crates.io/crates/smol-tar-fs) crate gives a
   `Stream` of tar entries from a directory tree and a `Sink` that writes tar
   entries to a directory, on Unix.
 - Has a fuzz target for the reader. The tests run on Rust 1.85, stable, and
   nightly, with the smol traits and with the tokio traits.
 
-## Choose a crate
 
-- Use smol-tar to read or write tar data as a stream in async code. The
-  source or destination can be a file, a socket, an HTTP body, a
-  decompressor, or memory. Your code decides what goes to disk.
-- Use smol-tar with [`smol-tar-fs`](https://crates.io/crates/smol-tar-fs)
-  to pack a directory tree into an archive or to unpack an archive into a
-  directory, on Unix.
-- Use [`tar`](https://crates.io/crates/tar) for synchronous code.
-- On platforms other than Unix, use
-  [`async-tar`](https://crates.io/crates/async-tar) or
-  [`astral-tokio-tar`](https://crates.io/crates/astral-tokio-tar) to unpack
-  an archive into a directory with one call (`unpack`), or to add a
-  directory tree from disk with one call (`append_dir_all`).
+Use smol-tar to read or write tar data as a stream in async code. The
+source or destination can be a file, a socket, an HTTP body, a
+decompressor, or memory. 
+
+Use smol-tar with [`smol-tar-fs`](https://crates.io/crates/smol-tar-fs)
+to pack a directory tree into an archive or to unpack an archive into a
+directory.
 
 ## Installation
 
@@ -38,23 +30,25 @@ For smol and other `futures-io` runtimes:
 
 ```toml
 [dependencies]
-smol-tar = "0.1"
+smol-tar = "0.2"
 ```
 
 For tokio:
 
 ```toml
 [dependencies]
-smol-tar = { version = "0.1", default-features = false, features = ["tokio"] }
+smol-tar = { version = "0.2", default-features = false, features = ["tokio"] }
 ```
 
 The minimum supported Rust version is 1.85.
 
 ## Feature flags
 
-- `smol` (default): use the `futures-io` traits `AsyncRead` and `AsyncWrite`.
-  `smol` and other `futures`-based runtimes use these traits.
-- `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`.
+- `smol` (default): use the `futures-io` traits `AsyncRead`, `AsyncBufRead`
+  and `AsyncWrite`. `smol` and other `futures`-based runtimes use these
+  traits.
+- `tokio`: use the `tokio::io` traits `AsyncRead`, `AsyncBufRead` and
+  `AsyncWrite`.
 - `futures`: add the `futures` crate as a dependency. The library code does
   not use it.
 
@@ -65,27 +59,35 @@ you enable both features, the crate uses the `tokio` traits.
 
 1. Use the entries in sequence. `TarReader` and the file entries that it
    yields share one archive stream. Read each file body to the end or drop
-   it before you get the next entry. The types are `Send` and `Sync`, but do
-   not read two of them at the same time.
+   it before you get the next entry. A pending request for the next entry
+   wakes when the current body ends or its file reader is dropped.
+   If the source is `Send`, both the archive and its file readers are
+   `Send` and `Sync`.
 2. Wrap a file or a socket in a `BufReader` before you give it to
-   `TarReader`. The reader does not buffer the source. `TarWriter` writes
-   the header, each part of the body (up to 16 KiB), and the padding of each
-   entry as separate writes. To decrease the number of writes to a file or a
-   socket, wrap it in a `BufWriter`.
-3. Give `TarRegularFile::new` the exact size of the body. If the body is
+   `TarReader`. The reader does not buffer the source.
+3. Give `TarWriter` file bodies that implement `AsyncBufRead`. The writer
+   writes the data from the buffer of the body reader directly to the
+   destination, so the buffer size sets the size of each body write. Wrap a
+   body that implements only `AsyncRead`, for example a file, in a
+   `BufReader`. To write the entries of a `TarReader`, give the `TarReader`
+   a source that implements `AsyncBufRead`.
+4. `TarWriter` writes the header, each part of the body, and the padding of
+   each entry as separate writes. To decrease the number of writes to a file
+   or a socket, wrap it in a `BufWriter`.
+5. Give `TarRegularFile::new` the exact size of the body. If the body is
    shorter, the write fails with `ErrorKind::UnexpectedEof`. If the body is
    longer, the writer does not read the remaining bytes.
-4. Call `TarWriter::finish` or `SinkExt::close` after the last entry. These
+6. Call `TarWriter::finish` or `SinkExt::close` after the last entry. These
    methods write the two zero blocks that end a tar archive and close the
    destination. `StreamExt::forward` closes the writer at the end of the
    stream.
-5. All file entries of one `TarWriter` use the same body type `R`. To write
+7. All file entries of one `TarWriter` use the same body type `R`. To write
    bodies of different types, box them as
-   `Box<dyn AsyncRead + Unpin + Send>`. If you write only entries without a
+   `Box<dyn AsyncBufRead + Unpin + Send>`. If you write only entries without a
    body, such as directories, set `R` explicitly, for example with the
    `Empty` type of `smol::io` or `tokio::io`:
    `TarWriter::<_, Empty>::new(destination)`.
-6. Paths, link targets, and user and group names are UTF-8 strings. Extended
+8. Paths, link targets, and user and group names are UTF-8 strings. Extended
    attribute names are UTF-8 strings. Extended attribute values are bytes.
 
 ## Errors
@@ -109,6 +111,10 @@ commands compile the programs:
 - `cargo test`: `read`, `read_gz`, `write`, and `filter`.
 - `cargo test --no-default-features --features tokio`: `read_tokio`.
 
+With `--features tokio`, the default `smol` feature stays on. Then the smol
+programs compile to a `main` that writes a message to stderr and exits with
+status 1.
+
 ### Read an archive with smol
 
 Dependencies: `smol-tar`, `smol`.
@@ -119,6 +125,11 @@ Dependencies: `smol-tar`, `smol`.
 //!
 //! Run: cargo run --example read -- ARCHIVE.tar
 
+// With the tokio feature, smol-tar uses the tokio traits, and the smol main
+// below cannot compile. In that case, a short main writes a message to
+// stderr and exits with status 1.
+#![cfg_attr(feature = "tokio", allow(unused_imports))]
+
 use smol::{
     fs::File,
     io::{copy, sink, BufReader},
@@ -126,6 +137,7 @@ use smol::{
 };
 use smol_tar::{TarEntry, TarReader};
 
+#[cfg(not(feature = "tokio"))]
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1).expect("usage: read ARCHIVE.tar");
     smol::block_on(async {
@@ -145,6 +157,12 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(feature = "tokio")]
+fn main() {
+    eprintln!("this example needs the smol feature without the tokio feature");
+    std::process::exit(1);
 }
 ```
 
@@ -200,6 +218,11 @@ and `gzip` features. With tokio, use the `tokio` feature of
 //!
 //! Run: cargo run --example read_gz -- ARCHIVE.tar.gz
 
+// With the tokio feature, smol-tar uses the tokio traits, and the smol main
+// below cannot compile. In that case, a short main writes a message to
+// stderr and exits with status 1.
+#![cfg_attr(feature = "tokio", allow(unused_imports))]
+
 use async_compression::futures::bufread::GzipDecoder;
 use smol::{
     fs::File,
@@ -208,6 +231,7 @@ use smol::{
 };
 use smol_tar::{TarEntry, TarReader};
 
+#[cfg(not(feature = "tokio"))]
 fn main() -> std::io::Result<()> {
     let path = std::env::args()
         .nth(1)
@@ -224,6 +248,12 @@ fn main() -> std::io::Result<()> {
         Ok(())
     })
 }
+
+#[cfg(feature = "tokio")]
+fn main() {
+    eprintln!("this example needs the smol feature without the tokio feature");
+    std::process::exit(1);
+}
 ```
 
 ### Write an archive
@@ -236,9 +266,15 @@ Dependencies: `smol-tar`, `smol`.
 //!
 //! Run: cargo run --example write -- OUT.tar FILE...
 
-use smol::fs::File;
+// With the tokio feature, smol-tar uses the tokio traits, and the smol main
+// below cannot compile. In that case, a short main writes a message to
+// stderr and exits with status 1.
+#![cfg_attr(feature = "tokio", allow(unused_imports))]
+
+use smol::{fs::File, io::BufReader};
 use smol_tar::{TarDirectory, TarRegularFile, TarWriter};
 
+#[cfg(not(feature = "tokio"))]
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().expect("usage: write OUT.tar FILE...");
@@ -252,8 +288,11 @@ fn main() -> std::io::Result<()> {
             let file = File::open(&path).await?;
             let meta = file.metadata().await?;
             let name = format!("files/{}", path.trim_start_matches('/'));
+            // TarWriter writes the body from the buffer of the body reader.
+            // The buffer size sets the size of each body write.
+            let body = BufReader::with_capacity(64 * 1024, file);
             // The size must be equal to the number of bytes in the body.
-            let entry = TarRegularFile::new(name, meta.len(), file)
+            let entry = TarRegularFile::new(name, meta.len(), body)
                 .with_mode(0o644)
                 .with_mtime(meta.modified()?);
             tar.write(entry.into()).await?;
@@ -261,6 +300,12 @@ fn main() -> std::io::Result<()> {
         // Write the two zero blocks that end the archive and close the file.
         tar.finish().await
     })
+}
+
+#[cfg(feature = "tokio")]
+fn main() {
+    eprintln!("this example needs the smol feature without the tokio feature");
+    std::process::exit(1);
 }
 ```
 
@@ -277,10 +322,16 @@ Dependencies: `smol-tar`, `smol`, `futures`.
 //!
 //! Run: cargo run --example filter -- IN.tar OUT.tar PREFIX
 
+// With the tokio feature, smol-tar uses the tokio traits, and the smol main
+// below cannot compile. In that case, a short main writes a message to
+// stderr and exits with status 1.
+#![cfg_attr(feature = "tokio", allow(unused_imports))]
+
 use futures::{future, StreamExt, TryStreamExt};
 use smol::{fs::File, io::BufReader};
 use smol_tar::{TarReader, TarWriter};
 
+#[cfg(not(feature = "tokio"))]
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [input, output, prefix] = args.as_slice() else {
@@ -295,6 +346,12 @@ fn main() -> std::io::Result<()> {
             .forward(&mut out)
             .await
     })
+}
+
+#[cfg(feature = "tokio")]
+fn main() {
+    eprintln!("this example needs the smol feature without the tokio feature");
+    std::process::exit(1);
 }
 ```
 
@@ -340,48 +397,6 @@ Metadata
 `AttrList`
 : The extended attributes of an entry. The writer stores them in pax
   records.
-
-## Migrate from the tar crate
-
-These are the smol-tar equivalents of the [`tar`](https://docs.rs/tar) and
-[`async-tar`](https://docs.rs/async-tar) API:
-
-- `Archive::new(r).entries()?` -- `TarReader::new(r)`, which is a `Stream`.
-- `entry.path()?` -- `entry.path()`, which returns `&str`.
-- `entry.header().entry_type()` -- a `match` on the `TarEntry` variant.
-- `entry.header().size()?` -- `file.size()` on `TarEntry::File(file)`.
-- `Read` or `AsyncRead` on an entry -- `AsyncRead` on `TarRegularFile`.
-- `Builder::new(w)` -- `TarWriter::new(w)`.
-- `builder.append_data(&mut header, path, body)` --
-  `writer.write(TarRegularFile::new(path, size, body).into())`.
-- `header.set_mode(m)`, `header.set_mtime(t)` -- `.with_mode(m)`,
-  `.with_mtime(t)` on the entry.
-- `builder.append_dir(path, src)` --
-  `writer.write(TarDirectory::new(path).into())`.
-- `builder.finish()` or `builder.into_inner()` -- `writer.finish()`.
-- `archive.unpack(dir)` -- `TarReader::new(r).forward(FsSink::new(dir))`
-  with smol-tar-fs. `FsSink` needs an existing directory. The
-  `unpack` method of the `tar` crate creates the directory. It writes a
-  character device, block device or FIFO entry as a regular file with the
-  data of the entry. By default, `FsSink` skips character and block device
-  entries and creates a FIFO for a FIFO entry. To create device nodes, call
-  `with_device_nodes(DeviceNodes::Create)`.
-- `archive.set_unpack_xattrs(true)` -- `FsSink::new(dir).with_xattrs(true)`.
-  The `tar` crate then writes all attribute names on regular files.
-  By default, `FsSink` writes all names on Apple platforms, and only the
-  names that start with `user.` on Linux and Android. To write other names,
-  call `with_xattr_filter`. On other Unix platforms, `FsSink` cannot write
-  extended attributes. `with_unsupported_xattr` sets the action for them.
-- `builder.append_dir_all(path, dir)` --
-  `writer.send_all(&mut FsSource::new(dir).with_prefix(path).into_tar())`
-  with smol-tar-fs and `SinkExt`. `FsSource` stores symlinks as
-  symlinks and does not follow them, the same as
-  `builder.follow_symlinks(false)`.
-- `builder.append_path_with_name(path, name)` for a file --
-  `writer.send_all(&mut FsSource::new(path).with_prefix(name).into_tar())`
-  with smol-tar-fs and `SinkExt`. For `builder.append_path(path)`, use
-  `path` as the name. For a directory, smol-tar has no equivalent, because
-  `FsSource` gives the directory and all of its contents.
 
 ## Supported formats
 
@@ -460,9 +475,9 @@ creates, extracts, and lists archives on disk.
 
 ## Benchmarks
 
-The [`bench`](https://github.com/growler/smol-tar.rs/tree/main/bench) crate compares smol-tar with async-tar,
-astral-tokio-tar, and the synchronous `tar` crate. All archives are in
-memory, so the results do not include disk I/O.
+The [`bench`](https://github.com/growler/smol-tar.rs/tree/main/bench) crate 
+compares smol-tar with async-tar, astral-tokio-tar, tar-codec and the synchronous
+`tar` crate. All archives are in memory, so the results do not include disk I/O.
 
 - For archives that hold thousands of entries, the times of all libraries
   are within a few milliseconds of each other. The first real disk or
@@ -478,8 +493,7 @@ memory, so the results do not include disk I/O.
 
 Refer to
 [`bench/README.md`](https://github.com/growler/smol-tar.rs/blob/main/bench/README.md#results)
-for the result tables,
-the allocation counts, and the test environment.
+for the result tables, the allocation counts, and the test environment.
 
 ## Rationale
 

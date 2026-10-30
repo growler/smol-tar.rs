@@ -23,7 +23,7 @@ features = ["futures"]
 
 [features]
 default = ["smol"]
-smol = ["dep:async-lock", "dep:futures-io"]
+smol = ["dep:futures-io"]
 tokio = ["dep:tokio", "dep:tokio-stream"]
 futures = ["dep:futures"]
 
@@ -31,7 +31,6 @@ futures = ["dep:futures"]
 futures-core = "0.3"
 futures-sink = "0.3"
 pin-project-lite = "0.2"
-async-lock = { version = "3.4", optional = true }
 futures-io = { version = "0.3", optional = true }
 tokio = { version = "1", optional = true, features = ["fs", "io-util", "rt"] }
 tokio-stream = { version = "0.1", optional = true }
