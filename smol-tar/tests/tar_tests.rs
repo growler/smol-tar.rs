@@ -1320,6 +1320,110 @@ fn reader_accepts_binary_xattr_value() -> Result<()> {
 }
 
 #[test]
+fn tar_writer_writes_pax_header_larger_than_initial_buffer() -> Result<()> {
+    block_on_test(async {
+        let (writer_sink, shared) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
+        let value = vec![b'x'; 20 * 1024];
+        writer
+            .send(TarEntry::File(
+                TarRegularFile::new("big.txt", 3, Cursor::new(&b"abc"[..]))
+                    .with_attrs(AttrList::new().with("user.big", value.clone())),
+            ))
+            .await?;
+        writer
+            .send(TarEntry::File(TarRegularFile::new(
+                "small.txt",
+                3,
+                Cursor::new(&b"def"[..]),
+            )))
+            .await?;
+        writer.close().await?;
+
+        let buffer = shared.lock().unwrap().clone();
+        let mut stream = Box::pin(TarReader::new(Cursor::new(buffer)));
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                assert_eq!(file.path(), "big.txt");
+                assert_attrs_eq(file.attrs(), &[("user.big", value.as_slice())]);
+                let mut body = Vec::new();
+                file.read_to_end(&mut body).await?;
+                assert_eq!(body, b"abc");
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                assert_eq!(file.path(), "small.txt");
+                let mut body = Vec::new();
+                file.read_to_end(&mut body).await?;
+                assert_eq!(body, b"def");
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn tar_writer_limits_header_size() -> Result<()> {
+    block_on_test(async {
+        let (writer_sink, shared) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
+        // The record "130048 SCHILY.xattr.user.big=<value>\n" is 130048 bytes,
+        // which is 254 blocks. With the two ustar headers, the entry headers
+        // are 131072 bytes, which is the limit.
+        let at_limit = vec![b'x'; 130_018];
+        writer
+            .send(TarEntry::File(
+                TarRegularFile::new("at-limit.txt", 0, Cursor::new(&[][..]))
+                    .with_attrs(AttrList::new().with("user.big", at_limit.clone())),
+            ))
+            .await?;
+        let err = writer
+            .send(TarEntry::File(
+                TarRegularFile::new("over-limit.txt", 0, Cursor::new(&[][..]))
+                    .with_attrs(AttrList::new().with("user.big", vec![b'x'; 130_019])),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(err.to_string().contains("header too large"));
+        writer
+            .send(TarEntry::File(TarRegularFile::new(
+                "after.txt",
+                3,
+                Cursor::new(&b"abc"[..]),
+            )))
+            .await?;
+        writer.close().await?;
+
+        let buffer = shared.lock().unwrap().clone();
+        let mut stream = Box::pin(TarReader::new(Cursor::new(buffer)));
+        match stream.next().await.unwrap()? {
+            TarEntry::File(file) => {
+                assert_eq!(file.path(), "at-limit.txt");
+                assert_attrs_eq(file.attrs(), &[("user.big", at_limit.as_slice())]);
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        match stream.next().await.unwrap()? {
+            TarEntry::File(mut file) => {
+                assert_eq!(file.path(), "after.txt");
+                assert!(file.attrs().is_empty());
+                let mut body = Vec::new();
+                file.read_to_end(&mut body).await?;
+                assert_eq!(body, b"abc");
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
 fn tar_writer_round_trip_extended_pax_metadata() -> Result<()> {
     block_on_test(async {
         let (writer_sink, shared) = VecAsyncWriter::new();

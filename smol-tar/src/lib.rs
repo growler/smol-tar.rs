@@ -268,7 +268,11 @@
 //! - more than 256 global PAX extensions
 //! - global PAX records that are larger than 1 MiB together
 //!
+//! The writer returns an [`Other`] error for an entry whose headers, with
+//! the PAX records, are larger than 128 KiB.
+//!
 //! [`InvalidData`]: std::io::ErrorKind::InvalidData
+//! [`Other`]: std::io::ErrorKind::Other
 //!
 
 #[cfg(not(any(feature = "smol", feature = "tokio")))]
@@ -298,6 +302,8 @@ const BLOCK_SIZE: usize = 512;
 const SKIP_BUFFER_SIZE: usize = 64 * 1024;
 const PATH_MAX: usize = 4096;
 const PAX_HEADER_MAX_SIZE: usize = 1024 * 1024;
+const HEADER_BUFFER_SIZE: usize = 4 * 1024;
+const HEADER_BUFFER_MAX_SIZE: usize = 128 * 1024;
 const PAX_GLOBAL_MAX_COUNT: usize = 256;
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
@@ -792,15 +798,15 @@ impl UstarHeader {
     fn set_typeflag(&mut self, kind: Kind) {
         self.typeflag[0] = kind.byte();
     }
-    fn path_split_point(&mut self, path: &str) -> Option<usize> {
+    fn path_split_point(path: &str) -> Option<usize> {
         let bytes = path.as_bytes();
-        if bytes.len() <= self.name.len() {
+        if bytes.len() <= NAME_LEN {
             return None;
         }
         bytes
             .iter()
             .enumerate()
-            .rfind(|(i, b)| **b == b'/' && i <= &self.prefix.len())
+            .rfind(|(i, b)| **b == b'/' && i <= &PREFIX_LEN)
             .map(|(i, _)| i)
     }
     fn set_path(&mut self, path: &str, split_pos: Option<usize>) {
@@ -1462,7 +1468,7 @@ impl TarLink {
     pub fn link(&'_ self) -> &'_ str {
         &self.link_name
     }
-    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    fn write_header(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
         write_header(
             buffer,
             self.path_name.as_ref(),
@@ -1651,7 +1657,7 @@ impl TarDevice {
         self.attrs = attrs;
         self
     }
-    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    fn write_header(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
         write_header(
             buffer,
             self.path_name.as_ref(),
@@ -1795,7 +1801,7 @@ impl TarFifo {
         self.attrs = attrs;
         self
     }
-    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    fn write_header(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
         write_header(
             buffer,
             self.path_name.as_ref(),
@@ -1945,7 +1951,7 @@ impl TarSymlink {
         self.attrs = attrs;
         self
     }
-    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    fn write_header(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
         write_header(
             buffer,
             self.path_name.as_ref(),
@@ -2104,7 +2110,7 @@ impl TarDirectory {
         self.attrs = attrs;
         self
     }
-    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    fn write_header(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
         write_header(
             buffer,
             self.path_name.as_ref(),
@@ -2466,7 +2472,7 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
         self.attrs = attrs;
         self
     }
-    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    fn write_header(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
         write_header(
             buffer,
             self.path_name.as_ref(),
@@ -2506,7 +2512,7 @@ pub enum TarEntry<'a, R: AsyncRead + 'a> {
 }
 
 impl<'a, R: AsyncRead + 'a> TarEntry<'a, R> {
-    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    fn write_header(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
         match self {
             Self::Directory(dir) => dir.write_header(buffer),
             Self::Device(device) => device.write_header(buffer),
@@ -3589,8 +3595,11 @@ const fn padded_size(n: u64) -> u64 {
 /// extended attributes), prepends a PAX header containing the full values
 /// before duplicating the original header so downstream tools can still read
 /// the entry.
+///
+/// The function grows `buffer` when the header does not fit. A header larger
+/// than `HEADER_BUFFER_MAX_SIZE` is an error.
 fn write_header(
-    buffer: &mut [u8],
+    buffer: &mut Vec<u8>,
     name: &str,
     link_name: Option<&str>,
     kind: Kind,
@@ -3604,14 +3613,7 @@ fn write_header(
     device: Option<(u32, u32)>,
     attrs: &AttrList,
 ) -> std::io::Result<usize> {
-    if buffer.len() < BLOCK_SIZE {
-        return Err(std::io::Error::other("buffer too small for tar header"));
-    }
-    let (header_buf, data_buf) = buffer.split_at_mut(BLOCK_SIZE);
-    let header = unsafe { UstarHeader::from_buf(header_buf) };
-    let mut total = BLOCK_SIZE;
-
-    let split_pos = header.path_split_point(name);
+    let split_pos = UstarHeader::path_split_point(name);
     let path_truncated = if let Some(pos) = split_pos {
         name.len() - pos - 1 > NAME_LEN
     } else {
@@ -3678,6 +3680,27 @@ fn write_header(
         }
     }
 
+    let ext_size: usize = records
+        .iter()
+        .map(|record| pax_record_len(&record.key, record.value.len()))
+        .sum();
+    let padded = padded_size(ext_size as u64) as usize;
+    let total = if records.is_empty() {
+        BLOCK_SIZE
+    } else {
+        BLOCK_SIZE + padded + BLOCK_SIZE
+    };
+    if total > HEADER_BUFFER_MAX_SIZE {
+        return Err(std::io::Error::other(format!(
+            "tar header too large: {total} bytes, limit {HEADER_BUFFER_MAX_SIZE} bytes"
+        )));
+    }
+    if buffer.len() < total {
+        buffer.resize(total, 0);
+    }
+    let (header_buf, data_buf) = buffer.split_at_mut(BLOCK_SIZE);
+    let header = unsafe { UstarHeader::from_buf(header_buf) };
+
     if records.is_empty() {
         header.set_uid(uid)?;
         header.set_gid(gid)?;
@@ -3707,19 +3730,9 @@ fn write_header(
         header.set_gid(0)?;
         header.set_mode(0)?;
         header.set_mtime(0)?;
-        let mut ext_size = 0;
-        for record in &records {
-            ext_size += pax_record_len(&record.key, record.value.len());
-        }
-        if data_buf.len() < ext_size {
-            return Err(std::io::Error::other("buffer too small for pax header"));
-        }
         let mut offset = 0;
         for record in records {
             let rec_len = pax_record_len(&record.key, record.value.len());
-            if data_buf.len() < offset + rec_len {
-                return Err(std::io::Error::other("buffer too small for pax header"));
-            }
             write_pax_record(
                 &mut data_buf[offset..offset + rec_len],
                 &record.key,
@@ -3730,19 +3743,8 @@ fn write_header(
         }
         header.set_size(ext_size as u64)?;
         header.finalize()?;
-        let padded = padded_size(ext_size as u64);
-        if data_buf.len() < padded as usize {
-            return Err(std::io::Error::other("buffer too small for pax header"));
-        }
-        data_buf[ext_size..padded as usize].fill(0);
-        total += padded as usize;
-        if data_buf.len() < padded as usize + BLOCK_SIZE {
-            return Err(std::io::Error::other("buffer too small for pax header"));
-        }
-        let header = unsafe {
-            UstarHeader::from_buf(&mut data_buf[padded as usize..padded as usize + BLOCK_SIZE])
-        };
-        total += BLOCK_SIZE;
+        data_buf[ext_size..padded].fill(0);
+        let header = unsafe { UstarHeader::from_buf(&mut data_buf[padded..padded + BLOCK_SIZE]) };
         header.set_uid(if uid_requires_pax { 0 } else { uid })?;
         header.set_gid(if gid_requires_pax { 0 } else { gid })?;
         if !uname_requires_pax {
@@ -3890,8 +3892,10 @@ fn format_octal(val: u64, field: &mut [u8]) -> std::io::Result<()> {
 pin_project! {
     /// Streaming tar writer that implements [`Sink`] for [`TarEntry`] values.
     ///
-    /// The writer keeps headers and padding in a fixed 16 KiB buffer inside
-    /// the struct until the output writer accepts them. It writes the file
+    /// The writer keeps headers and padding in a 4 KiB heap buffer until the
+    /// output writer accepts them. When the header of an entry is larger, the
+    /// buffer grows to the size of that header and keeps that size for the
+    /// next entries. The maximum header size is 128 KiB. It writes the file
     /// data from the buffer of the body reader, so the body type `R` must
     /// implement [`AsyncBufRead`]. Wrap a body that implements only
     /// [`AsyncRead`] in a `BufReader`. Each entry starts on a 512-byte block
@@ -3942,7 +3946,7 @@ pin_project! {
     #[doc(alias = "Builder")]
     pub struct TarWriter<'a, 'b, W, R> {
         // internal buffer for writing headers and padding
-        buf: [u8; BLOCK_SIZE * 32],
+        buf: Vec<u8>,
         // length of valid data in the buffer
         len: usize,
         // current position in the buffer
@@ -3967,7 +3971,7 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     /// Create a writer that targets the provided [`AsyncWrite`] sink.
     pub fn new(writer: W) -> Self {
         Self {
-            buf: [0; BLOCK_SIZE * 32],
+            buf: vec![0; HEADER_BUFFER_SIZE],
             len: 0,
             pos: 0,
             total: 0,
@@ -3992,8 +3996,8 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     /// - [`ErrorKind::Other`]: the mode or a device number is too large for
     ///   its header field, an
     ///   extended-attribute name contains characters that are not ASCII
-    ///   graphic characters or contains `=`, or the PAX records of the entry
-    ///   do not fit in the writer buffer.
+    ///   graphic characters or contains `=`, or the headers of the entry,
+    ///   with the PAX records, are larger than 128 KiB.
     /// - [`ErrorKind::UnexpectedEof`]: the file body ends before
     ///   [`TarRegularFile::size`] bytes.
     /// - [`ErrorKind::WriteZero`]: the underlying writer accepts zero bytes.
@@ -4325,10 +4329,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn write_header_reports_small_buffers() {
-        let err = write_header(
-            &mut [0u8; BLOCK_SIZE - 1],
+    fn write_file_header(buffer: &mut Vec<u8>, attrs: &AttrList) -> std::io::Result<usize> {
+        write_header(
+            buffer,
             "file.txt",
             None,
             Kind::File,
@@ -4340,29 +4343,32 @@ mod tests {
             None,
             &EntryTimes::default(),
             None,
-            &AttrList::default(),
+            attrs,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("buffer too small for tar header"));
+    }
 
-        let mut small = vec![0u8; BLOCK_SIZE + 10];
-        let err = write_header(
-            &mut small,
-            "file.txt",
-            None,
-            Kind::File,
-            0,
-            0o644,
-            0,
-            0,
-            None,
-            None,
-            &EntryTimes::default(),
-            None,
-            &AttrList::new().with("user.comment", b"hello".as_slice()),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("buffer too small for pax header"));
+    #[test]
+    fn write_header_grows_buffer_up_to_limit() {
+        let mut buffer = vec![0u8; HEADER_BUFFER_SIZE];
+        let len = write_file_header(&mut buffer, &AttrList::default()).unwrap();
+        assert_eq!(len, BLOCK_SIZE);
+        assert_eq!(buffer.len(), HEADER_BUFFER_SIZE);
+
+        let attrs = AttrList::new().with("user.big", vec![b'x'; 20 * 1024]);
+        let len = write_file_header(&mut buffer, &attrs).unwrap();
+        assert!(len > HEADER_BUFFER_SIZE);
+        assert_eq!(len % BLOCK_SIZE, 0);
+        assert_eq!(buffer.len(), len);
+
+        let len = write_file_header(&mut buffer, &AttrList::default()).unwrap();
+        assert_eq!(len, BLOCK_SIZE);
+        assert!(buffer.len() > HEADER_BUFFER_SIZE);
+
+        let attrs = AttrList::new().with("user.big", vec![b'x'; HEADER_BUFFER_MAX_SIZE]);
+        let before = buffer.len();
+        let err = write_file_header(&mut buffer, &attrs).unwrap_err();
+        assert!(err.to_string().contains("tar header too large"));
+        assert_eq!(buffer.len(), before);
     }
 
     #[test]

@@ -467,6 +467,9 @@ contents:
 - more than 256 global PAX extensions
 - global PAX records that are larger than 1 MiB together
 
+The writer returns an `ErrorKind::Other` error for an entry whose headers,
+with the PAX records, are larger than 128 KiB.
+
 ## Example CLI
 
 The repository also includes the example CLI
