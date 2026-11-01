@@ -278,6 +278,73 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for FailingWriter<W> {
     }
 }
 
+/// Writer that counts its close calls in `closes`. The first `pending` close
+/// calls return `Pending`. The next `fail` close calls fail. The writer passes
+/// all other calls to `inner`.
+struct CloseCountingWriter<W> {
+    inner: W,
+    closes: Arc<AtomicUsize>,
+    pending: usize,
+    fail: usize,
+}
+
+impl<W> CloseCountingWriter<W> {
+    fn new(inner: W, pending: usize, fail: usize) -> (Self, Arc<AtomicUsize>) {
+        let closes = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                inner,
+                closes: closes.clone(),
+                pending,
+                fail,
+            },
+            closes,
+        )
+    }
+
+    fn close_now(&mut self, cx: &mut Context<'_>) -> Option<Poll<Result<()>>> {
+        let n = self.closes.fetch_add(1, Ordering::SeqCst);
+        if n < self.pending {
+            cx.waker().wake_by_ref();
+            Some(Poll::Pending)
+        } else if n < self.pending + self.fail {
+            Some(Poll::Ready(Err(io::Error::other("close failure"))))
+        } else {
+            None
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CloseCountingWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    #[cfg(all(feature = "smol", not(feature = "tokio")))]
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if let Some(poll) = self.close_now(cx) {
+            return poll;
+        }
+        Pin::new(&mut self.inner).poll_close(cx)
+    }
+
+    #[cfg(feature = "tokio")]
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if let Some(poll) = self.close_now(cx) {
+            return poll;
+        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 struct ChunkedAsyncWriter {
     inner: Arc<Mutex<Vec<u8>>>,
     max_chunk: usize,
@@ -1384,6 +1451,87 @@ fn writer_rejects_entry_after_finish() -> Result<()> {
         assert_eq!(paths, ["dir/"]);
         Ok(())
     })
+}
+
+#[test]
+fn writer_finish_closes_destination_once() -> Result<()> {
+    block_on_test(async {
+        let (inner, bytes) = VecAsyncWriter::new();
+        let (sink, closes) = CloseCountingWriter::new(inner, 0, 0);
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(sink);
+        writer
+            .write(TarEntry::from(TarDirectory::new("dir/")))
+            .await?;
+        writer.finish().await?;
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        let archive = bytes.lock().unwrap().clone();
+        assert_eq!(archive.len(), 3 * BLOCK_SIZE);
+
+        writer.finish().await?;
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(*bytes.lock().unwrap(), archive);
+
+        SinkExt::close(&mut writer).await?;
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(*bytes.lock().unwrap(), archive);
+
+        let entries = collect_entries_async(Cursor::new(archive)).await?;
+        let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["dir/"]);
+        Ok(())
+    })
+}
+
+#[test]
+fn writer_finish_closes_destination_again_after_close_error() -> Result<()> {
+    block_on_test(async {
+        let (inner, bytes) = VecAsyncWriter::new();
+        let (sink, closes) = CloseCountingWriter::new(inner, 0, 1);
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(sink);
+        writer
+            .write(TarEntry::from(TarDirectory::new("dir/")))
+            .await?;
+        let err = writer.finish().await.unwrap_err();
+        assert!(err.to_string().contains("close failure"));
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        let archive = bytes.lock().unwrap().clone();
+        assert_eq!(archive.len(), 3 * BLOCK_SIZE);
+
+        writer.finish().await?;
+        assert_eq!(closes.load(Ordering::SeqCst), 2);
+        writer.finish().await?;
+        assert_eq!(closes.load(Ordering::SeqCst), 2);
+        assert_eq!(*bytes.lock().unwrap(), archive);
+
+        let err = writer
+            .write(TarEntry::from(TarDirectory::new("late/")))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already finished"));
+        assert_eq!(*bytes.lock().unwrap(), archive);
+        Ok(())
+    })
+}
+
+#[test]
+fn writer_finish_closes_destination_again_after_drop() -> Result<()> {
+    let (inner, bytes) = VecAsyncWriter::new();
+    let (sink, closes) = CloseCountingWriter::new(inner, 1, 0);
+    let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(sink);
+    block_on_test(writer.write(TarEntry::from(TarDirectory::new("dir/"))))?;
+    let wakes = Arc::new(WakeCount::default());
+    assert!(poll_once(writer.finish(), &wakes).is_pending());
+    assert_eq!(wakes.get(), 1);
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+    let archive = bytes.lock().unwrap().clone();
+    assert_eq!(archive.len(), 3 * BLOCK_SIZE);
+
+    block_on_test(writer.finish())?;
+    assert_eq!(closes.load(Ordering::SeqCst), 2);
+    block_on_test(writer.finish())?;
+    assert_eq!(closes.load(Ordering::SeqCst), 2);
+    assert_eq!(*bytes.lock().unwrap(), archive);
+    Ok(())
 }
 
 #[test]

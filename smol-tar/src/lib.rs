@@ -3948,6 +3948,15 @@ fn format_octal(val: u64, field: &mut [u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(PartialEq, Eq)]
+enum WriterState {
+    Open,
+    // the end marker is in the buffer or written
+    Marker,
+    // the underlying writer is closed
+    Closed,
+}
+
 pin_project! {
     /// Streaming tar writer that implements [`Sink`] for [`TarEntry`] values.
     ///
@@ -3964,7 +3973,8 @@ pin_project! {
     /// `futures` crate. Use [`TarWriter::write`] to write each entry. When all
     /// entries are written, call [`TarWriter::finish`] to write the two zero
     /// blocks that end the archive. [`SinkExt::close`] does the same. After
-    /// that, the writer accepts no more entries.
+    /// that, the writer accepts no more entries. After these methods close the
+    /// underlying writer, a second call does nothing and returns `Ok`.
     ///
     /// [`SinkExt::close`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.close
     ///
@@ -4015,8 +4025,8 @@ pin_project! {
         total: u64,
         // the end position of the current entry being written
         eof: u64,
-        // closed
-        closed: bool,
+        // stage of the archive end
+        state: WriterState,
         // reader for the current file being written
         reader: Option<R>,
         marker_: std::marker::PhantomData<&'b ()>,
@@ -4036,7 +4046,7 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
             pos: 0,
             total: 0,
             eof: 0,
-            closed: false,
+            state: WriterState::Open,
             reader: None,
             marker_: std::marker::PhantomData,
             writer,
@@ -4157,13 +4167,19 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     /// The method writes the remaining buffered data, then the two zero blocks
     /// that end the archive. Then it closes the underlying writer. After this
     /// method starts to write the zero blocks, [`TarWriter::write`] returns an
-    /// error.
+    /// error. After this method returns `Ok`, a later call to this method or
+    /// to [`SinkExt::close`] does nothing and returns `Ok`.
+    ///
+    /// [`SinkExt::close`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.close
     ///
     /// # Errors
     ///
     /// The method returns the same errors as [`TarWriter::write`] for data
     /// that is not yet written, but not the error for a finished archive. It
     /// also returns an error from the underlying writer when the close fails.
+    /// In that case, the next call closes the underlying writer again. If you
+    /// drop the future before it completes, the next call continues. It does
+    /// not write the zero blocks again.
     pub async fn finish(&mut self) -> std::io::Result<()> {
         poll_fn(|cx| {
             // SAFETY: the mutable borrow of `self` is held for the duration of
@@ -4245,7 +4261,7 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> Sink<TarEntry<'b,
     type Error = std::io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if self.closed {
+        if self.state != WriterState::Open {
             return Poll::Ready(Err(std::io::Error::other("archive is already finished")));
         }
         self.poll_drain(cx)
@@ -4254,7 +4270,7 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> Sink<TarEntry<'b,
     fn start_send(self: Pin<&mut Self>, item: TarEntry<'b, R>) -> std::io::Result<()> {
         let this = self.project();
 
-        if *this.closed {
+        if *this.state != WriterState::Open {
             return Err(std::io::Error::other("archive is already finished"));
         }
 
@@ -4283,18 +4299,23 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> Sink<TarEntry<'b,
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.state == WriterState::Closed {
+            return Poll::Ready(Ok(()));
+        }
         task::ready!(self.as_mut().poll_drain(cx))?;
         {
             let this = self.as_mut().project();
-            if !*this.closed {
+            if *this.state == WriterState::Open {
                 this.buf[..BLOCK_SIZE * 2].fill(0);
                 *this.len = BLOCK_SIZE * 2;
-                *this.closed = true;
+                *this.state = WriterState::Marker;
             }
         }
         task::ready!(self.as_mut().poll_drain(cx))?;
         let mut this = self.project();
-        poll_close_compat(this.writer.as_mut(), cx)
+        task::ready!(poll_close_compat(this.writer.as_mut(), cx))?;
+        *this.state = WriterState::Closed;
+        Poll::Ready(Ok(()))
     }
 }
 

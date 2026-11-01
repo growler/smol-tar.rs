@@ -87,7 +87,9 @@ you enable both features, the crate uses the `tokio` traits.
 7. Call `TarWriter::finish` or `SinkExt::close` after the last entry. These
    methods write the two zero blocks that end a tar archive and close the
    destination. `StreamExt::forward` closes the writer at the end of the
-   stream. After that, `write` and `SinkExt::send` return an error.
+   stream. After that, `write` and `SinkExt::send` return an error. After
+   these methods close the destination, a second call to `TarWriter::finish`
+   or `SinkExt::close` does nothing and returns `Ok`.
 8. All file entries of one `TarWriter` use the same body type `R`. To write
    bodies of different types, box them as
    `Box<dyn AsyncBufRead + Unpin + Send>`. If you write only entries without a
