@@ -230,6 +230,52 @@ impl<R: AsyncRead + Unpin> AsyncRead for FailingReader<R> {
     }
 }
 
+/// Writer that fails one time on write number `fail_at` (from 1) and passes
+/// all other writes to `inner`.
+struct FailingWriter<W> {
+    inner: W,
+    fail_at: usize,
+    writes: usize,
+}
+
+impl<W> FailingWriter<W> {
+    fn new(inner: W, fail_at: usize) -> Self {
+        Self {
+            inner,
+            fail_at,
+            writes: 0,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for FailingWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize>> {
+        self.writes += 1;
+        if self.writes == self.fail_at {
+            return Poll::Ready(Err(io::Error::other("destination failure")));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    #[cfg(all(feature = "smol", not(feature = "tokio")))]
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.inner).poll_close(cx)
+    }
+
+    #[cfg(feature = "tokio")]
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 struct ChunkedAsyncWriter {
     inner: Arc<Mutex<Vec<u8>>>,
     max_chunk: usize,
@@ -5124,6 +5170,108 @@ fn writer_rejects_entry_after_dropped_finish() -> Result<()> {
         let entries = collect_entries_async(Cursor::new(archive)).await?;
         let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, ["dir/"]);
+        Ok(())
+    })
+}
+
+#[test]
+fn writer_feed_does_not_accept_entry_when_dropped() -> Result<()> {
+    block_on_test(async {
+        let (sink, bytes) = VecAsyncWriter::new();
+        let mut writer = TarWriter::new(InterleavePending::new(sink));
+        writer
+            .feed(TarEntry::from(TarRegularFile::new(
+                "a",
+                3,
+                Cursor::new(b"abc".as_slice()),
+            )))
+            .await?;
+        let wakes = Arc::new(WakeCount::default());
+        let dir = || TarEntry::from(TarDirectory::new("b/"));
+        // poll_ready writes the previous entry and returns Pending.
+        assert!(poll_once(writer.feed(dir()), &wakes).is_pending());
+
+        // The dropped feed did not accept the entry, so send it again.
+        writer.feed(dir()).await?;
+        writer.finish().await?;
+        let archive = bytes.lock().unwrap().clone();
+        let entries = collect_entries_async(Cursor::new(archive)).await?;
+        let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["a", "b/"]);
+        Ok(())
+    })
+}
+
+#[test]
+fn writer_feed_does_not_accept_entry_after_error() -> Result<()> {
+    const BODY: &[u8] = b"body";
+    let entry = |i: usize| -> TarEntry<'static, Cursor<&'static [u8]>> {
+        match i {
+            0 => TarDirectory::new("a/").into(),
+            1 => TarRegularFile::new("a/f", BODY.len() as u64, Cursor::new(BODY)).into(),
+            _ => TarDirectory::new("b/").into(),
+        }
+    };
+    // Writes: three headers, the body, the padding and the end marker.
+    for fail_at in 1..=6 {
+        block_on_test(async {
+            let (sink, bytes) = VecAsyncWriter::new();
+            let mut writer = TarWriter::new(FailingWriter::new(sink, fail_at));
+            let mut errors = 0;
+            for i in 0..3 {
+                // A feed that fails did not accept the entry, so send it
+                // again.
+                if let Err(err) = writer.feed(entry(i)).await {
+                    assert_eq!(err.to_string(), "destination failure");
+                    errors += 1;
+                    writer.feed(entry(i)).await?;
+                }
+            }
+            if let Err(err) = writer.finish().await {
+                assert_eq!(err.to_string(), "destination failure");
+                errors += 1;
+                writer.finish().await?;
+            }
+            assert_eq!(errors, 1, "fail_at {fail_at}");
+
+            let archive = bytes.lock().unwrap().clone();
+            let entries = collect_entries_async(Cursor::new(archive)).await?;
+            let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+            assert_eq!(paths, ["a/", "a/f", "b/"], "fail_at {fail_at}");
+            assert_eq!(entries[1].data, BODY);
+            Result::Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_flush_writes_accepted_entry() -> Result<()> {
+    block_on_test(async {
+        let (sink, bytes) = VecAsyncWriter::new();
+        let mut writer = TarWriter::new(sink);
+        writer
+            .feed(TarEntry::from(TarRegularFile::new(
+                "a",
+                3,
+                Cursor::new(b"abc".as_slice()),
+            )))
+            .await?;
+        assert!(bytes.lock().unwrap().is_empty());
+
+        writer.flush().await?;
+        let archive = bytes.lock().unwrap().clone();
+        assert_eq!(archive.len(), 2 * BLOCK_SIZE);
+        assert_eq!(&archive[..2], b"a\0");
+        assert_eq!(&archive[BLOCK_SIZE..BLOCK_SIZE + 3], b"abc");
+        assert!(archive[BLOCK_SIZE + 3..].iter().all(|&b| b == 0));
+
+        writer.finish().await?;
+        let archive = bytes.lock().unwrap().clone();
+        let entries = collect_entries_async(Cursor::new(archive)).await?;
+        let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["a"]);
+        assert_eq!(entries[0].data, b"abc");
         Ok(())
     })
 }

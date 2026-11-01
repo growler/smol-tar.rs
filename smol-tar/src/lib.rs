@@ -13,8 +13,8 @@
 //! body to the end or drop the file entry.
 //!
 //! [`TarWriter`] is a [`Sink`] of [`TarEntry`] values. It also has the
-//! inherent methods [`TarWriter::write`] and [`TarWriter::finish`], so you can
-//! write an archive without [`SinkExt`].
+//! inherent methods [`TarWriter::write`], [`TarWriter::flush`] and
+//! [`TarWriter::finish`], so you can write an archive without [`SinkExt`].
 //!
 //! Write entries with [`TarWriter::write`] or [`SinkExt::send`]. Finish the
 //! archive with [`TarWriter::finish`] or [`SinkExt::close`]. These methods
@@ -4064,6 +4064,39 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     /// - The file body reader or the underlying writer returns an error. The
     ///   method returns that error.
     ///
+    /// # Cancel safety
+    ///
+    /// The method is not cancel safe. The method accepts the entry after it
+    /// writes the rest of the previous entry and before it flushes the new
+    /// entry. If the method returns an error, or if you drop the future before
+    /// it completes, the entry can be in the archive or not. If you write the
+    /// entry again after such an error, the archive can contain the entry two
+    /// times.
+    ///
+    /// The method takes the entry by value. After an error, or when you drop
+    /// the future, you cannot get the entry back. If the writer did not
+    /// accept the entry, the method drops the entry and its body reader. To
+    /// write the entry again, you must make the entry again.
+    ///
+    /// [`SinkExt::send`] has the same behavior as this method.
+    ///
+    /// When you must know if the writer accepted the entry, call
+    /// [`Sink::poll_ready`] and then [`Sink::start_send`], or use
+    /// [`SinkExt::feed`]. When [`Sink::start_send`] returns `Ok`, the writer
+    /// accepted the entry. An error from [`Sink::poll_ready`] comes from the
+    /// previous entry, from the buffered data or from a finished archive, and
+    /// the writer did not accept the new entry.
+    ///
+    /// With these methods, the next call to [`Sink::poll_ready`],
+    /// [`Sink::poll_flush`], [`TarWriter::flush`], [`Sink::poll_close`] or
+    /// [`TarWriter::finish`] writes the body of the accepted entry. A
+    /// [`TarReader`] gives the next entry only after the body of the previous
+    /// entry is read to the end or dropped. Thus a loop that copies entries
+    /// from a [`TarReader`] must flush the writer after each accepted entry,
+    /// before it reads the next entry.
+    ///
+    /// [`SinkExt::send`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.send
+    /// [`SinkExt::feed`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.feed
     /// [`SinkExt::close`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.close
     pub async fn write(&mut self, entry: TarEntry<'b, R>) -> std::io::Result<()> {
         poll_fn(|cx| {
@@ -4076,6 +4109,37 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
         // SAFETY: same as above; `start_send` does not move out of `self`.
         unsafe { Pin::new_unchecked(&mut *self) }.start_send(entry)?;
 
+        poll_fn(|cx| {
+            // SAFETY: the mutable borrow of `self` is held for the duration of
+            // this async method, so the writer cannot be moved while polled.
+            unsafe { Pin::new_unchecked(&mut *self) }.poll_flush(cx)
+        })
+        .await
+    }
+
+    /// Write the buffered data and the body of the accepted entry, then flush
+    /// the underlying writer.
+    ///
+    /// [`TarWriter::write`] does these steps for each entry. Use this method
+    /// after you give entries with [`Sink::start_send`] or [`SinkExt::feed`].
+    /// [`SinkExt::flush`] does the same steps.
+    ///
+    /// If you drop the future before it completes, the writer keeps the data
+    /// that it did not write. The next call continues to write it.
+    ///
+    /// # Errors
+    ///
+    /// The method returns an error in these conditions:
+    ///
+    /// - [`ErrorKind::UnexpectedEof`]: the file body ends before
+    ///   [`TarRegularFile::size`] bytes.
+    /// - [`ErrorKind::WriteZero`]: the underlying writer accepts zero bytes.
+    /// - The file body reader or the underlying writer returns an error. The
+    ///   method returns that error.
+    ///
+    /// [`SinkExt::feed`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.feed
+    /// [`SinkExt::flush`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.flush
+    pub async fn flush(&mut self) -> std::io::Result<()> {
         poll_fn(|cx| {
             // SAFETY: the mutable borrow of `self` is held for the duration of
             // this async method, so the writer cannot be moved while polled.

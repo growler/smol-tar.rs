@@ -77,17 +77,24 @@ you enable both features, the crate uses the `tokio` traits.
 5. Give `TarRegularFile::new` the exact size of the body. If the body is
    shorter, the write fails with `ErrorKind::UnexpectedEof`. If the body is
    longer, the writer does not read the remaining bytes.
-6. Call `TarWriter::finish` or `SinkExt::close` after the last entry. These
+6. `TarWriter::write` and `SinkExt::send` are not cancel safe. If the call
+   fails or you drop its future, the entry can be in the archive or not. If
+   you write the entry again, the archive can contain it two times. To know
+   if the writer accepted the entry, use `SinkExt::feed`, or `poll_ready` and
+   then `start_send`. An `Ok` from `start_send` means that the writer
+   accepted the entry. In that case, call `TarWriter::flush` after each
+   accepted entry, before you read the next entry from a `TarReader`.
+7. Call `TarWriter::finish` or `SinkExt::close` after the last entry. These
    methods write the two zero blocks that end a tar archive and close the
    destination. `StreamExt::forward` closes the writer at the end of the
    stream. After that, `write` and `SinkExt::send` return an error.
-7. All file entries of one `TarWriter` use the same body type `R`. To write
+8. All file entries of one `TarWriter` use the same body type `R`. To write
    bodies of different types, box them as
    `Box<dyn AsyncBufRead + Unpin + Send>`. If you write only entries without a
    body, such as directories, set `R` explicitly, for example with the
    `Empty` type of `smol::io` or `tokio::io`:
    `TarWriter::<_, Empty>::new(destination)`.
-8. Paths, link targets, and user and group names are UTF-8 strings. Extended
+9. Paths, link targets, and user and group names are UTF-8 strings. Extended
    attribute names are UTF-8 strings. Extended attribute values are bytes.
 
 ## Errors
@@ -368,8 +375,8 @@ Refer to [docs.rs](https://docs.rs/smol-tar) for the full API.
 : A `Stream` of `std::io::Result<TarEntry>`.
 
 `TarWriter::new(destination)`
-: A `Sink` of `TarEntry`. It also has the methods `write(entry)` and
-  `finish()`.
+: A `Sink` of `TarEntry`. It also has the methods `write(entry)`,
+  `flush()` and `finish()`.
 
 `TarEntry`
 : An enum with the variants `File`, `Link`, `Symlink`, `Directory`,
