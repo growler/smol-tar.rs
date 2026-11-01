@@ -265,6 +265,9 @@ fn round_trip() {
     let dest = tmp.path().join("dest");
     fs::create_dir(&src).unwrap();
     fs::create_dir(&dest).unwrap();
+    // Without the setgid bit on `dest`, the new directories get no setgid
+    // bit from it.
+    fs::set_permissions(&dest, Permissions::from_mode(0o755)).unwrap();
     make_tree(&src);
     let xattrs = add_xattrs(&src);
 

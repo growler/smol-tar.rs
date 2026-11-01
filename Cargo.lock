@@ -477,11 +477,12 @@ checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "picotar"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "async-compression",
  "futures",
  "futures-lite",
+ "libc",
  "smol",
  "smol-tar",
  "smol-tar-fs",
@@ -610,10 +611,9 @@ dependencies = [
 
 [[package]]
 name = "smol-tar"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "async-compression",
- "async-lock",
  "futures",
  "futures-core",
  "futures-io",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "smol-tar-fs"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "blocking",
  "futures",

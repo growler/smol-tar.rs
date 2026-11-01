@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::SinkExt;
@@ -565,12 +565,44 @@ fn run_ok(current_dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> io::Result
     Ok(output)
 }
 
+/// Run picotar in `current_dir` with the umask `umask`. Fail if picotar
+/// does not exit with success.
+fn run_ok_with_umask(current_dir: &Path, umask: &str, args: &[&str]) -> io::Result<Output> {
+    let output = Command::new("sh")
+        .current_dir(current_dir)
+        .arg("-c")
+        .arg(format!("umask {umask} && exec \"$0\" \"$@\""))
+        .arg(bin())
+        .args(args)
+        .output()?;
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    Ok(output)
+}
+
 fn path_str(path: &Path) -> &str {
     path.to_str().unwrap()
 }
 
 fn mode_of(path: &Path) -> io::Result<u32> {
     Ok(fs::metadata(path)?.permissions().mode() & 0o7777)
+}
+
+/// Give the setgid bit that a new directory in `dir` keeps after a mode
+/// change: 0o2000 if a new directory gets the setgid bit from `dir` and
+/// keeps it after a change to mode 0o2700. Else give 0.
+fn kept_setgid(dir: &Path) -> io::Result<u32> {
+    if mode_of(dir)? & 0o2000 == 0 {
+        return Ok(0);
+    }
+    let probe = dir.join("setgid-probe");
+    fs::create_dir(&probe)?;
+    let mut kept = mode_of(&probe)? & 0o2000;
+    if kept != 0 {
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o2700))?;
+        kept = mode_of(&probe)? & 0o2000;
+    }
+    fs::remove_dir(&probe)?;
+    Ok(kept)
 }
 
 /// Make `src/tree` with two files, a subdirectory and a hard link.
@@ -842,10 +874,16 @@ fn preserve_permissions_keeps_special_bits() -> io::Result<()> {
     )?;
 
     let plain = temp.path().join("plain");
-    run_ok(
+    run_ok_with_umask(
         temp.path(),
-        &["-xf", path_str(&archive), "-C", path_str(&plain)],
-        None,
+        "022",
+        &[
+            "-xf",
+            path_str(&archive),
+            "-C",
+            path_str(&plain),
+            "--no-same-permissions",
+        ],
     )?;
     assert_eq!(mode_of(&plain.join("tree/run.sh"))?, 0o755);
 
@@ -856,6 +894,331 @@ fn preserve_permissions_keeps_special_bits() -> io::Result<()> {
         None,
     )?;
     assert_eq!(mode_of(&preserved.join("tree/run.sh"))?, 0o4755);
+    Ok(())
+}
+
+#[test]
+fn extract_applies_umask() -> io::Result<()> {
+    let temp = TempDir::new()?;
+    let src_root = make_sample_tree(temp.path())?;
+    let tree = src_root.join("tree");
+    fs::set_permissions(tree.join("alpha.txt"), fs::Permissions::from_mode(0o666))?;
+    fs::set_permissions(tree.join("nested"), fs::Permissions::from_mode(0o777))?;
+    let archive = temp.path().join("archive.tar");
+    run_ok(
+        temp.path(),
+        &["-cf", path_str(&archive), "-C", path_str(&src_root), "tree"],
+        None,
+    )?;
+
+    let masked = temp.path().join("masked");
+    run_ok_with_umask(
+        temp.path(),
+        "027",
+        &[
+            "-xf",
+            path_str(&archive),
+            "-C",
+            path_str(&masked),
+            "--no-same-permissions",
+        ],
+    )?;
+    assert_eq!(mode_of(&masked.join("tree/alpha.txt"))?, 0o640);
+    let setgid = kept_setgid(&masked)?;
+    assert_eq!(mode_of(&masked.join("tree/nested"))?, 0o750 | setgid);
+
+    let preserved = temp.path().join("preserved");
+    run_ok_with_umask(
+        temp.path(),
+        "027",
+        &["-xpf", path_str(&archive), "-C", path_str(&preserved)],
+    )?;
+    assert_eq!(mode_of(&preserved.join("tree/alpha.txt"))?, 0o666);
+    assert_eq!(mode_of(&preserved.join("tree/nested"))?, 0o777);
+    Ok(())
+}
+
+#[test]
+fn extract_missing_parent_uses_umask() -> io::Result<()> {
+    let temp = TempDir::new()?;
+    let archive = temp.path().join("archive.tar");
+    build_archive(&archive, vec![file_entry("tree/sub/f", "f")])?;
+    for (umask, expect) in [("077", 0o700), ("002", 0o775)] {
+        for option in ["--same-permissions", "--no-same-permissions", ""] {
+            let dest = temp.path().join(format!("dest-{umask}{option}"));
+            let mut args = vec!["-xf", path_str(&archive), "-C", path_str(&dest)];
+            if !option.is_empty() {
+                args.push(option);
+            }
+            run_ok_with_umask(temp.path(), umask, &args)?;
+            let setgid = mode_of(&dest)? & 0o2000;
+            for path in ["tree", "tree/sub"] {
+                assert_eq!(
+                    mode_of(&dest.join(path))?,
+                    expect | setgid,
+                    "{path} umask {umask} {option}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Without `-p`, a directory keeps the setgid bit that it gets from its
+/// parent. With `-p`, it gets the exact mode of the entry.
+#[test]
+fn extract_keeps_setgid_from_parent() -> io::Result<()> {
+    let temp = TempDir::new()?;
+    let archive = temp.path().join("archive.tar");
+    build_archive(
+        &archive,
+        vec![
+            TarDirectory::new("tree/").with_mode(0o755).into(),
+            TarDirectory::new("tree/sub/").with_mode(0o755).into(),
+            file_entry("tree/sub/f", "f"),
+        ],
+    )?;
+    for (option, expect) in [("--no-same-permissions", 0o2755), ("-p", 0o755)] {
+        let dest = temp.path().join(format!("dest{option}"));
+        fs::create_dir(&dest)?;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o2755))?;
+        if mode_of(&dest)? != 0o2755 {
+            eprintln!("skip: the process cannot set the setgid bit");
+            return Ok(());
+        }
+        let probe = dest.join("probe");
+        fs::create_dir(&probe)?;
+        let inherited = mode_of(&probe)? & 0o2000 != 0;
+        fs::remove_dir(&probe)?;
+        if !inherited {
+            eprintln!("skip: a new directory does not get the setgid bit");
+            return Ok(());
+        }
+        let args = ["-xf", path_str(&archive), "-C", path_str(&dest), option];
+        run_ok_with_umask(temp.path(), "022", &args)?;
+        for (path, expect) in [
+            ("tree", expect),
+            ("tree/sub", expect),
+            ("tree/sub/f", 0o644),
+        ] {
+            assert_eq!(mode_of(&dest.join(path))?, expect, "{path} {option}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn extract_keeps_mode_for_root() -> io::Result<()> {
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skip: the process does not run as root");
+        return Ok(());
+    }
+    let temp = TempDir::new()?;
+    let src_root = make_sample_tree(temp.path())?;
+    let tree = src_root.join("tree");
+    let script = tree.join("run.sh");
+    write_text(&script, "#!/bin/sh\n")?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o4755))?;
+    fs::set_permissions(tree.join("nested"), fs::Permissions::from_mode(0o777))?;
+    let archive = temp.path().join("archive.tar");
+    run_ok(
+        temp.path(),
+        &["-cf", path_str(&archive), "-C", path_str(&src_root), "tree"],
+        None,
+    )?;
+
+    let kept = temp.path().join("kept");
+    run_ok_with_umask(
+        temp.path(),
+        "077",
+        &["-xf", path_str(&archive), "-C", path_str(&kept)],
+    )?;
+    assert_eq!(mode_of(&kept.join("tree/run.sh"))?, 0o4755);
+    assert_eq!(mode_of(&kept.join("tree/nested"))?, 0o777);
+
+    let masked = temp.path().join("masked");
+    run_ok_with_umask(
+        temp.path(),
+        "077",
+        &[
+            "-xf",
+            path_str(&archive),
+            "-C",
+            path_str(&masked),
+            "--no-same-permissions",
+        ],
+    )?;
+    assert_eq!(mode_of(&masked.join("tree/run.sh"))?, 0o700);
+    assert_eq!(mode_of(&masked.join("tree/nested"))?, 0o700);
+    Ok(())
+}
+
+#[test]
+fn extract_sets_owner_for_root() -> io::Result<()> {
+    // SAFETY: `geteuid` has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        eprintln!("skip: the process does not run as root");
+        return Ok(());
+    }
+    const ID: u32 = 1234;
+    let temp = TempDir::new()?;
+    // A user namespace can map only uid 0. Then the owner change fails.
+    let probe = temp.path().join("probe");
+    fs::write(&probe, "")?;
+    if let Err(err) = std::os::unix::fs::chown(&probe, Some(ID), Some(ID)) {
+        eprintln!("skip: the process cannot set the owner {ID}:{ID}: {err}");
+        return Ok(());
+    }
+    let archive = temp.path().join("archive.tar");
+    build_archive(
+        &archive,
+        vec![
+            TarRegularFile::new("run.sh", 10, ArchiveCursor::new(b"#!/bin/sh\n".to_vec()))
+                .with_uid(ID)
+                .with_gid(ID)
+                .with_mode(0o4755)
+                .into(),
+        ],
+    )?;
+
+    let owned = temp.path().join("owned");
+    run_ok(
+        temp.path(),
+        &["-xf", path_str(&archive), "-C", path_str(&owned)],
+        None,
+    )?;
+    let meta = fs::metadata(owned.join("run.sh"))?;
+    assert_eq!((meta.uid(), meta.gid()), (ID, ID));
+    assert_eq!(mode_of(&owned.join("run.sh"))?, 0o4755);
+
+    let plain = temp.path().join("plain");
+    run_ok(
+        temp.path(),
+        &[
+            "-xf",
+            path_str(&archive),
+            "-C",
+            path_str(&plain),
+            "--no-same-owner",
+        ],
+        None,
+    )?;
+    let meta = fs::metadata(plain.join("run.sh"))?;
+    assert_eq!(meta.uid(), euid);
+    Ok(())
+}
+
+/// Run picotar in `current_dir` with `args` under `unshare -r`. The user
+/// namespace maps only uid 0, thus picotar runs as root and cannot set
+/// other owners. Give `None` if the system cannot run `unshare -r`.
+fn run_in_user_namespace(current_dir: &Path, args: &[&str]) -> io::Result<Option<Output>> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    let usable = Command::new("unshare")
+        .args(["-r", "true"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !usable {
+        return Ok(None);
+    }
+    Command::new("unshare")
+        .current_dir(current_dir)
+        .arg("-r")
+        .arg(bin())
+        .args(args)
+        .output()
+        .map(Some)
+}
+
+#[test]
+fn extract_continues_after_owner_errors() -> io::Result<()> {
+    const ID: u32 = 1234;
+    let temp = TempDir::new()?;
+    let archive = temp.path().join("archive.tar");
+    build_archive(
+        &archive,
+        vec![
+            TarDirectory::new("./").with_uid(ID).with_gid(ID).into(),
+            TarRegularFile::new("a.txt", 1, ArchiveCursor::new(b"a".to_vec()))
+                .with_uid(ID)
+                .with_gid(ID)
+                .with_mode(0o4755)
+                .into(),
+            TarRegularFile::new("b.txt", 1, ArchiveCursor::new(b"b".to_vec()))
+                .with_uid(ID)
+                .with_gid(ID)
+                .into(),
+        ],
+    )?;
+
+    let owned = temp.path().join("owned");
+    let args = ["-xf", path_str(&archive), "-C", path_str(&owned)];
+    let Some(output) = run_in_user_namespace(temp.path(), &args)? else {
+        eprintln!("skip: the system cannot run `unshare -r`");
+        return Ok(());
+    };
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for path in ["a.txt", "b.txt"] {
+        let warning = format!("{path}: cannot set the owner to uid {ID}, gid {ID}");
+        assert!(stderr.contains(&warning), "{stderr}");
+    }
+    assert!(
+        stderr.ends_with("picotar: exiting with failure status due to previous errors\n"),
+        "{stderr}"
+    );
+    assert_eq!(mode_of(&owned.join("a.txt"))?, 0o755);
+    assert_eq!(fs::read_to_string(owned.join("a.txt"))?, "a");
+    assert_eq!(fs::read_to_string(owned.join("b.txt"))?, "b");
+
+    let plain = temp.path().join("plain");
+    let args = [
+        "-xf",
+        path_str(&archive),
+        "-C",
+        path_str(&plain),
+        "--no-same-owner",
+    ];
+    let output = run_in_user_namespace(temp.path(), &args)?.expect("unshare -r runs");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(mode_of(&plain.join("a.txt"))?, 0o4755);
+    Ok(())
+}
+
+#[test]
+fn touch_keeps_extraction_time() -> io::Result<()> {
+    let temp = TempDir::new()?;
+    let src_root = make_sample_tree(temp.path())?;
+    let old = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    for path in ["tree/alpha.txt", "tree/nested"] {
+        fs::File::open(src_root.join(path))?.set_modified(old)?;
+    }
+    let archive = temp.path().join("archive.tar");
+    run_ok(
+        temp.path(),
+        &["-cf", path_str(&archive), "-C", path_str(&src_root), "tree"],
+        None,
+    )?;
+
+    let plain = temp.path().join("plain");
+    run_ok(
+        temp.path(),
+        &["-xf", path_str(&archive), "-C", path_str(&plain)],
+        None,
+    )?;
+    let touched = temp.path().join("touched");
+    run_ok(
+        temp.path(),
+        &["-xmf", path_str(&archive), "-C", path_str(&touched)],
+        None,
+    )?;
+    for path in ["tree/alpha.txt", "tree/nested"] {
+        assert_eq!(fs::metadata(plain.join(path))?.mtime(), 1_000_000_000);
+        assert_ne!(fs::metadata(touched.join(path))?.mtime(), 1_000_000_000);
+    }
     Ok(())
 }
 

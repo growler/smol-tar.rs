@@ -10,7 +10,7 @@ use ::smol_tar::{
     TarWriter,
 };
 use ::smol_tar_fs::{
-    DeviceNodes, FsEntry, FsKind, FsSink, FsSource, FsStreamExt, MissingLinkTarget,
+    DeviceNodes, FsEntry, FsKind, FsSink, FsSource, FsStreamExt, MissingLinkTarget, ModePolicy,
 };
 #[cfg(feature = "tokio")]
 use ::tokio::{
@@ -34,6 +34,15 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     process::ExitCode,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+#[cfg(feature = "tokio")]
+use std::{
+    pin::Pin,
+    task::{ready, Context, Poll},
 };
 
 /// Size of the buffer around the archive file or stream.
@@ -59,8 +68,12 @@ options:
   -v, --verbose               write each entry path to stderr (-c, -x)
       --exclude PATH          skip the entries at or below PATH (-c, -x)
       --xattrs                read or write extended attributes (-c, -x)
-  -p, --preserve-permissions  keep the setuid, setgid and sticky bits (-x)
-      --same-owner            set the owner from the archive (-x)
+  -p, --preserve-permissions  keep entry modes and setuid/setgid/sticky (-x)
+      --same-permissions      same as -p; the default for root (-x)
+      --no-same-permissions   apply the umask (-x); default if not root
+  -m, --touch                 do not set the modification time (-x)
+      --same-owner            set the archive owner (-x); default for root
+      --no-same-owner         do not set the owner (-x); default if not root
       --devices               create device nodes (-x)
       --skip-missing-links    skip hard links without a target (-x)
       --strip-components N    remove N leading path components (-x)"
@@ -80,7 +93,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let cli = match parse_cli(args) {
+    let mut cli = match parse_cli(args) {
         Ok(cli) => cli,
         Err(message) => {
             eprintln!("{program_name}: {message}");
@@ -88,6 +101,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The process has one thread here. Thus the short change of the umask
+    // has no effect on other file creates.
+    cli.options.umask = process_umask();
+    // SAFETY: `geteuid` has no preconditions.
+    cli.options.is_root = unsafe { libc::geteuid() } == 0;
 
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -127,11 +145,39 @@ pub struct Options {
     pub verbose: bool,
     pub excludes: Vec<PathBuf>,
     pub xattrs: bool,
-    pub preserve_permissions: bool,
-    pub same_owner: bool,
+    /// -p or --no-same-permissions. None: no option given.
+    pub preserve_permissions: Option<bool>,
+    pub touch: bool,
+    /// --same-owner or --no-same-owner. None: no option given.
+    pub same_owner: Option<bool>,
     pub devices: bool,
     pub skip_missing_links: bool,
     pub strip_components: usize,
+    /// Umask of the process. `main` sets it after the parse.
+    pub umask: u32,
+    /// The effective uid is 0. `main` sets it after the parse.
+    pub is_root: bool,
+}
+
+/// Give the umask of the process. The process must have one thread.
+// `mode_t` is `u32` on Linux and `u16` on Apple platforms.
+#[allow(clippy::useless_conversion)]
+fn process_umask() -> u32 {
+    // SAFETY: `umask` has no preconditions. The second call restores the
+    // umask of the first call.
+    let umask = unsafe {
+        let umask = libc::umask(0o022);
+        libc::umask(umask);
+        umask
+    };
+    umask.into()
+}
+
+/// Give the value of an extract option that is on for root by default:
+/// `--same-permissions` or `--same-owner`. Without an option, the value is
+/// true only for root.
+fn root_default(flag: Option<bool>, is_root: bool) -> bool {
+    flag.unwrap_or(is_root)
 }
 
 pub fn parse_cli<I>(args: I) -> Result<Cli, String>
@@ -169,7 +215,8 @@ where
                             'z' => set_compression(&mut options.compression, Compression::Gzip)?,
                             'J' => set_compression(&mut options.compression, Compression::Xz)?,
                             'v' => options.verbose = true,
-                            'p' => options.preserve_permissions = true,
+                            'p' => options.preserve_permissions = Some(true),
+                            'm' => options.touch = true,
                             'f' | 'C' => {
                                 let value_start = 1 + offset + flag.len_utf8();
                                 let value = if value_start < text.len() {
@@ -222,8 +269,14 @@ where
 
     if mode != Mode::Extract {
         for (used, option) in [
-            (options.preserve_permissions, "-p"),
-            (options.same_owner, "--same-owner"),
+            (options.preserve_permissions == Some(true), "-p"),
+            (
+                options.preserve_permissions == Some(false),
+                "--no-same-permissions",
+            ),
+            (options.touch, "-m"),
+            (options.same_owner == Some(true), "--same-owner"),
+            (options.same_owner == Some(false), "--no-same-owner"),
             (options.devices, "--devices"),
             (options.skip_missing_links, "--skip-missing-links"),
             (options.strip_components > 0, "--strip-components"),
@@ -270,8 +323,11 @@ fn parse_long_option(
         "zstd" => set_compression(&mut options.compression, Compression::Zstd)?,
         "verbose" => options.verbose = true,
         "xattrs" => options.xattrs = true,
-        "preserve-permissions" => options.preserve_permissions = true,
-        "same-owner" => options.same_owner = true,
+        "preserve-permissions" | "same-permissions" => options.preserve_permissions = Some(true),
+        "no-same-permissions" => options.preserve_permissions = Some(false),
+        "touch" => options.touch = true,
+        "same-owner" => options.same_owner = Some(true),
+        "no-same-owner" => options.same_owner = Some(false),
         "devices" => options.devices = true,
         "skip-missing-links" => options.skip_missing_links = true,
         "exclude" => {
@@ -707,21 +763,29 @@ async fn run_extract(cli: Cli) -> io::Result<()> {
     let entries = TarReader::new(reader)
         .try_filter(|entry| future::ready(is_selected(entry.path(), &filters, &excludes)));
 
+    let owner_failed = Arc::new(AtomicBool::new(false));
     let count = options.strip_components;
     if count == 0 {
-        entries
-            .inspect_ok(|entry| print_entry(entry, &options))
-            .forward(fs_sink(&destination, &options))
-            .await
+        fs_sink(&destination, &options, Arc::clone(&owner_failed))
+            .extract(entries.inspect_ok(|entry| print_entry(entry, &options)))
+            .await?;
     } else {
-        entries
-            .try_filter_map(|entry| {
-                future::ready(strip_entry(entry, count, options.skip_missing_links))
-            })
-            .inspect_ok(|entry| print_entry(entry, &options))
-            .forward(fs_sink(&destination, &options))
-            .await
+        fs_sink(&destination, &options, Arc::clone(&owner_failed))
+            .extract(
+                entries
+                    .try_filter_map(|entry| {
+                        future::ready(strip_entry(entry, count, options.skip_missing_links))
+                    })
+                    .inspect_ok(|entry| print_entry(entry, &options)),
+            )
+            .await?;
     }
+    if owner_failed.load(Ordering::Relaxed) {
+        return Err(io::Error::other(
+            "exiting with failure status due to previous errors",
+        ));
+    }
+    Ok(())
 }
 
 /// With `-v`, write the path of `entry` to stderr. Do not write the path of
@@ -732,13 +796,31 @@ fn print_entry<R: AsyncRead + Unpin>(entry: &TarEntry<'_, R>, options: &Options)
     }
 }
 
+/// Make the sink for the extraction. If the owner change of a node fails,
+/// write a warning and set `owner_failed`.
 fn fs_sink<'a, R: AsyncRead + Unpin + Send + 'a>(
     destination: &Path,
     options: &Options,
+    owner_failed: Arc<AtomicBool>,
 ) -> FsSink<'a, R> {
+    let keep = root_default(options.preserve_permissions, options.is_root);
     FsSink::new(destination)
-        .with_special_bits(options.preserve_permissions)
-        .with_owner(options.same_owner)
+        .with_mode(if keep {
+            ModePolicy::Apply
+        } else {
+            ModePolicy::Mask(options.umask)
+        })
+        .with_special_bits(keep)
+        .with_mtime(!options.touch)
+        .with_owner(root_default(options.same_owner, options.is_root))
+        .with_owner_error(move |path, err| {
+            use std::io::Write as _;
+
+            let line = format!("{}: {path}: {err}\n", program_name());
+            let _ = io::stderr().write_all(line.as_bytes());
+            owner_failed.store(true, Ordering::Relaxed);
+            Ok(())
+        })
         .with_xattrs(options.xattrs)
         .with_device_nodes(if options.devices {
             DeviceNodes::Create
@@ -784,6 +866,8 @@ fn archive_writer(
     target: Box<dyn AsyncWrite + Unpin + Send>,
     compression: Option<Compression>,
 ) -> Box<dyn AsyncWrite + Unpin + Send> {
+    #[cfg(feature = "tokio")]
+    let target: Box<dyn AsyncWrite + Unpin + Send> = Box::new(FlushOnShutdown(target));
     let target: Box<dyn AsyncWrite + Unpin + Send> = match compression {
         None => target,
         Some(Compression::Gzip) => Box::new(encode::GzipEncoder::new(target)),
@@ -815,9 +899,37 @@ fn stdout_archive_writer() -> Box<dyn AsyncWrite + Unpin + Send> {
     Box::new(::tokio::io::stdout())
 }
 
+/// Writer that flushes the inner writer before the shutdown of it.
+///
+/// The shutdown of the tokio stdout does not wait for the write that is in
+/// progress. Without a flush, the archive end can get lost when the runtime
+/// stops.
+#[cfg(feature = "tokio")]
+struct FlushOnShutdown<W>(W);
+
+#[cfg(feature = "tokio")]
+impl<W: AsyncWrite + Unpin> AsyncWrite for FlushOnShutdown<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(Pin::new(&mut self.0).poll_flush(cx))?;
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_selected, parse_cli, strip_path, Cli, Compression, Mode};
+    use super::{is_selected, parse_cli, root_default, strip_path, Cli, Compression, Mode};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -883,7 +995,7 @@ mod tests {
     #[test]
     fn parse_extract_options() {
         let cli = parse(&[
-            "-xpJf",
+            "-xpmJf",
             "archive.tar.xz",
             "--same-owner",
             "--devices",
@@ -892,8 +1004,9 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.options.compression, Some(Compression::Xz));
-        assert!(cli.options.preserve_permissions);
-        assert!(cli.options.same_owner);
+        assert_eq!(cli.options.preserve_permissions, Some(true));
+        assert!(cli.options.touch);
+        assert_eq!(cli.options.same_owner, Some(true));
         assert!(cli.options.devices);
         assert!(cli.options.skip_missing_links);
         assert_eq!(cli.options.strip_components, 2);
@@ -902,14 +1015,85 @@ mod tests {
         let cli = parse(&["-x", "--xzip", "--strip-components", "1", "-f", "a"]).unwrap();
         assert_eq!(cli.options.compression, Some(Compression::Xz));
         assert_eq!(cli.options.strip_components, 1);
+        assert!(!cli.options.touch);
+        assert_eq!(cli.options.preserve_permissions, None);
+
+        let cli = parse(&["-xf", "a", "--touch"]).unwrap();
+        assert!(cli.options.touch);
     }
 
     #[test]
     fn parse_rejects_extract_options_for_create() {
         let err = parse(&["-cpf", "archive.tar", "tree"]).unwrap_err();
         assert_eq!(err, "option -p is only valid with -x");
+        let err = parse(&["-cmf", "archive.tar", "tree"]).unwrap_err();
+        assert_eq!(err, "option -m is only valid with -x");
         let err = parse(&["-tf", "archive.tar", "--strip-components=1"]).unwrap_err();
         assert_eq!(err, "option --strip-components is only valid with -x");
+    }
+
+    #[test]
+    fn parse_same_permissions_options() {
+        let cli = parse(&["-xf", "a", "--same-permissions"]).unwrap();
+        assert_eq!(cli.options.preserve_permissions, Some(true));
+        let cli = parse(&["-xf", "a", "--no-same-permissions"]).unwrap();
+        assert_eq!(cli.options.preserve_permissions, Some(false));
+        let cli = parse(&["-xf", "a"]).unwrap();
+        assert_eq!(cli.options.preserve_permissions, None);
+        let cli = parse(&["-xpf", "a", "--no-same-permissions"]).unwrap();
+        assert_eq!(cli.options.preserve_permissions, Some(false));
+    }
+
+    #[test]
+    fn parse_rejects_same_permissions_options_outside_extract() {
+        let err = parse(&["-cf", "a", "--no-same-permissions", "tree"]).unwrap_err();
+        assert_eq!(err, "option --no-same-permissions is only valid with -x");
+        let err = parse(&["-tf", "a", "--no-same-permissions"]).unwrap_err();
+        assert_eq!(err, "option --no-same-permissions is only valid with -x");
+        let err = parse(&["-cf", "a", "--same-permissions", "tree"]).unwrap_err();
+        assert_eq!(err, "option -p is only valid with -x");
+        let err = parse(&["-tf", "a", "--same-permissions"]).unwrap_err();
+        assert_eq!(err, "option -p is only valid with -x");
+        let err = parse(&["-tpf", "a"]).unwrap_err();
+        assert_eq!(err, "option -p is only valid with -x");
+    }
+
+    #[test]
+    fn parse_same_owner_options() {
+        let cli = parse(&["-xf", "a", "--same-owner"]).unwrap();
+        assert_eq!(cli.options.same_owner, Some(true));
+        let cli = parse(&["-xf", "a", "--no-same-owner"]).unwrap();
+        assert_eq!(cli.options.same_owner, Some(false));
+        let cli = parse(&["-xf", "a"]).unwrap();
+        assert_eq!(cli.options.same_owner, None);
+        let cli = parse(&["-xf", "a", "--same-owner", "--no-same-owner"]).unwrap();
+        assert_eq!(cli.options.same_owner, Some(false));
+        let cli = parse(&["-xf", "a", "--no-same-owner", "--same-owner"]).unwrap();
+        assert_eq!(cli.options.same_owner, Some(true));
+    }
+
+    #[test]
+    fn parse_rejects_same_owner_options_outside_extract() {
+        let err = parse(&["-cf", "a", "--same-owner", "tree"]).unwrap_err();
+        assert_eq!(err, "option --same-owner is only valid with -x");
+        let err = parse(&["-tf", "a", "--same-owner"]).unwrap_err();
+        assert_eq!(err, "option --same-owner is only valid with -x");
+        let err = parse(&["-cf", "a", "--no-same-owner", "tree"]).unwrap_err();
+        assert_eq!(err, "option --no-same-owner is only valid with -x");
+        let err = parse(&["-tf", "a", "--no-same-owner"]).unwrap_err();
+        assert_eq!(err, "option --no-same-owner is only valid with -x");
+    }
+
+    #[test]
+    fn root_default_depends_on_root() {
+        assert!(!root_default(None, false));
+        assert!(root_default(None, true));
+    }
+
+    #[test]
+    fn root_default_option_overrides_root() {
+        assert!(root_default(Some(true), false));
+        assert!(!root_default(Some(false), true));
     }
 
     #[test]
@@ -971,5 +1155,79 @@ mod tests {
         assert_eq!(strip_path("a//b", 1).as_deref(), Some("b"));
         assert_eq!(strip_path("a/", 1), None);
         assert_eq!(strip_path("a/b", 2), None);
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod tokio_tests {
+    use super::{archive_writer, decode, Compression};
+    use ::smol_tar::{TarDirectory, TarWriter};
+    use ::tokio::io::{AsyncReadExt, AsyncWrite};
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    /// Model of `tokio::io::Stdout`: the flush makes the written data visible,
+    /// and the shutdown does nothing.
+    #[derive(Clone, Default)]
+    struct LazyStdout {
+        pending: Arc<Mutex<Vec<u8>>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for LazyStdout {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.pending.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut pending = self.pending.lock().unwrap();
+            self.written.lock().unwrap().append(&mut pending);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn write_archive(compression: Option<Compression>) -> Vec<u8> {
+        let target = LazyStdout::default();
+        let mut tar =
+            TarWriter::<_, &[u8]>::new(archive_writer(Box::new(target.clone()), compression));
+        tar.write(TarDirectory::new("dir/").into()).await.unwrap();
+        tar.finish().await.unwrap();
+        let written = target.written.lock().unwrap().clone();
+        written
+    }
+
+    fn assert_complete(tar: &[u8]) {
+        assert_eq!(tar.len() % 512, 0);
+        assert!(tar.len() > 1024);
+        assert!(tar.ends_with(&[0; 1024]));
+    }
+
+    #[test]
+    fn close_flushes_archive_target() {
+        let rt = ::tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert_complete(&write_archive(None).await);
+
+            let written = write_archive(Some(Compression::Gzip)).await;
+            let mut tar = Vec::new();
+            decode::GzipDecoder::new(&written[..])
+                .read_to_end(&mut tar)
+                .await
+                .unwrap();
+            assert_complete(&tar);
+        });
     }
 }

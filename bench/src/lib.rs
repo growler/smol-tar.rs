@@ -6,6 +6,8 @@
 //! - `read_skip` reads every entry header and skips every file body.
 //! - `write` encodes a list of [`Spec`] values into a caller `Vec<u8>`.
 //! - `filter` copies every second entry of an archive into a caller `Vec<u8>`.
+//! - `encode_dir` encodes a directory tree on disk into a caller writer.
+//! - `extract` extracts an archive into a new directory on disk.
 
 #[cfg(all(feature = "smol", feature = "tokio"))]
 compile_error!("enable exactly one of `smol` or `tokio`, see bench/README.md");
@@ -13,10 +15,14 @@ compile_error!("enable exactly one of `smol` or `tokio`, see bench/README.md");
 compile_error!("enable exactly one of `smol` or `tokio`, see bench/README.md");
 
 use std::{
-    fmt,
+    fmt, fs,
     future::Future,
+    io,
+    path::PathBuf,
+    pin::Pin,
     sync::OnceLock,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    task::{Context, Poll},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Size of the buffer that `read_all` adapters read file bodies into.
@@ -24,6 +30,7 @@ pub const BUF_SIZE: usize = 64 * 1024;
 
 const MTIME: u64 = 1_700_000_000;
 const LARGE_FILE_SIZE: usize = 64 << 20;
+const TREE_LARGE_FILE_SIZE: usize = 16 << 20;
 const LONG_NAME: &str = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn";
 
 /// Entry and body byte counts from a `read_all` adapter.
@@ -235,6 +242,197 @@ impl fmt::Display for Corpus {
     }
 }
 
+/// A directory tree for the disk benchmarks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tree {
+    /// 1 file of 16 MiB.
+    Large,
+    /// 1,024 files of 1 KiB in 32 directories.
+    ManySmall,
+    /// The entries of the mixed corpus.
+    Mixed,
+}
+
+/// A tree on disk and a ustar archive of its entries.
+pub struct Fixture {
+    _dir: tempfile::TempDir,
+    /// The root directory of the tree.
+    pub root: PathBuf,
+    /// The entries of the tree. The archive has the same entries.
+    pub specs: Vec<Spec>,
+    /// The archive of the entries, written by the `tar` crate.
+    pub archive: Vec<u8>,
+    /// Number of file body bytes in the tree.
+    pub body_bytes: u64,
+}
+
+impl Tree {
+    /// All trees.
+    pub const ALL: [Tree; 3] = [Tree::Large, Tree::ManySmall, Tree::Mixed];
+
+    /// The name of the root directory. Each entry path starts with this
+    /// name.
+    pub fn root(self) -> &'static str {
+        match self {
+            Tree::Large => "large",
+            Tree::ManySmall => "many-small",
+            Tree::Mixed => "m",
+        }
+    }
+
+    /// The entries of the tree. The large and many-small trees have no
+    /// directory entries.
+    pub fn specs(self) -> Vec<Spec> {
+        let file = |path, size| Spec {
+            path,
+            kind: Kind::File(size),
+            xattrs: false,
+        };
+        match self {
+            Tree::Large => vec![file("large/payload.bin".into(), TREE_LARGE_FILE_SIZE)],
+            Tree::ManySmall => (0..1024)
+                .map(|i| file(format!("many-small/d{:02}/f{i:04}.txt", i % 32), 1024))
+                .collect(),
+            Tree::Mixed => mixed(100),
+        }
+    }
+
+    /// Make the tree in a new temporary directory, and make an archive of
+    /// its entries.
+    pub fn fixture(self) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let specs = self.specs();
+        let mut body_bytes = 0;
+        for spec in &specs {
+            let path = dir.path().join(&spec.path);
+            match &spec.kind {
+                Kind::Dir => fs::create_dir_all(&path).unwrap(),
+                Kind::File(size) => {
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, body(*size)).unwrap();
+                    body_bytes += *size as u64;
+                }
+                Kind::Symlink(target) => std::os::unix::fs::symlink(target, &path).unwrap(),
+            }
+        }
+        Fixture {
+            root: dir.path().join(self.root()),
+            archive: ustar_archive(&specs),
+            specs,
+            body_bytes,
+            _dir: dir,
+        }
+    }
+}
+
+impl fmt::Display for Tree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Tree::Large => "large-16m",
+            Tree::ManySmall => "many-small",
+            Tree::Mixed => "mixed",
+        })
+    }
+}
+
+/// A writer that counts the bytes and drops them.
+#[derive(Debug, Default)]
+pub struct CountingSink {
+    /// Number of bytes written.
+    pub bytes: u64,
+}
+
+impl io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Implement the `AsyncWrite` trait of the selected runtime for `$ty` with
+/// its `io::Write` implementation. Each call returns `Poll::Ready` and
+/// never returns `Poll::Pending`.
+macro_rules! async_write {
+    ($ty:ty) => {
+        #[cfg(feature = "smol")]
+        impl futures::AsyncWrite for $ty {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(io::Write::write(&mut *self, buf))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        impl tokio::io::AsyncWrite for $ty {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(io::Write::write(&mut *self, buf))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+    };
+}
+
+async_write!(CountingSink);
+
+/// A writer that counts the bytes and drops them. It takes
+/// [`SlowSink::NS_PER_KIB`] nanoseconds for each KiB, as a consumer that
+/// uses the CPU for each byte. It busy-waits on the thread that writes.
+#[derive(Debug, Default)]
+pub struct SlowSink {
+    /// Number of bytes written.
+    pub bytes: u64,
+}
+
+impl SlowSink {
+    /// Time in nanoseconds for each KiB: 100 ns, thus approximately 1.6 ms
+    /// for 16 MiB.
+    pub const NS_PER_KIB: u64 = 100;
+}
+
+impl io::Write for SlowSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let ns = Self::NS_PER_KIB * buf.len() as u64 / 1024;
+        let end = Instant::now() + Duration::from_nanos(ns);
+        while Instant::now() < end {
+            std::hint::spin_loop();
+        }
+        self.bytes += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+async_write!(SlowSink);
+
 /// The async runtime of the selected feature.
 #[cfg(feature = "smol")]
 pub struct Runtime;
@@ -288,16 +486,17 @@ pub mod adapters {
     /// smol-tar with the selected runtime.
     pub mod smol_tar {
         #[cfg(feature = "smol")]
-        use futures::AsyncReadExt;
+        use futures::{AsyncReadExt, AsyncWrite};
         #[cfg(feature = "tokio")]
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWrite};
         use {
             crate::{body, mtime, Counts, Kind, Spec},
             ::smol_tar::{
                 AttrList, TarDirectory, TarEntry, TarReader, TarRegularFile, TarSymlink, TarWriter,
             },
             futures::{future, StreamExt, TryStreamExt},
-            std::io::Result,
+            smol_tar_fs::{FsSink, FsSource, FsStreamExt, ModePolicy},
+            std::{fs, io::Result, path::Path},
         };
 
         /// Read every entry and every file body.
@@ -376,6 +575,35 @@ pub mod adapters {
                 .forward(&mut tar)
                 .await
         }
+
+        /// Encode the tree at `root` into `out`. Each entry path starts
+        /// with `prefix`.
+        pub async fn encode_dir<W: AsyncWrite + Unpin>(
+            root: &Path,
+            prefix: &str,
+            out: W,
+        ) -> Result<()> {
+            let mut tar = TarWriter::new(out);
+            FsSource::new(root)
+                .with_prefix(prefix)
+                .into_tar()
+                .forward(&mut tar)
+                .await
+        }
+
+        /// Extract `data` into the new directory `dest`. With `minimal`,
+        /// do not set the mode or the modification time.
+        pub async fn extract(data: &[u8], dest: &Path, minimal: bool) -> Result<()> {
+            // FsSink writes into an existing directory.
+            fs::create_dir(dest)?;
+            let sink = FsSink::new(dest);
+            let sink = if minimal {
+                sink.with_mode(ModePolicy::Skip).with_mtime(false)
+            } else {
+                sink
+            };
+            sink.extract(TarReader::new(data)).await
+        }
     }
 
     /// The synchronous `tar` crate.
@@ -383,7 +611,10 @@ pub mod adapters {
         use {
             crate::{body, Counts, Kind, Spec, MTIME},
             ::tar::{Archive, Builder, EntryType, Header},
-            std::io::{Read, Result},
+            std::{
+                io::{Read, Result, Write},
+                path::Path,
+            },
         };
 
         /// Read every entry and every file body.
@@ -467,19 +698,36 @@ pub mod adapters {
             }
             tar.finish()
         }
+
+        /// Encode the tree at `root` into `out`. Each entry path starts
+        /// with `prefix`.
+        pub fn encode_dir<W: Write>(root: &Path, prefix: &str, out: W) -> Result<()> {
+            let mut tar = Builder::new(out);
+            tar.follow_symlinks(false);
+            tar.append_dir_all(prefix, root)?;
+            tar.finish()
+        }
+
+        /// Extract `data` into the new directory `dest`. With `minimal`,
+        /// do not set the modification time.
+        pub fn extract(data: &[u8], dest: &Path, minimal: bool) -> Result<()> {
+            let mut archive = Archive::new(data);
+            archive.set_preserve_mtime(!minimal);
+            archive.unpack(dest)
+        }
     }
 
     /// `async-tar` with the selected runtime.
     pub mod async_tar {
         #[cfg(feature = "smol")]
-        use futures::AsyncReadExt;
+        use futures::{AsyncReadExt, AsyncWrite};
         #[cfg(feature = "tokio")]
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWrite};
         use {
             crate::{body, Counts, Kind, Spec, MTIME},
-            ::async_tar::{Archive, Builder, EntryType, Header},
+            ::async_tar::{Archive, ArchiveBuilder, Builder, EntryType, Header},
             futures::StreamExt,
-            std::io::Result,
+            std::{io::Result, path::Path},
         };
 
         /// Read every entry and every file body.
@@ -561,6 +809,29 @@ pub mod adapters {
             }
             tar.finish().await
         }
+
+        /// Encode the tree at `root` into `out`. Each entry path starts
+        /// with `prefix`.
+        pub async fn encode_dir<W: AsyncWrite + Unpin + Send + Sync>(
+            root: &Path,
+            prefix: &str,
+            out: W,
+        ) -> Result<()> {
+            let mut tar = Builder::new(out);
+            tar.follow_symlinks(false);
+            tar.append_dir_all(prefix, root).await?;
+            tar.finish().await
+        }
+
+        /// Extract `data` into the new directory `dest`. With `minimal`,
+        /// do not set the modification time.
+        pub async fn extract(data: &[u8], dest: &Path, minimal: bool) -> Result<()> {
+            ArchiveBuilder::new(data)
+                .set_preserve_mtime(!minimal)
+                .build()
+                .unpack(dest)
+                .await
+        }
     }
 
     /// `astral-tokio-tar`.
@@ -568,10 +839,10 @@ pub mod adapters {
     pub mod astral_tokio_tar {
         use {
             crate::{body, Counts, Kind, Spec, MTIME},
-            ::tokio_tar::{Archive, Builder, EntryType, Header},
+            ::tokio_tar::{Archive, ArchiveBuilder, Builder, EntryType, Header},
             futures::StreamExt,
-            std::io::Result,
-            tokio::io::AsyncReadExt,
+            std::{io::Result, path::Path},
+            tokio::io::{AsyncReadExt, AsyncWrite},
         };
 
         /// Read every entry and every file body.
@@ -659,6 +930,142 @@ pub mod adapters {
                 }
             }
             tar.finish().await
+        }
+
+        /// Encode the tree at `root` into `out`. Each entry path starts
+        /// with `prefix`.
+        pub async fn encode_dir<W: AsyncWrite + Unpin + Send>(
+            root: &Path,
+            prefix: &str,
+            out: W,
+        ) -> Result<()> {
+            let mut tar = Builder::new_non_terminated(out);
+            tar.follow_symlinks(false);
+            tar.append_dir_all(prefix, root).await?;
+            tar.finish().await
+        }
+
+        /// Extract `data` into the new directory `dest`. With `minimal`,
+        /// do not set the modification time.
+        pub async fn extract(data: &[u8], dest: &Path, minimal: bool) -> Result<()> {
+            ArchiveBuilder::new(data)
+                .set_preserve_mtime(!minimal)
+                .build()
+                .unpack(dest)
+                .await
+        }
+    }
+
+    /// `tar-codec`.
+    #[cfg(feature = "tokio")]
+    pub mod tar_codec {
+        use {
+            crate::{body, Counts, Kind, Spec, BUF_SIZE},
+            ::tar_codec::{
+                builder::{BuilderPolicy, SymlinkPolicy},
+                extract::ExtractPolicy,
+                Archive, ArchiveBuilder, DecodePolicy, EntryMetadata, FilePayload, Member,
+                MemberPayload, PaxDecodePolicy, PaxVendorExtensionPolicy, TarArchive, TarEncoder,
+            },
+            std::{
+                io::{Error, ErrorKind, Result},
+                path::Path,
+            },
+            tokio::io::AsyncWrite,
+        };
+
+        /// A reader of `data`. The default policy rejects unknown vendor
+        /// PAX records. The pax corpus has `SCHILY.xattr` records, so the
+        /// reader ignores the `SCHILY` records.
+        fn archive(data: &[u8]) -> TarArchive<&[u8]> {
+            TarArchive::new(data).with_policy(
+                DecodePolicy::default().pax_policy(
+                    PaxDecodePolicy::default()
+                        .vendor_extension_policy(PaxVendorExtensionPolicy::ignore(["SCHILY"])),
+                ),
+            )
+        }
+
+        /// Read every entry and every file body. tar-codec puts each part
+        /// of a body into a `Vec<u8>`.
+        pub async fn read_all(data: &[u8], buf: &mut Vec<u8>) -> Result<Counts> {
+            let mut tar = archive(data);
+            let mut counts = Counts::default();
+            while let Some(member) = tar.next_member().await.map_err(Error::other)? {
+                counts.entries += 1;
+                if let Member::File { mut payload, .. } = member {
+                    while payload
+                        .next_chunk(buf, BUF_SIZE)
+                        .await
+                        .map_err(Error::other)?
+                    {
+                        counts.bytes += buf.len() as u64;
+                    }
+                }
+            }
+            Ok(counts)
+        }
+
+        /// Read every entry and skip every file body.
+        pub async fn read_skip(data: &[u8]) -> Result<u64> {
+            let mut tar = archive(data);
+            let mut entries = 0;
+            while let Some(member) = tar.next_member().await.map_err(Error::other)? {
+                if let Member::File { payload, .. } = member {
+                    payload.skip().await.map_err(Error::other)?;
+                }
+                entries += 1;
+            }
+            Ok(entries)
+        }
+
+        /// Write `specs` into `out`. tar-codec writes a PAX header for each
+        /// entry, and does not write the mode or the modification time. Its
+        /// builder cannot write a symbolic link.
+        pub async fn write(specs: &[Spec], out: &mut Vec<u8>) -> Result<()> {
+            let mut tar = TarEncoder::new(out).builder();
+            for spec in specs {
+                match &spec.kind {
+                    Kind::Dir => tar.add_directory(spec.path.trim_end_matches('/')).await,
+                    Kind::File(size) => {
+                        tar.add_file(
+                            &spec.path,
+                            FilePayload::new(*size as u64, body(*size)),
+                            EntryMetadata::default(),
+                        )
+                        .await
+                    }
+                    Kind::Symlink(_) => {
+                        return Err(Error::new(
+                            ErrorKind::Unsupported,
+                            "tar-codec cannot write a symbolic link",
+                        ))
+                    }
+                }
+                .map_err(Error::other)?;
+            }
+            tar.finish().await.map_err(Error::other)
+        }
+
+        /// Encode the tree at `root` into `out`. The default policy rejects
+        /// a symbolic link, so the builder uses the policy that writes link
+        /// entries.
+        pub async fn encode_dir<W: AsyncWrite + Unpin>(root: &Path, out: W) -> Result<()> {
+            let mut tar = TarEncoder::new(out)
+                .builder()
+                .with_policy(BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve));
+            tar.add_directory_all(root).await.map_err(Error::other)?;
+            tar.finish().await.map_err(Error::other)
+        }
+
+        /// Extract `data` into the new directory `dest` with the default
+        /// policy. tar-codec does not set the mode from the archive or the
+        /// modification time, so it has no `minimal` option.
+        pub async fn extract(data: &[u8], dest: &Path) -> Result<()> {
+            TarArchive::new(data)
+                .extract_in(dest, ExtractPolicy::default())
+                .await
+                .map_err(Error::other)
         }
     }
 }

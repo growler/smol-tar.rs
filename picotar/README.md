@@ -64,12 +64,47 @@ Create and extract modes:
 
 Extract mode:
 
-`-p`, `--preserve-permissions`
-: Keep the setuid, setgid and sticky bits.
+By default, extract mode sets the mode of each node to the mode of the entry
+less the umask of picotar. It sets no setuid, setgid or sticky bit from the
+entry. A directory keeps the setuid, setgid and sticky bits that it has, for
+example the setgid bit that a new directory gets from its parent. A
+directory of a directory entry keeps the setgid bit only if the picotar
+process is a member of the group of the directory or has the `CAP_FSETID`
+capability. Root has this capability.
+If picotar runs as root (effective uid 0), the defaults are `-p` and
+`--same-owner`. Extract mode sets the modification time of each node to the
+time of the entry.
+
+If the archive has no entry for a parent directory of an entry, extract
+mode creates this directory with mode 0o777 less the umask. This also
+applies with `-p` and for root. A later directory entry for the path sets
+the mode of the directory.
+
+`-p`, `--preserve-permissions`, `--same-permissions`
+: Set the mode of each node to the mode of its entry, with the setuid,
+  setgid and sticky bits. The umask and the setgid bit of the parent
+  directory do not change it. This is the default for root.
+
+`--no-same-permissions`
+: Apply the umask and set no setuid, setgid or sticky bit from the entry,
+  also for root. A directory keeps the special bits that it has. The
+  setgid bit has the same condition as in the default mode.
+
+`-m`, `--touch`
+: Do not set the modification time. Each node keeps the time of the
+  extraction.
 
 `--same-owner`
 : Set the owner of each node to the uid and gid of the entry. This usually
-  needs root.
+  needs root. This is the default for root. If picotar cannot set the
+  owner of a node, it writes a warning, and the user that runs picotar
+  owns the node. Then a node that is not a directory gets no setuid and
+  setgid bits from the entry. picotar continues with the next entry and,
+  at the end, exits with status 1.
+
+`--no-same-owner`
+: Do not set the owner. The user that runs picotar owns each node, also for
+  root.
 
 `--devices`
 : Create character and block device nodes. This usually needs root.
@@ -149,8 +184,11 @@ cargo run -p picotar -- -xf - -C out < archive.tar
   FIFOs, and devices. It skips sockets below the input paths. A hard link
   between two input paths becomes a hard link entry.
 - Extract mode rejects member paths that start with `/` or that have a `..`
-  component. It stores symlink targets without change and does not follow
-  them.
+  component. It stores symlink targets without change.
+- Extract mode follows a symlink in a parent component of a member path
+  only if the symlink target stays inside the destination directory. A
+  symlink that leads outside the destination directory, or an absolute
+  symlink, stops the extraction with an error.
 - Extract mode creates FIFO entries. It skips device entries without
   `--devices`.
 - In extract mode, the target of a hard link must come before the link in the

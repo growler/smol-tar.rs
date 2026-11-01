@@ -15,7 +15,13 @@
 //!   [`FsStreamExt::into_tar`] converts the nodes to [`TarEntry`] values
 //!   for [`TarWriter`].
 //! - [`FsSink`] is a sink of [`TarEntry`] values, for example from
-//!   [`TarReader`]. It writes each entry to a directory.
+//!   [`TarReader`]. It writes each entry to a directory. After the last
+//!   [`FsSink::write`], call [`FsSink::finish`]. It writes the entries of
+//!   the batch and sets the metadata of the directories. If the sink is
+//!   dropped before, the entries that wait in the batch are not written,
+//!   and no error comes back. A job that writes the batch or runs the
+//!   finish continues after the drop. See [Finish](FsSink#finish) and
+//!   [Batches](FsSink#batches).
 //!
 //! The source and the sink run the filesystem calls on the blocking thread
 //! pool of the runtime. The close of a file or a directory can occur on the
@@ -23,12 +29,12 @@
 //!
 //! # Feature flags
 //!
-//! - `smol` (default): use the `futures-io` traits `AsyncRead` and
-//!   `AsyncWrite`, and the thread pool of the `blocking` crate. This feature
-//!   enables the `smol` feature of `smol-tar`.
-//! - `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`, and
-//!   the blocking thread pool of Tokio. This feature enables the `tokio`
-//!   feature of `smol-tar`.
+//! - `smol` (default): use the `futures-io` traits `AsyncRead`,
+//!   `AsyncBufRead` and `AsyncWrite`, and the thread pool of the `blocking`
+//!   crate. This feature enables the `smol` feature of `smol-tar`.
+//! - `tokio`: use the `tokio::io` traits `AsyncRead`, `AsyncBufRead` and
+//!   `AsyncWrite`, and the blocking thread pool of Tokio. This feature
+//!   enables the `tokio` feature of `smol-tar`.
 //!
 //! Enable `smol` or `tokio`. If you enable neither feature, the build fails.
 //! If you enable both features, the crate uses `tokio`. Enable the same
@@ -118,10 +124,14 @@ pub enum FsKind {
 
 /// Action of the sink for a hard link whose target the sink did not create.
 ///
-/// The sink creates a hard link only to a path that it created before from
-/// the same archive. The target is not available in these conditions:
+/// The sink creates a hard link only to a node that it created before from
+/// the same archive. The node at the target path must have the identity
+/// that the sink stored when it created the node. The target is not
+/// available in these conditions:
 ///
 /// - The archive has the link before its target.
+/// - The target path leads to another node or to no node, for example
+///   because a later entry changed a parent symlink of the path.
 /// - A filter removed the target entry.
 /// - The target is a directory, or a later entry replaced it with a
 ///   directory.
@@ -131,10 +141,13 @@ pub enum FsKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MissingLinkTarget {
     /// Stop with a [`NotFound`](std::io::ErrorKind::NotFound) error. The
-    /// error has the entry path and the link target.
+    /// error has the entry path and the link target. The sink can create the
+    /// missing parent directories of the link path before it gives the
+    /// error.
     #[default]
     Error,
-    /// Do not create the link, and continue.
+    /// Do not create the link, and continue. The sink can create the missing
+    /// parent directories of the link path before it skips the link.
     Skip,
 }
 
@@ -146,8 +159,11 @@ pub enum MissingLinkTarget {
 /// error with each policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DeviceNodes {
-    /// Create the device node. Without privileges, the entry gives a
+    /// Create the device node. Without privileges, the system usually
+    /// refuses the node, and the entry gives a
     /// [`PermissionDenied`](std::io::ErrorKind::PermissionDenied) error.
+    /// Linux 5.8 and later let a process without CAP_MKNOD create the
+    /// character device 0:0.
     Create,
     /// Do not create the node, and continue.
     #[default]
@@ -155,6 +171,37 @@ pub enum DeviceNodes {
     /// Stop with a [`PermissionDenied`](std::io::ErrorKind::PermissionDenied)
     /// error. The error message starts with the entry path.
     Error,
+}
+
+/// Action of the sink for the permission bits (0o777) of an entry.
+///
+/// [`FsSink::with_special_bits`] sets the action for the setuid, setgid and
+/// sticky bits. The sink does not set the mode of a symlink or a hard link
+/// with each policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ModePolicy {
+    /// Set the permission bits of the entry. The umask does not change
+    /// them. A missing parent directory gets 0o777 less the umask.
+    #[default]
+    Apply,
+    /// Set the permission bits of the entry without the bits of the mask,
+    /// in the same way as a umask. For example, `Mask(0o022)` gives 0o755
+    /// for the entry mode 0o777. A missing parent directory gets 0o777
+    /// without the bits of the mask, less the umask. The sink ignores the
+    /// bits of the mask outside 0o777. The umask of the process does not
+    /// change the mode of an entry.
+    Mask(u32),
+    /// Do not set the mode of the entry. A new node gets the default mode
+    /// less the umask of the process: 0o666 for a file and a FIFO, 0o777
+    /// for a directory, and 0o600 for a device. Thus only the owner of a new
+    /// device node can read or write the device. A new directory keeps the
+    /// setgid bit that it gets from its parent. The sink does not change the
+    /// mode of an existing directory. [`FsSink::with_special_bits`] has no
+    /// effect.
+    ///
+    /// If the umask removes the read, write or search bit of the owner, a
+    /// process without privileges cannot create nodes in a new directory.
+    Skip,
 }
 
 /// Action of the sink when it cannot write an extended attribute.
@@ -215,7 +262,8 @@ pub(crate) struct SetMeta {
     mode: Option<u32>,
     /// `(uid, gid)`. `None`: do not change the owner.
     owner: Option<(u32, u32)>,
-    mtime: SystemTime,
+    /// `None`: do not change the mtime.
+    mtime: Option<SystemTime>,
     /// Empty: do not write xattrs.
     xattrs: AttrList,
     /// Gives `true` for an attribute name that the sink writes.
@@ -235,6 +283,10 @@ impl SetMeta {
 /// Filter of xattr names. It gives `true` for a name that the sink writes.
 pub(crate) type XattrFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Handler of an owner change that failed. It gets the entry path and the
+/// error. `Ok` lets the sink continue.
+pub(crate) type OwnerErrorFn = Arc<dyn Fn(&str, io::Error) -> io::Result<()> + Send + Sync>;
+
 /// Filter of archive paths. It gives `true` for a path that the source
 /// gives.
 pub(crate) type PathFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -253,8 +305,8 @@ pub(crate) enum Root {
 pub(crate) enum Existing {
     /// No node has the name.
     Missing,
-    /// A directory. A symlink to a directory is `Other`.
-    Directory,
+    /// A directory, with its identity. A symlink to a directory is `Other`.
+    Directory(sys::FileId),
     /// A node of another kind.
     Other,
 }

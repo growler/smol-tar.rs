@@ -10,7 +10,8 @@ works with smol and other `futures-io` runtimes, and with tokio.
   `FsStreamExt::into_tar` converts the nodes to `TarEntry` values for
   `TarWriter`.
 - `FsSink` is a `Sink` of `TarEntry` values, for example from `TarReader`.
-  It writes each entry to a directory.
+  It writes each entry to a directory. `FsSink::extract` writes the entries
+  of a stream.
 
 The source and the sink run the filesystem calls on the blocking thread pool
 of the runtime.
@@ -27,28 +28,28 @@ For smol and other `futures-io` runtimes:
 
 ```toml
 [dependencies]
-smol-tar = "0.1"
-smol-tar-fs = "0.1"
+smol-tar = "0.2"
+smol-tar-fs = "0.2"
 ```
 
 For tokio:
 
 ```toml
 [dependencies]
-smol-tar = { version = "0.1", default-features = false, features = ["tokio"] }
-smol-tar-fs = { version = "0.1", default-features = false, features = ["tokio"] }
+smol-tar = { version = "0.2", default-features = false, features = ["tokio"] }
+smol-tar-fs = { version = "0.2", default-features = false, features = ["tokio"] }
 ```
 
 The minimum supported Rust version is 1.85.
 
 ## Feature flags
 
-- `smol` (default): use the `futures-io` traits `AsyncRead` and
-  `AsyncWrite`, and the thread pool of the `blocking` crate. This feature
+- `smol` (default): use the `futures-io` traits `AsyncRead`, `AsyncBufRead`
+  and `AsyncWrite`, and the thread pool of the `blocking` crate. This feature
   enables the `smol` feature of `smol-tar`.
-- `tokio`: use the `tokio::io` traits `AsyncRead` and `AsyncWrite`, and the
-  blocking thread pool of Tokio. This feature enables the `tokio` feature of
-  `smol-tar`.
+- `tokio`: use the `tokio::io` traits `AsyncRead`, `AsyncBufRead` and
+  `AsyncWrite`, and the blocking thread pool of Tokio. This feature enables
+  the `tokio` feature of `smol-tar`.
 
 Enable `smol` or `tokio`. If you enable neither feature, the build fails. If
 you enable both features, the crate uses `tokio`. Enable the same runtime
@@ -58,15 +59,28 @@ feature for `smol-tar` and `smol-tar-fs`. If `smol-tar` uses `tokio` and
 ## Usage rules
 
 1. Call `FsSink::finish` or `SinkExt::close` after the last entry. These
-   methods set the mode and the modification time of the directories of the
-   directory entries. With `with_owner` and `with_xattrs`, they also set the
-   owner and the extended attributes of these directories.
-   `StreamExt::forward` closes the sink at the end of the stream. If you drop
-   the sink before, the directories that the sink created for directory
-   entries keep mode 0o700.
+   methods write the entries of the batch and set the mode and the
+   modification time of the directories of the directory entries. With
+   `with_owner` and `with_xattrs`, they also set the owner and the extended
+   attributes of these directories.
+   `FsSink::extract` and `StreamExt::forward` close the sink at the end of
+   the stream. A drop of the `FsSink::extract` future, for example at a
+   timeout, also drops the sink. If you drop the sink before the end of the
+   finish, these rules apply. If the sink has no job on the blocking thread
+   pool, the directories that the sink created for directory entries keep
+   mode 0o700. The entries of the batch are not written, and no error comes
+   back. A job that runs on the blocking thread pool continues after the
+   drop. Thus a job that writes the batch or runs the finish can write the
+   entries of the batch and set the metadata of the directories after the
+   drop returns. With the `smol` feature, the drop cancels a job that waits
+   for a thread. With the `tokio` feature, a job that waits for a thread
+   runs after the drop. With `with_mode(ModePolicy::Skip)` and
+   `with_mtime(false)`, the sink sets the owner and the extended attributes
+   of a directory when it creates the directory.
 2. In an archive for `FsSink`, put the target of each hard link before the
-   link. `FsSink` creates a hard link only to a path that it created before
-   from the same archive.
+   link. `FsSink` creates a hard link only to a node that it created before
+   from the same archive. The node at the target path must have the
+   identity that `FsSink` stored when it created the node.
 3. Filter the entries of `FsSource` before `FsStreamExt::into_tar`. Then each
    hard link in the archive points to an entry in the archive.
 4. `FsSource` and `FsSink` do not read or write extended attributes by
@@ -81,9 +95,55 @@ feature for `smol-tar` and `smol-tar-fs`. If `smol-tar` uses `tokio` and
    `with_device_nodes(DeviceNodes::Create)`. To stop at a device entry, use
    `DeviceNodes::Error`. A device entry with a path that is not valid gives
    an `ErrorKind::InvalidData` error with each policy.
-6. With the `tokio` feature, use `FsSource`, `FsFile`, `FsSink`, and the
+6. By default, `FsSink` sets the permission bits and the modification time of
+   each node from the entry. The umask of the process does not change the
+   mode of an entry. A missing parent directory gets mode 0o777 less the
+   umask with each mode policy. `with_mode(ModePolicy::Mask(mask))` removes
+   the bits of `mask` from the mode of each entry and from the mode of a
+   missing parent directory.
+   `with_mode(ModePolicy::Skip)` does not set the
+   mode: a new node gets the default mode less the umask, for example 0o644
+   for a file with the umask 0o022. A device node gets 0o600 less the umask.
+   `with_mtime(false)` does not set the modification time. With
+   `ModePolicy::Skip` and `with_mtime(false)`, `FsSink` makes fewer system
+   calls for each node.
+7. With the `tokio` feature, use `FsSource`, `FsFile`, `FsSink`, and the
    stream of `into_tar` inside a Tokio runtime context. Outside of a Tokio
    runtime context, they panic.
+8. Use `FsSink::extract` to write a stream of entries. The sink puts regular
+   files of up to 256 KiB and directory entries in batches. A batch has up
+   to 64 entries and up to 1 MiB of data. One job on the blocking thread
+   pool writes each batch. `forward` flushes the sink each time that the
+   stream is not ready. With a `TarReader` stream, `forward` flushes the
+   sink after each regular file. Thus each batch has at most one file.
+   `FsSink::write` can return before the entry is on disk. `start_send` and
+   `feed` return before the sink writes the entry. With a `TarReader`
+   stream, a `next` after the `feed` of a regular file does not return until
+   the sink runs the job. The sink keeps the body, and the body keeps the
+   source of the reader. For full batches, use `FsSink::write` or
+   `FsSink::extract`. `FsSink::write` does not flush the batch. Thus the
+   batches fill up to the limits. You can also use `send` or `forward`, or
+   call `flush` after `feed`. A flush after each entry writes each entry in
+   its own job. Call `FsSink::finish` or `SinkExt::close` one time, after
+   the last entry. `finish` and `close` also write the batch. A `flush`
+   before them is not necessary. If you stop before the end of the archive,
+   call `FsSink::flush` to write the entries of the batch. `finish` also
+   sets the metadata of the directories. After an error from the stream,
+   `forward` does not flush or close the sink. To write the last entry and
+   the batch after such an error, give `&mut sink` to `forward`, then call
+   `flush` or `close`. If you drop the sink while the entries wait in the
+   batch, these entries are not written, and no error comes back. A job that
+   writes the batch continues after the drop. See rule 1. An error of an
+   entry in the batch comes from a later call, and the error has the path of
+   that entry.
+9. `FsSink` follows a symlink in a parent component of an entry path if
+   the symlink target stays inside the destination. For example, with
+   `lib -> usr/lib` in the destination, the entry `lib/f` goes to
+   `usr/lib/f`. A parent symlink that leads outside the destination gives
+   an `ErrorKind::PermissionDenied` error. An absolute parent symlink also
+   gives this error when its target is in the destination. These rules
+   apply to the symlinks of the archive and to the symlinks that are in the
+   destination before the extraction.
 
 ## Errors
 
@@ -104,20 +164,20 @@ All functions return `std::io::Error`.
     node also gives this error. The message is "file changed".
   - When `FsFile` opens the file, the identity or the size of the file is
     different from the values that the source read. The message is "file
-    changed". A file of up to 256 KiB with less data than that size gives
-    the same error.
+    changed".
 - Other errors from the system pass through. Each error has the path of the
   node. After an error, the stream ends.
 
 `FsFile` compares the identity and the size only when it opens the file. If
-a file larger than 256 KiB gets smaller after the open, the body ends early.
-Then the reader of the body, for example `TarWriter`, gives an
-`ErrorKind::UnexpectedEof` error.
+a file gets smaller after the open, the read of the body gives an
+`ErrorKind::InvalidData` error "file changed". Errors from the reads after
+the open do not have the path of the node.
 
 `FsSink` uses these error kinds:
 
 - `ErrorKind::InvalidData`: the entry path starts with `/`, has a `..`
-  component, or has no components.
+  component, or has no components. At `finish`, the path of a directory
+  entry leads to another directory. The message is "PATH: file changed".
 - `ErrorKind::InvalidInput`: the entry path or the link target has a NUL
   byte, or the platform cannot encode the device numbers or the
   modification time.
@@ -125,8 +185,13 @@ Then the reader of the body, for example `TarWriter`, gives an
   not a directory.
 - `ErrorKind::NotFound`: the destination does not exist, or the target of a
   hard link is not available and the policy is `MissingLinkTarget::Error`.
-- `ErrorKind::PermissionDenied`: the sink cannot set the owner, create a
-  device, or write an extended attribute. A device entry with the policy
+  For example, the target is not in the archive, the target path leads to
+  another node or to no node, or the target path has a symlink loop. The
+  message is "PATH: link target TARGET is not in the archive".
+- `ErrorKind::PermissionDenied`: a parent symlink of the entry path or of
+  a hard link target leads outside the destination or is absolute. The
+  sink also gives this error if it cannot create a device or write an
+  extended attribute. A device entry with the policy
   `DeviceNodes::Error` also gives this error. The message is "PATH: device
   entries are not allowed".
 - `ErrorKind::Unsupported`: the filesystem does not support extended
@@ -134,6 +199,12 @@ Then the reader of the body, for example `TarWriter`, gives an
   platform cannot write extended attributes on the kind of the node.
 - `ErrorKind::UnexpectedEof`: the file body ends before the size of the
   entry.
+- The sink cannot set the owner. The kind comes from the system error.
+  Examples are `ErrorKind::PermissionDenied` for a user without privileges
+  and, on Linux, `ErrorKind::InvalidInput` for an id that the user
+  namespace does not map. The message is "PATH: cannot set the owner to
+  uid UID, gid GID: ERROR". The handler of `with_owner_error` can let the
+  sink continue.
 - Other errors from the system or from the body reader pass through.
 
 Each error message starts with the entry path, without its empty and `.`
@@ -149,6 +220,10 @@ Each example is a program in the [`examples`](examples) directory. The test
 suite makes sure that the code below is equal to these programs. `cargo test`
 compiles the programs.
 
+The programs use smol. With `--features tokio`, the default `smol` feature
+stays on. Then the programs compile to a `main` that writes a message to
+stderr and exits with status 1.
+
 ### Pack a directory
 
 `FsSource` is a `Stream` of the nodes in a directory tree. `into_tar`
@@ -162,11 +237,17 @@ Dependencies: `smol-tar`, `smol-tar-fs`, `smol`, `futures`.
 //!
 //! Run: cargo run --example pack -- OUT.tar DIR
 
+// With the tokio feature, smol-tar-fs uses the tokio traits, and the smol
+// main below cannot compile. In that case, a short main writes a message to
+// stderr and exits with status 1.
+#![cfg_attr(feature = "tokio", allow(unused_imports))]
+
 use futures::{future, StreamExt, TryStreamExt};
 use smol::{fs::File, io::BufWriter};
 use smol_tar::TarWriter;
 use smol_tar_fs::{FsSource, FsStreamExt};
 
+#[cfg(not(feature = "tokio"))]
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [output, dir] = args.as_slice() else {
@@ -188,13 +269,20 @@ fn main() -> std::io::Result<()> {
             .await
     })
 }
+
+#[cfg(feature = "tokio")]
+fn main() {
+    eprintln!("this example needs the smol feature without the tokio feature");
+    std::process::exit(1);
+}
 ```
 
 ### Unpack an archive into a directory
 
-`FsSink` is a `Sink` of tar entries. It writes each entry to a directory.
+`FsSink` writes each tar entry to a directory. `FsSink::extract` writes
+the entries of a stream, for example a `TarReader`.
 
-Dependencies: `smol-tar`, `smol-tar-fs`, `smol`, `futures`.
+Dependencies: `smol-tar`, `smol-tar-fs`, `smol`.
 
 <!-- example: examples/unpack.rs -->
 ```rust
@@ -202,11 +290,16 @@ Dependencies: `smol-tar`, `smol-tar-fs`, `smol`, `futures`.
 //!
 //! Run: cargo run --example unpack -- IN.tar DIR
 
-use futures::StreamExt;
+// With the tokio feature, smol-tar-fs uses the tokio traits, and the smol
+// main below cannot compile. In that case, a short main writes a message to
+// stderr and exits with status 1.
+#![cfg_attr(feature = "tokio", allow(unused_imports))]
+
 use smol::{fs::File, io::BufReader};
 use smol_tar::TarReader;
 use smol_tar_fs::FsSink;
 
+#[cfg(not(feature = "tokio"))]
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [input, dir] = args.as_slice() else {
@@ -214,13 +307,19 @@ fn main() -> std::io::Result<()> {
     };
     smol::block_on(async {
         // DIR must exist. If it does not exist, the sink gives a NotFound
-        // error at the first entry that it writes. forward() calls finish()
-        // at the end of the stream. finish() sets the mode and the
-        // modification time of the directories.
-        TarReader::new(BufReader::new(File::open(input).await?))
-            .forward(FsSink::new(dir))
+        // error at the first entry that it writes. extract() calls finish()
+        // at the end of the stream. finish() writes the files of the batch
+        // and sets the mode and the modification time of the directories.
+        FsSink::new(dir)
+            .extract(TarReader::new(BufReader::new(File::open(input).await?)))
             .await
     })
+}
+
+#[cfg(feature = "tokio")]
+fn main() {
+    eprintln!("this example needs the smol feature without the tokio feature");
+    std::process::exit(1);
 }
 ```
 
@@ -238,10 +337,17 @@ Refer to [docs.rs](https://docs.rs/smol-tar-fs) for the full API.
 
 `FsSink::new(dir)`
 : A `Sink` of `TarEntry` that writes the entries to a directory. It also
-  has the methods `write(entry)` and `finish()`. Its options are
+  has the methods `extract(stream)`, `write(entry)`, `flush()`, and
+  `finish()`. After the last `write`, call `finish`. `extract` writes small
+  files and directories in batches. With a `TarReader` stream and `forward`,
+  each batch has at most one file. Its options are
   `with_missing_link_target`, `with_device_nodes`, `with_owner`,
-  `with_special_bits`, `with_xattrs`, `with_unsupported_xattr`, and
-  `with_xattr_filter`.
+  `with_owner_error`, `with_mode`, `with_special_bits`, `with_mtime`,
+  `with_xattrs`, `with_unsupported_xattr`, and `with_xattr_filter`. With `with_owner_error`, the sink can continue
+  after an owner change that the system refuses. Then the node keeps the
+  user of the process as owner, and a node that is not a directory gets
+  no setuid and setgid bits from the entry. The sink also does not write
+  the `security.capability` attribute on this node.
 
 ## License
 

@@ -69,6 +69,11 @@ fn make_writable(dir: &Path) {
     }
 }
 
+/// Give data of `len` bytes that depends on `seed`.
+pub fn data(len: usize, seed: usize) -> Vec<u8> {
+    (0..len).map(|i| ((i + seed) % 251) as u8).collect()
+}
+
 /// Create a FIFO at `path` with the permission bits `mode`, less the umask.
 pub fn make_fifo(path: &Path, mode: libc::mode_t) {
     let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -80,6 +85,47 @@ pub fn make_fifo(path: &Path, mode: libc::mode_t) {
             std::io::Error::last_os_error()
         );
     }
+}
+
+/// Create the directory `name` in `dir` with mode 0o2755 and give its path.
+/// Give `None` if the directory does not keep the setgid bit, or if a new
+/// directory in it does not get the setgid bit.
+pub fn setgid_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    let path = dir.join(name);
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, Permissions::from_mode(0o2755)).unwrap();
+    if fs::metadata(&path).unwrap().permissions().mode() & 0o7777 != 0o2755 {
+        eprintln!("skip: the process cannot set the setgid bit");
+        return None;
+    }
+    let probe = path.join("probe");
+    fs::create_dir(&probe).unwrap();
+    let inherited = fs::metadata(&probe).unwrap().permissions().mode() & 0o2000 != 0;
+    fs::remove_dir(&probe).unwrap();
+    if !inherited {
+        eprintln!("skip: a new directory does not get the setgid bit");
+        return None;
+    }
+    Some(path)
+}
+
+/// Give the setgid bit that a new directory in `dir` keeps after a mode
+/// change: 0o2000 if a new directory gets the setgid bit from `dir` and
+/// keeps it after a change to mode 0o2700. Else give 0.
+pub fn kept_setgid(dir: &Path) -> u32 {
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode();
+    if mode(dir) & 0o2000 == 0 {
+        return 0;
+    }
+    let probe = dir.join("setgid-probe");
+    fs::create_dir(&probe).unwrap();
+    let mut kept = mode(&probe) & 0o2000;
+    if kept != 0 {
+        fs::set_permissions(&probe, Permissions::from_mode(0o2700)).unwrap();
+        kept = mode(&probe) & 0o2000;
+    }
+    fs::remove_dir(&probe).unwrap();
+    kept
 }
 
 /// Run a future to completion on the selected runtime.

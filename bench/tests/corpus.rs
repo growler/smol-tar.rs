@@ -30,6 +30,10 @@ fn readers_agree() {
                 .block_on(adapters::astral_tokio_tar::read_all(archive, &mut buf))
                 .unwrap();
             assert_eq!(got, want, "{corpus}: astral-tokio-tar");
+            let got = rt
+                .block_on(adapters::tar_codec::read_all(archive, &mut Vec::new()))
+                .unwrap();
+            assert_eq!(got, want, "{corpus}: tar-codec");
         }
 
         assert_eq!(
@@ -49,6 +53,10 @@ fn readers_agree() {
                 .block_on(adapters::astral_tokio_tar::read_skip(archive))
                 .unwrap();
             assert_eq!(got, want.entries, "{corpus}: astral-tokio-tar");
+            let got = rt
+                .block_on(adapters::tar_codec::read_skip(archive))
+                .unwrap();
+            assert_eq!(got, want.entries, "{corpus}: tar-codec");
         }
     }
 }
@@ -94,6 +102,15 @@ fn writers_agree() {
                 .unwrap();
             let got = adapters::tar::read_all(&out, &mut buf).unwrap();
             assert_eq!(got, want, "{corpus}: astral-tokio-tar");
+            // The tar-codec builder cannot write the symbolic links of the
+            // mixed corpus.
+            if corpus != Corpus::Mixed {
+                out.clear();
+                rt.block_on(adapters::tar_codec::write(&data.specs, &mut out))
+                    .unwrap();
+                let got = adapters::tar::read_all(&out, &mut buf).unwrap();
+                assert_eq!(got, want, "{corpus}: tar-codec");
+            }
         }
     }
 }

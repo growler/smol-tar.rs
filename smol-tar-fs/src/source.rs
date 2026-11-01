@@ -171,7 +171,7 @@ impl FsSource {
     /// Set the prefix of the archive paths. The prefix loses its trailing
     /// `/` characters.
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
-        let mut prefix = prefix.into();
+        let mut prefix: String = prefix.into();
         prefix.truncate(prefix.trim_end_matches('/').len());
         self.prefix = prefix;
         self

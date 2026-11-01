@@ -6,23 +6,34 @@ publish = false
 
 [features]
 default = ["smol"]
-smol = ["smol-tar/smol", "dep:smol", "dep:async-tar", "async-tar/runtime-async-std"]
+smol = [
+    "smol-tar/smol",
+    "smol-tar-fs/smol",
+    "dep:smol",
+    "dep:async-tar",
+    "async-tar/runtime-async-std",
+]
 tokio = [
     "smol-tar/tokio",
+    "smol-tar-fs/tokio",
     "dep:tokio",
     "dep:async-tar",
     "async-tar/runtime-tokio",
     "dep:astral-tokio-tar",
+    "dep:tar-codec",
 ]
 
 [dependencies]
 smol-tar = { path = "../smol-tar", default-features = false }
+smol-tar-fs = { path = "../smol-tar-fs", default-features = false }
 futures = "0.3"
 tar = { version = "0.4.46", default-features = false }
 smol = { version = "2", optional = true }
 async-tar = { version = "0.6.1", default-features = false, optional = true }
 tokio = { version = "1", optional = true, features = ["io-util", "rt"] }
 astral-tokio-tar = { version = "0.7.0", default-features = false, optional = true }
+tar-codec = { version = "0.0.15", optional = true }
+tempfile = "3"
 
 [dev-dependencies]
 divan = "0.1.21"
@@ -30,4 +41,8 @@ dhat = "0.3.3"
 
 [[bench]]
 name = "tar"
+harness = false
+
+[[bench]]
+name = "fs"
 harness = false

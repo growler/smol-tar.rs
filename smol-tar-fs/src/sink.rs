@@ -2,21 +2,23 @@
 
 use {
     super::{
-        resolve, rt, sys, with_path, DeviceNodes, Existing, FsKind, MissingLinkTarget, SetMeta,
-        UnsupportedXattr, XattrFilter,
+        resolve, rt, sys, with_path, DeviceNodes, Existing, FsKind, MissingLinkTarget, ModePolicy,
+        OwnerErrorFn, SetMeta, UnsupportedXattr, XattrFilter,
     },
     crate::{poll_read_compat, AsyncRead, AsyncWrite},
+    futures_core::Stream,
     futures_sink::Sink,
-    smol_tar::{AttrList, TarEntry, TarRegularFile},
+    rustix::io::Errno,
+    smol_tar::{AttrList, TarDirectory, TarEntry, TarRegularFile},
     std::{
         borrow::Cow,
-        collections::HashSet,
+        collections::HashMap,
         future::{poll_fn, Future},
         io::{self, Write},
         marker::PhantomData,
         mem,
-        path::{Path, PathBuf},
-        pin::Pin,
+        path::PathBuf,
+        pin::{pin, Pin},
         sync::Arc,
         task::{ready, Context, Poll},
         time::SystemTime,
@@ -27,8 +29,10 @@ use {
 ///
 /// The sink takes the [`TarEntry`] values of an archive, for example from a
 /// [`TarReader`](smol_tar::TarReader), and creates one node in the destination
-/// directory for each entry. Use it with `forward`, or call
-/// [`write`](Self::write) for each entry and then [`finish`](Self::finish).
+/// directory for each entry. Use [`extract`](Self::extract) with a stream
+/// of entries, or call [`write`](Self::write) for each entry and then
+/// [`finish`](Self::finish). The sink also implements [`Sink`] for
+/// `forward`. See [Batches](#batches) for the difference.
 ///
 /// # Paths
 ///
@@ -41,25 +45,53 @@ use {
 /// - A directory entry with no components, for example `./`, is the
 ///   destination itself. The sink does not change the destination for it.
 ///   Another entry kind with no components gives an [`InvalidData`] error.
-/// - The sink creates missing parent directories with mode 0o755. If the
-///   parent of such a directory has the setgid bit, the new directory also
-///   gets this bit and keeps it.
+/// - The sink creates a missing parent directory with mode 0o777 less the
+///   umask, with each mode policy. With [`ModePolicy::Mask`], the directory
+///   also does not get the bits of the mask. The sink does not change this
+///   mode later. A later directory entry for the path sets the metadata of
+///   the directory by the rules of [Metadata](#metadata). If the parent of
+///   a new directory has the setgid bit, the new directory also gets this
+///   bit. After a later directory entry, the directory keeps this bit only
+///   if the process is a member of the group of the directory or has the
+///   `CAP_FSETID` capability. Root has this capability. With
+///   [`with_special_bits(true)`](Self::with_special_bits), a later
+///   directory entry sets the exact mode of the entry. If the umask or the
+///   mask removes the read, write or search bit of the owner, a process
+///   without privileges cannot create nodes in such a directory.
 ///
 /// # Safety rules
 ///
-/// - The sink opens each parent component without following symlinks. A
-///   symlink in a parent component gives an error.
+/// - The sink follows a symlink in a parent component if the symlink target
+///   stays inside the destination. This rule applies to entry paths and to
+///   hard link targets. For example, with `lib -> usr/lib` in the
+///   destination, the entry `lib/f` goes to `usr/lib/f`. The rule applies
+///   to the symlinks of the archive and to the symlinks that are in the
+///   destination before the extraction.
+/// - A parent symlink that leads outside the destination gives a
+///   [`PermissionDenied`] error. An absolute parent symlink also gives this
+///   error when its target is in the destination. For a parent symlink of
+///   the entry path, the sink gives the error before it changes the
+///   destination. For a parent symlink of a hard link target, the sink can
+///   create the missing parent directories of the link path before it gives
+///   the error.
 /// - If a node that is not a directory has the name of the entry, the sink
 ///   removes it and creates a new node. The sink never writes through an
 ///   existing node.
 /// - If a directory has the name of the entry, a directory entry uses it.
 ///   Another entry kind gives an [`AlreadyExists`] error.
-/// - The sink stores the target of a symlink without change. It never
-///   follows a symlink target.
-/// - The sink creates a hard link only to a path that it created before from
-///   the same archive. The target must not be a directory. For another
-///   target, [`with_missing_link_target`](Self::with_missing_link_target)
-///   sets the action. A link to its own path does nothing.
+/// - The sink stores the target of a symlink entry without change. It does
+///   not resolve the target when it creates the symlink.
+/// - The sink creates a hard link only to a node that it created before
+///   from the same archive. The target must not be a directory. For each
+///   node that is not a directory, the sink stores the identity of the
+///   node: the device and the inode number. The node at the target path of
+///   a hard link must have the stored identity. A target path can lead to
+///   another node or to no node, for example if a later entry changes a
+///   parent symlink of the path.
+///   [`with_missing_link_target`](Self::with_missing_link_target) sets the
+///   action if the target is not in the archive, or if the target path
+///   leads to another node or to no node. A link to its own path does
+///   nothing.
 /// - By default, the sink skips character and block device entries and
 ///   creates no device nodes. A device node gives access to the device
 ///   through the extracted tree.
@@ -85,20 +117,66 @@ use {
 /// # Metadata
 ///
 /// - The sink sets the mode, the modification time and the owner of each
-///   node after it writes the data. The umask does not change the mode.
-/// - The mode keeps the permission bits (0o777). With
-///   [`with_special_bits`](Self::with_special_bits), it keeps the setuid,
-///   setgid and sticky bits (0o7777). Without it, the directory of a
-///   directory entry loses at [`finish`](Self::finish) the setgid bit that
-///   it gets from its parent.
-/// - A new directory has mode 0o700 until [`finish`](Self::finish). Then
-///   the sink sets the metadata of each directory, deepest first. Thus a
-///   read-only directory does not stop the extraction of its children, and
-///   the children do not change the modification time of the directory. If
+///   node after it writes the data. A regular file gets the mode that the
+///   mode policy gives, less the umask, when the sink creates it, if the mode
+///   has no special bits and the sink writes no extended attributes on the
+///   file. With [`with_owner(true)`](Self::with_owner), the group and other
+///   bits of this create mode are only the bits that the owner, group and
+///   other classes all have. Thus no user can read the data before the owner
+///   change that cannot read it after the change. After the write, the sink
+///   sets the mode only if the file does not have it.
+/// - [`with_mode`](Self::with_mode) sets the action for the permission bits
+///   (0o777). With [`ModePolicy::Apply`], the default, the node gets the
+///   bits of the entry. With [`ModePolicy::Mask`], it gets the bits of the
+///   entry without the bits of the mask. The umask of the process does not
+///   change the mode of an entry with these two policies. With
+///   [`ModePolicy::Skip`], a new node gets the default mode less the umask,
+///   and the sink does not change the mode of an existing directory. The
+///   default mode of a device node is 0o600. [Paths](#paths) gives the mode
+///   of a missing parent directory.
+/// - With [`with_special_bits`](Self::with_special_bits), the mode has the
+///   setuid, setgid and sticky bits (0o7000) of the entry and no other
+///   special bits. Without it, the sink sets no special bits from the entry.
+///   A directory keeps the special bits that it has at
+///   [`finish`](Self::finish), for example the setgid bit that a new
+///   directory gets from its parent. The directory keeps the setgid bit only
+///   if the process is a member of the group of the directory or has the
+///   `CAP_FSETID` capability. Root has this capability. A new file, FIFO or
+///   device node has no special bits. With [`ModePolicy::Skip`], the option
+///   has no effect, and a new directory keeps the setgid bit that it gets
+///   from its parent.
+/// - The sink sets the modification time only with
+///   [`with_mtime(true)`](Self::with_mtime), the default. Without it, each
+///   node keeps the time of the extraction.
+/// - Without [`ModePolicy::Skip`], a new directory of a directory entry has
+///   mode 0o700 until [`finish`](Self::finish). If the directory keeps the
+///   setgid bit of its parent, the mode is 0o2700. Then the sink sets the
+///   metadata of each directory, deepest first. Thus a read-only directory
+///   does not stop the extraction of its children, and the children do not
+///   change the modification time of the directory. If
 ///   the archive has more than one entry for a directory, the last entry
-///   sets the metadata.
+///   sets the metadata. This rule also applies to entries that reach one
+///   directory through a parent symlink.
+/// - The finish sorts the directories by their depth on disk below the
+///   destination. It opens each directory by its entry path. A symlink in
+///   the entry path can lead up from a directory that is not a parent of
+///   the directory on disk. The finish can set the metadata of that
+///   directory first. Example: the archive has `p/q/` with mode 000,
+///   `p/q/l -> ../../s`, `s/` and `p/q/l/t/`. On disk, `p/q` and `s/t` both
+///   have depth 2. The finish sets mode 000 on `p/q` first. Then the open of
+///   `p/q/l/t` fails for a user without privileges, and the finish stops
+///   with this error.
+/// - With [`ModePolicy::Skip`], a new directory gets its final mode when the
+///   sink creates it. With [`ModePolicy::Skip`] and
+///   [`with_mtime(false)`](Self::with_mtime), the sink also sets the owner
+///   and the extended attributes of a directory entry when it creates the
+///   directory, and does not keep its metadata for
+///   [`finish`](Self::finish).
 /// - The sink sets the owner only with [`with_owner`](Self::with_owner).
-///   The owner change usually needs privileges.
+///   The owner change usually needs privileges. If the system refuses the
+///   owner change, the handler of
+///   [`with_owner_error`](Self::with_owner_error) selects if the sink stops
+///   or continues.
 /// - The sink writes extended attributes only with
 ///   [`with_xattrs`](Self::with_xattrs).
 ///   [`with_unsupported_xattr`](Self::with_unsupported_xattr) sets the
@@ -106,7 +184,8 @@ use {
 ///   not apply to an attribute that the filter of
 ///   [`with_xattr_filter`](Self::with_xattr_filter) removes.
 /// - With [`DeviceNodes::Create`], the sink sets the metadata of a device
-///   node by the same rules as for other nodes. The sink cannot write
+///   node by the same rules as for other nodes. With [`ModePolicy::Skip`], a
+///   new device node has mode 0o600 less the umask. The sink cannot write
 ///   extended attributes on a device node.
 ///   [`with_unsupported_xattr`](Self::with_unsupported_xattr) sets the
 ///   action for the attributes of a device entry.
@@ -115,18 +194,96 @@ use {
 ///
 /// # Finish
 ///
-/// Call [`finish`](Self::finish) or `close` after the last entry. `forward`
-/// does this. If the sink is dropped before, the directories keep mode
-/// 0o700 and the modification time of the extraction.
+/// Call [`finish`](Self::finish) or `close` after the last entry.
+/// [`extract`](Self::extract) and `forward` do this. A drop of the
+/// [`extract`](Self::extract) future, for example at a timeout, also drops
+/// the sink. If the sink is dropped before the end of the finish, these
+/// rules apply:
+///
+/// - If the sink has no job on the blocking thread pool, the directories
+///   keep mode 0o700, or 0o2700 with the setgid bit of the parent, and the
+///   modification time of the extraction. With [`ModePolicy::Skip`], the
+///   directories have their final mode. The entries of the batch are not
+///   written, and no error comes back.
+/// - A job that runs on the blocking thread pool continues after the drop.
+///   Thus a job that writes the batch or runs the finish can write the
+///   entries of the batch and set the metadata of the directories after the
+///   drop returns.
+/// - With the `smol` feature, the drop cancels a job that waits for a
+///   thread. With the `tokio` feature, a job that waits for a thread runs
+///   after the drop.
+///
+/// See [Batches](#batches).
+///
+/// At the finish, the sink opens the directory of each kept directory entry
+/// again, by the entry path. The open does not follow a symlink at the last
+/// component. The directory must have the identity that the sink stored
+/// when it wrote the entry. If the path leads to another directory, the
+/// finish stops with an [`InvalidData`] error "PATH: file changed". For
+/// example, a later entry can change a parent symlink of the path. If the
+/// path leads to no node or to a node that is not a directory, the finish
+/// also stops with an error.
+///
+/// # Batches
+///
+/// The sink writes a regular file of up to 256 KiB and a directory entry in
+/// a batch. It reads the body of such a file into memory and writes the file
+/// later. One job on the blocking thread pool writes all entries of a batch,
+/// in archive order. The sink writes the batch:
+///
+/// - when the batch has 64 entries or 1 MiB of bodies,
+/// - before a file that makes the bodies of the batch larger than 1 MiB,
+/// - before an entry that is not such a file or a directory entry,
+/// - at [`flush`](Self::flush), `poll_flush`, [`finish`](Self::finish) and
+///   `close`.
+///
+/// Thus [`write`](Self::write) for such an entry can return before the entry
+/// is on disk. `start_send` and `feed` return before the sink writes the
+/// entry. Until the sink runs the job, the job keeps the entry. The body of
+/// a regular file from a [`TarReader`](smol_tar::TarReader) keeps the source
+/// of the reader. Thus the reader cannot give the next entry. A `next` after
+/// `feed` does not return until the sink runs the job. After `feed`, call
+/// `flush` before the next `next`, or use `send`. `send` and `flush` write
+/// the batch. Thus each batch has one entry. [`write`](Self::write) runs the
+/// job before it returns. `write` does not flush the batch. Thus the batches
+/// fill up to the limits. For full batches, use [`extract`](Self::extract)
+/// or [`write`](Self::write). Call [`finish`](Self::finish) or `close` one
+/// time, after the last entry. A flush after each entry writes each entry in
+/// its own job. If you stop before the end of the entries, call
+/// [`flush`](Self::flush) to write the entries of the batch.
+/// [`finish`](Self::finish) also sets the metadata of the directories. If
+/// the sink is dropped while the entries wait in the batch, these entries
+/// are not written, and no error comes back. A job that writes the batch
+/// continues after the drop. See [Finish](#finish). An error of an entry in
+/// the batch comes from a later call, and the error has the path of that
+/// entry. Each entry sees the entries before it. For example, a hard link
+/// sees its target.
+///
+/// `forward` calls `poll_flush` each time that the stream is not ready. A
+/// [`TarReader`](smol_tar::TarReader) stream is not ready until the sink
+/// reads the body of the current entry. Thus with a `TarReader` stream,
+/// `forward` flushes the sink after each regular file. As a result, each
+/// batch has at most one file. [`extract`](Self::extract) does not call
+/// `poll_flush`, and it writes full batches. After an error from the stream,
+/// `forward` does not flush or close the sink. To write the last entry and
+/// the batch after such an error, give `&mut sink` to `forward`, then call
+/// `flush` or `close`.
 ///
 /// # Memory
 ///
-/// The sink keeps the path of each node that is not a directory, for the
-/// hard link check. It keeps the metadata and the extended attributes of
-/// each directory entry until [`finish`](Self::finish). A path of 70 bytes
-/// uses about 100 bytes, thus about 100 MB for each million nodes. The sink
-/// also has one buffer of 256 KiB for file bodies. A file body of up to
-/// 256 KiB is read into this buffer and written to the file in one job.
+/// The sink keeps the path and the identity of each node that is not a
+/// directory, for the hard link check. It keeps the metadata, the identity
+/// and the extended attributes of each directory entry until
+/// [`finish`](Self::finish), except with [`ModePolicy::Skip`] and
+/// [`with_mtime(false)`](Self::with_mtime). For the same entries, it keeps
+/// the identity and the depth on disk of the directory and of each parent
+/// directory on disk, about 28 bytes for each directory. The identity uses
+/// 16 bytes. A path of 70 bytes and its identity use about 116 bytes, thus
+/// about 116 MB for each million nodes. The sink has one buffer of 1 MiB
+/// for the bodies of a batch, and one buffer of 256 KiB for the bodies of
+/// larger files. Each buffer is allocated at the first file body that uses
+/// it. The sink keeps the destination and up to 16 other directories open.
+/// See [Runtime](#runtime).
 ///
 /// # Runtime
 ///
@@ -135,33 +292,74 @@ use {
 /// polls or drops the sink. With the `tokio` feature, poll the sink inside a
 /// Tokio runtime context.
 ///
+/// The sink keeps up to 16 directories in the destination open. These are
+/// parent directories of earlier entries and new directories of directory
+/// entries. The path of each one is an ancestor of the path of the next one.
+/// The sink uses an open directory for each later entry with the same parent
+/// path. For another parent path, the sink resolves the rest of the parent
+/// path beneath the nearest open ancestor directory. If this fails, it
+/// resolves the parent path from the destination again. The sink closes all
+/// of them when it removes a node, at [`finish`](Self::finish), and when it
+/// is dropped. If another process moves one of these directories during the
+/// extraction, the entries with that parent path or with a parent path
+/// below it go to the moved directory or to its subdirectories. The moved
+/// directory can be outside the destination. New directories of directory
+/// entries in it also stay open for later entries.
+///
+/// The limit of 40 symlink expansions applies separately to the part of the
+/// parent path beneath the open ancestor. Thus a parent path with many
+/// symlinks can resolve when an ancestor is open, and fail when no ancestor
+/// is open. In both cases, the result stays inside the directory where the
+/// resolution starts.
+///
 /// # Errors
 ///
 /// - [`InvalidData`]: the entry path starts with `/`, has a `..`
-///   component, or has no components.
+///   component, or has no components. At [`finish`](Self::finish), the path
+///   of a directory entry leads to another directory. The message is "PATH:
+///   file changed".
 /// - [`InvalidInput`]: the entry path or the link target has a NUL byte,
-///   or the platform cannot encode the device numbers or the modification
-///   time.
+///   or the platform cannot encode the device numbers. With
+///   [`with_mtime(true)`](Self::with_mtime), also if the platform cannot
+///   encode the modification time.
 /// - [`AlreadyExists`]: a directory has the name of an entry that is not a
 ///   directory.
 /// - [`NotFound`]: the target of a hard link is not available, and the
-///   policy is [`MissingLinkTarget::Error`].
-/// - [`PermissionDenied`]: the sink cannot set the owner, create a device,
-///   or write an extended attribute. A device entry with the policy
+///   policy is [`MissingLinkTarget::Error`]. For example, the target is not
+///   in the archive, the target path leads to another node or to no node,
+///   or the target path has a symlink loop. The message is "PATH: link
+///   target TARGET is not in the archive".
+/// - [`PermissionDenied`]: a parent symlink of the entry path or of a hard
+///   link target leads outside the destination or is absolute. The message
+///   has "a path led outside of the filesystem". The sink also gives this
+///   error if it cannot create a device or write an extended attribute. A
+///   device entry with the policy
 ///   [`DeviceNodes::Error`] also gives this error. The message is
 ///   "PATH: device entries are not allowed".
 /// - [`Unsupported`]: the filesystem does not support extended attributes,
 ///   the platform cannot write extended attributes, or the platform cannot
 ///   write extended attributes on the kind of the node.
 /// - [`UnexpectedEof`]: the file body ends before the size of the entry.
+/// - The sink cannot set the owner. The kind comes from the system error.
+///   Examples are [`PermissionDenied`] for a user without privileges and,
+///   on Linux, [`InvalidInput`] for an id that the user namespace does not
+///   map. The message is "PATH: cannot set the owner to uid UID, gid GID:
+///   ERROR". The handler of [`with_owner_error`](Self::with_owner_error)
+///   can let the sink continue.
 /// - Another error from the system or from the body reader.
 ///
 /// Each error message starts with the entry path, without its empty and `.`
 /// components. An error of the entry path itself shows the path from the
 /// archive. An error from the open of the destination starts with the
 /// destination path. After an error, the sink stops: each later call gives
-/// an error. A file that was partly written when the error occurred stays on
-/// disk with mode 0o600.
+/// an error. A file that the sink created when the error occurred stays on
+/// disk. The sink can have written all or part of its data. If the error
+/// occurred before the sink set the mode, the mode of the file is the mode
+/// that the mode policy gives less the umask, or 0o600 if the mode has
+/// special bits or the sink writes extended attributes on the file. With
+/// [`with_owner(true)`](Self::with_owner), the group and other bits of this
+/// mode are only the bits that the owner, group and other classes all have.
+/// With [`ModePolicy::Skip`], the file has mode 0o666 less the umask.
 ///
 /// [`InvalidData`]: io::ErrorKind::InvalidData
 /// [`InvalidInput`]: io::ErrorKind::InvalidInput
@@ -195,33 +393,85 @@ struct Inner {
     /// Destination directory. It opens on the first entry that the sink
     /// writes.
     root: Option<sys::Dir>,
+    /// Identity of `root`, when it is known.
+    root_id: Option<sys::FileId>,
+    /// Open parent directories of the last entries, at most `OPEN_DIRS`.
+    /// Each directory is an ancestor of the next one on the entry paths. The
+    /// last one is the parent directory of an earlier entry or a new
+    /// directory of a directory entry. The sink opens the rest of a parent
+    /// path in the nearest of them that is an ancestor of this path, and
+    /// opens the parent path from `root` if that fails. A removal of a node
+    /// clears all of them, because the removal of a symlink can change the
+    /// directory that a path leads to.
+    parents: Vec<OpenDir>,
     /// Normalized paths of the nodes that are not directories and that the
-    /// sink created.
-    created: HashSet<Box<str>>,
+    /// sink created, with the identity of each node.
+    created: HashMap<Box<str>, sys::FileId>,
     /// Metadata of the directory entries, for the finish.
     dirs: Vec<DirMeta>,
+    /// Depth on disk below the destination of each directory that the sink
+    /// passed to find the depth of a directory entry. The destination has
+    /// depth 0.
+    depths: HashMap<sys::FileId, u32>,
     missing_link: MissingLinkTarget,
     device_nodes: DeviceNodes,
     owner: bool,
+    /// Handler of an owner change that failed.
+    owner_error: OwnerErrorFn,
+    mode: ModePolicy,
     special_bits: bool,
+    mtime: bool,
     xattrs: bool,
     xattr_policy: UnsupportedXattr,
     /// Gives `true` for an attribute name that the sink writes.
     xattr_filter: XattrFilter,
     finished: bool,
-    /// Buffer for file bodies. It is empty until the first file body that
-    /// is not empty.
+    /// Buffer for the bodies of files larger than `FILE_BUFFER_SIZE`. It is
+    /// empty until the first such file.
     buf: Box<[u8]>,
+    /// Files of up to `FILE_BUFFER_SIZE` and directory entries that wait for
+    /// the next batch job, in archive order.
+    batch: Vec<QueuedEntry>,
+    /// Buffer of `BATCH_BYTES` for the bodies of the files in `batch`, one
+    /// after the other. It is empty until the first such file that is not
+    /// empty.
+    batch_data: Box<[u8]>,
+    /// Number of bytes in `batch_data` that the bodies use.
+    batch_len: usize,
+}
+
+/// Most open directories that the sink keeps for later entries.
+const OPEN_DIRS: usize = 16;
+
+/// Open directory that the sink keeps for later entries.
+struct OpenDir {
+    /// Normalized path.
+    path: Box<str>,
+    dir: sys::Dir,
+    /// Identity of the directory, when it is known.
+    id: Option<sys::FileId>,
+}
+
+/// Entry in the batch of the sink.
+struct QueuedEntry {
+    /// Normalized path.
+    key: Box<str>,
+    /// Length of the body in `batch_data` for a regular file. `None` for a
+    /// directory entry.
+    len: Option<usize>,
+    meta: SetMeta,
 }
 
 /// Metadata of a directory entry.
 struct DirMeta {
     /// Normalized path.
     path: Box<str>,
-    /// Number of components of `path`.
+    /// Depth of the directory on disk below the destination.
     depth: u32,
     /// Position of the entry among the directory entries.
     seq: u32,
+    /// Identity of the directory.
+    id: sys::FileId,
     meta: SetMeta,
 }
 
@@ -232,17 +482,26 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
         let inner = Inner {
             dest: dest.into(),
             root: None,
-            created: HashSet::new(),
+            root_id: None,
+            parents: Vec::new(),
+            created: HashMap::new(),
             dirs: Vec::new(),
+            depths: HashMap::new(),
             missing_link: MissingLinkTarget::default(),
             device_nodes: DeviceNodes::default(),
             owner: false,
+            owner_error: Arc::new(|_, err| Err(err)),
+            mode: ModePolicy::default(),
             special_bits: false,
+            mtime: true,
             xattrs: false,
             xattr_policy: UnsupportedXattr::default(),
             xattr_filter: Arc::new(default_xattr_filter),
             finished: false,
             buf: Box::default(),
+            batch: Vec::new(),
+            batch_data: Box::default(),
+            batch_len: 0,
         };
         Self {
             state: SinkState::Idle(Box::new(inner)),
@@ -275,6 +534,22 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
     /// Set the owner of each node to the uid and gid of the entry. The
     /// default is `false`: the nodes belong to the user of the process.
     ///
+    /// When the sink creates a regular file, the group and other bits of the
+    /// file are only the bits that the owner, group and other classes of its
+    /// mode all have. The file keeps these bits until the sink sets the mode
+    /// after the owner change. A mode with special bits or extended
+    /// attributes to write gives mode 0o600 at the create. With
+    /// [`ModePolicy::Skip`], the sink does not change the mode. Thus the file
+    /// keeps the mode 0o666 less the umask from the create.
+    ///
+    /// The owner change usually needs privileges. After the owner change, the
+    /// sink can set the mode of the file. For this step, the process must
+    /// have CAP_FOWNER or must be the owner of the file after the change.
+    ///
+    /// If the system refuses the owner change, the sink stops with an error.
+    /// [`with_owner_error`](Self::with_owner_error) sets a handler that can
+    /// let the sink continue.
+    ///
     /// Call the options before the first entry.
     pub fn with_owner(mut self, preserve: bool) -> Self {
         if let SinkState::Idle(inner) = &mut self.state {
@@ -283,13 +558,72 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
         self
     }
 
-    /// Keep the setuid, setgid and sticky bits of the entry mode. The
-    /// default is `false`: the sink removes these bits.
+    /// Set the handler for an owner change that the system refuses. With
+    /// [`with_owner(true)`](Self::with_owner), the sink calls `handler` with
+    /// the entry path and the error. The entry path has no empty and `.`
+    /// components. The error message has the uid and the gid of the entry.
+    /// The sink calls `handler` on the blocking thread pool.
+    ///
+    /// If `handler` gives an error, the sink stops with this error and adds
+    /// the entry path to the message. If `handler` gives `Ok`, the node keeps
+    /// its owner, usually the user of the process. The sink sets the other
+    /// metadata of the node and continues. Then a node that is not a
+    /// directory does not get the setuid and setgid bits of the entry. It
+    /// gets the sticky bit. The sink also does not write the
+    /// `security.capability` attribute on this node.
+    ///
+    /// The default handler gives the error back, thus the sink stops.
+    ///
+    /// Call the options before the first entry.
+    pub fn with_owner_error<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&str, io::Error) -> io::Result<()> + Send + Sync + 'static,
+    {
+        if let SinkState::Idle(inner) = &mut self.state {
+            inner.owner_error = Arc::new(handler);
+        }
+        self
+    }
+
+    /// Set the action for the permission bits (0o777) of each entry. The
+    /// default is [`ModePolicy::Apply`].
+    ///
+    /// Call the options before the first entry.
+    pub fn with_mode(mut self, policy: ModePolicy) -> Self {
+        if let SinkState::Idle(inner) = &mut self.state {
+            inner.mode = policy;
+        }
+        self
+    }
+
+    /// Set the setuid, setgid and sticky bits of the entry mode. Then the
+    /// mode of a directory has no other special bits. The default is
+    /// `false`: the sink sets no special bits from the entry, and a
+    /// directory keeps the special bits that it has on disk. Examples are the
+    /// setgid bit that a new directory gets from its parent and the bits that
+    /// the owner of the directory set before the extraction. A new directory
+    /// keeps the setgid bit only if the process is a member of the group of
+    /// the directory or has the `CAP_FSETID` capability. Root has this
+    /// capability. A caller that runs as root and needs the exact modes of
+    /// the archive sets this option. With [`ModePolicy::Skip`], the option
+    /// has no effect.
     ///
     /// Call the options before the first entry.
     pub fn with_special_bits(mut self, preserve: bool) -> Self {
         if let SinkState::Idle(inner) = &mut self.state {
             inner.special_bits = preserve;
+        }
+        self
+    }
+
+    /// Set the modification time of each node to the time of the entry. The
+    /// default is `true`. With `false`, each node keeps the time of the
+    /// extraction.
+    ///
+    /// Call the options before the first entry.
+    pub fn with_mtime(mut self, restore: bool) -> Self {
+        if let SinkState::Idle(inner) = &mut self.state {
+            inner.mtime = restore;
         }
         self
     }
@@ -350,7 +684,15 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
         self
     }
 
-    /// Write one entry to the destination.
+    /// Write one entry to the destination. A regular file of up to 256 KiB
+    /// and a directory entry go to the batch. See [Batches](FsSink#batches).
+    ///
+    /// The method can return before the entry is on disk. Call
+    /// [`finish`](Self::finish) after the last entry. If you stop before the
+    /// end of the entries, call [`flush`](Self::flush). If the sink is
+    /// dropped before, the entries that wait in the batch are not written,
+    /// and no error comes back. A job that writes the batch or runs the
+    /// finish continues after the drop. See [Finish](FsSink#finish).
     ///
     /// # Errors
     ///
@@ -361,7 +703,44 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
         poll_fn(|cx| self.poll_wait(cx)).await
     }
 
-    /// Set the metadata of the directories. A second call does nothing.
+    /// Write the entries of the batch to the destination.
+    ///
+    /// # Errors
+    ///
+    /// See [`FsSink`].
+    pub async fn flush(&mut self) -> io::Result<()> {
+        poll_fn(|cx| self.poll_flush_batch(cx)).await
+    }
+
+    /// Write each entry of `entries` to the destination, then call
+    /// [`finish`](Self::finish). The method writes full batches. See
+    /// [Batches](FsSink#batches).
+    ///
+    /// # Errors
+    ///
+    /// See [`FsSink`]. After an error from `entries`, the method writes the
+    /// batch. Then it gives the error from the batch if there is one, or else
+    /// the error from `entries`. After an error, the method does not call
+    /// [`finish`](Self::finish).
+    pub async fn extract<S>(mut self, entries: S) -> io::Result<()>
+    where
+        S: Stream<Item = io::Result<TarEntry<'a, R>>>,
+    {
+        let mut entries = pin!(entries);
+        while let Some(entry) = poll_fn(|cx| entries.as_mut().poll_next(cx)).await {
+            match entry {
+                Ok(entry) => self.write(entry).await?,
+                Err(err) => {
+                    self.flush().await?;
+                    return Err(err);
+                }
+            }
+        }
+        self.finish().await
+    }
+
+    /// Write the entries of the batch, then set the metadata of the
+    /// directories. After a call that succeeds, a second call does nothing.
     ///
     /// # Errors
     ///
@@ -415,6 +794,18 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
         }
     }
 
+    /// Run the current job, then write the batch.
+    fn poll_flush_batch(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let inner = ready!(self.poll_idle(cx))?;
+            if inner.batch.is_empty() {
+                self.state = SinkState::Idle(inner);
+                return Poll::Ready(Ok(()));
+            }
+            self.state = SinkState::Busy(Box::pin(flush(inner)));
+        }
+    }
+
     /// Run the current job, then the finish.
     fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
@@ -424,13 +815,27 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> FsSink<'a, R> {
                 return Poll::Ready(Ok(()));
             }
             self.state = SinkState::Busy(Box::pin(rt::unblock(move || {
-                inner.finish()?;
+                // The explicit deref lets rust-analyzer see the mutation.
+                (*inner).finish()?;
                 Ok(inner)
             })));
         }
     }
 }
 
+/// `start_send` only prepares the job for the entry. The sink runs the job
+/// at the next `poll_ready`, `poll_flush` or `poll_close`. A regular file of
+/// up to 256 KiB and a directory entry can also wait in the batch. After the
+/// last entry, call `poll_close`, for example with `SinkExt::close`. If the
+/// sink is dropped before, the last entry and the entries that wait in the
+/// batch are not written, and no error comes back. A job that runs on the
+/// blocking thread pool continues after the drop. See
+/// [Finish](FsSink#finish). A `next` on a [`TarReader`](smol_tar::TarReader)
+/// after `feed` of a regular file does not return until the sink runs the
+/// job. For full batches, use [`write`](FsSink::write) or
+/// [`extract`](FsSink::extract). You can also use `send` or `forward`, or
+/// call `flush` after `feed`. A flush after each entry writes each entry in
+/// its own job. See [Batches](FsSink#batches).
 impl<'a, R: AsyncRead + Unpin + Send + 'a> Sink<TarEntry<'a, R>> for FsSink<'a, R> {
     type Error = io::Error;
 
@@ -443,11 +848,56 @@ impl<'a, R: AsyncRead + Unpin + Send + 'a> Sink<TarEntry<'a, R>> for FsSink<'a, 
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().poll_wait(cx)
+        self.get_mut().poll_flush_batch(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.get_mut().poll_finish(cx)
+    }
+}
+
+/// Give the mode for the create of a regular file with the metadata `meta`.
+/// The umask applies to it.
+///
+/// With [`ModePolicy::Skip`], the mode is 0o666. This is the final mode.
+///
+/// A mode without special bits and without xattrs to write is the final
+/// mode. If the sink sets the owner, the group and other bits of the create
+/// mode are only the bits that the owner, group and other classes all have.
+/// Before the owner change, the file can have a different group. Then a user
+/// other than the creator gets at most these common bits. After the owner
+/// change, that user gets the bits of one class. Thus the user gets no access
+/// before the change that the user does not get after it. A file with mode
+/// 0o644 or 0o755 thus needs no mode change after the owner change.
+/// [`sys::finish_file`] sets the final mode if the umask or this rule removed
+/// bits.
+///
+/// Else the mode is 0o600, and the sink sets the final mode later.
+fn file_create_mode(meta: &SetMeta) -> u32 {
+    match meta.mode {
+        None => 0o666,
+        Some(mode) if mode & 0o7000 == 0 && meta.xattrs.is_empty() => {
+            if meta.owner.is_some() {
+                let common = (mode >> 6) & (mode >> 3) & mode & 0o7;
+                (mode & 0o700) | (common << 3) | common
+            } else {
+                mode
+            }
+        }
+        Some(_) => 0o600,
+    }
+}
+
+/// Give the mode for the create of a FIFO or a device of the kind `kind`
+/// with the mode policy `policy`. The umask applies to it. With
+/// [`ModePolicy::Skip`], it is the final mode: 0o666 for a FIFO and 0o600
+/// for a device. A device node with mode 0o666 gives each local user access
+/// to the device. With the other policies, the mode is 0o600, and the sink
+/// sets the final mode later.
+fn special_create_mode(policy: ModePolicy, kind: FsKind) -> u32 {
+    match (policy, kind) {
+        (ModePolicy::Skip, FsKind::Fifo) => 0o666,
+        _ => 0o600,
     }
 }
 
@@ -466,11 +916,16 @@ impl Inner {
         mtime: SystemTime,
         attrs: &mut AttrList,
     ) -> SetMeta {
-        let mask = if self.special_bits { 0o7777 } else { 0o777 };
+        let special = if self.special_bits { mode & 0o7000 } else { 0 };
+        let mode = match self.mode {
+            ModePolicy::Apply => Some((mode & 0o777) | special),
+            ModePolicy::Mask(mask) => Some((mode & 0o777 & !mask) | special),
+            ModePolicy::Skip => None,
+        };
         SetMeta {
-            mode: Some(mode & mask),
+            mode,
             owner: self.owner.then_some((uid, gid)),
-            mtime,
+            mtime: self.mtime.then_some(mtime),
             // The list keeps the names that the filter removes. A list from
             // `TarReader` shares the global PAX records, and a copy would
             // not. The writes apply the filter.
@@ -487,34 +942,247 @@ impl Inner {
     /// Set the metadata of the directories, deepest first. Then free the
     /// memory that the entries used.
     fn finish(&mut self) -> io::Result<()> {
+        self.write_batch()?;
+        self.parents = Vec::new();
         if let Some(root) = &self.root {
             let mut dirs = mem::take(&mut self.dirs);
-            // The last entry of a directory comes first in its run of equal
-            // paths.
-            dirs.sort_unstable_by(|a, b| {
-                b.depth
-                    .cmp(&a.depth)
-                    .then_with(|| a.path.cmp(&b.path))
-                    .then_with(|| b.seq.cmp(&a.seq))
-            });
-            for (i, dir) in dirs.iter().enumerate() {
-                if i > 0 && dirs[i - 1].path == dir.path {
-                    continue;
-                }
-                let parts: Vec<&str> = dir.path.split('/').collect();
-                let parent = resolve::open_parent(root, &parts, false)?;
-                let name = parts[parts.len() - 1];
-                sys::open_child_dir(&parent, name, false)
-                    .and_then(|handle| sys::set_meta_dir(&handle, &dir.meta))
-                    .map_err(|err| with_path(err, &dir.path))?;
+            // Keep the last entry of each directory. Entries with different
+            // paths can reach one directory through a parent symlink.
+            dirs.sort_unstable_by(|a, b| a.id.cmp(&b.id).then_with(|| b.seq.cmp(&a.seq)));
+            dirs.dedup_by_key(|dir| dir.id);
+            dirs.sort_unstable_by(|a, b| b.depth.cmp(&a.depth).then_with(|| a.path.cmp(&b.path)));
+            // Parent path and open parent of the directory before. The next
+            // directory with the same parent path uses it.
+            let mut last: Option<(&str, sys::Dir)> = None;
+            for dir in &dirs {
+                // The open of the last component does not follow a symlink,
+                // thus the metadata does not go to the node behind it. The
+                // open also checks that the path leads to the directory of
+                // the entry.
+                let (parent, name) = match dir.path.rsplit_once('/') {
+                    Some((path, name)) => {
+                        if last
+                            .as_ref()
+                            .is_none_or(|(last_path, _)| *last_path != path)
+                        {
+                            let opened = resolve::open_dir(root, path, false, None)
+                                .map_err(|err| with_path(err, &dir.path))?;
+                            last = Some((path, opened));
+                        }
+                        (&last.as_ref().expect("the parent is open").1, name)
+                    }
+                    None => (root, &*dir.path),
+                };
+                sys::finish_dir(
+                    parent,
+                    name,
+                    dir.id,
+                    &dir.meta,
+                    !self.special_bits,
+                    &|err| (self.owner_error)(&dir.path, err),
+                )
+                .map_err(|err| with_path(err, &dir.path))?;
             }
         }
         self.finished = true;
         self.root = None;
-        self.created = HashSet::new();
+        self.root_id = None;
+        self.created = HashMap::new();
+        self.depths = HashMap::new();
         self.buf = Box::default();
+        self.batch_data = Box::default();
         Ok(())
     }
+
+    /// Create the files and the directories of the batch, in archive order.
+    /// Write the body and set the metadata of each file. Keep the metadata of
+    /// each directory for the finish, as [`make_entry_dir`] gives it.
+    fn write_batch(&mut self) -> io::Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let batch = mem::take(&mut self.batch);
+        let mode = parent_mode(self.mode);
+        let umask = self.mode == ModePolicy::Skip;
+        let root = match &self.root {
+            Some(root) => root,
+            None => self.root.insert(sys::open_dest(&self.dest)?),
+        };
+        let mut pos = 0;
+        for QueuedEntry { key, len, meta } in batch {
+            // `parent_id` is `None` for the destination.
+            let (parent, parent_id, name) = match key.rsplit_once('/') {
+                Some((dir, name)) => {
+                    let OpenDir { dir, id, .. } = parent_dir(root, &mut self.parents, dir, mode)
+                        .map_err(|err| with_path(err, &key))?;
+                    (&*dir, Some(id), name)
+                }
+                None => (root, None, &*key),
+            };
+            let mut removed = false;
+            let Some(len) = len else {
+                let mut created = None;
+                let placed = make_entry_dir(
+                    root,
+                    &mut self.root_id,
+                    parent,
+                    parent_id,
+                    name,
+                    &meta,
+                    umask,
+                    &mut self.depths,
+                    &|err| (self.owner_error)(&key, err),
+                    &mut removed,
+                    &mut created,
+                );
+                if removed {
+                    self.parents.clear();
+                }
+                let placed = placed.map_err(|err| with_path(err, &key))?;
+                self.created.remove(&key);
+                // A removal clears the stack, and the new directory also does
+                // not go on it. The next entry opens its parent path from the
+                // destination.
+                if let (false, Some((dir, id))) = (removed, created) {
+                    let open = OpenDir {
+                        path: key.clone(),
+                        dir,
+                        id: Some(id),
+                    };
+                    push_dir(&mut self.parents, open);
+                }
+                if let Some((id, depth)) = placed {
+                    let seq = self.dirs.len() as u32;
+                    self.dirs.push(DirMeta {
+                        path: key,
+                        depth,
+                        seq,
+                        id,
+                        meta,
+                    });
+                }
+                continue;
+            };
+            let body = &self.batch_data[pos..pos + len];
+            pos += len;
+            let out = make_file(parent, name, file_create_mode(&meta), &mut removed);
+            if removed {
+                self.parents.clear();
+            }
+            let mut out = out.map_err(|err| with_path(err, &key))?;
+            let id = out
+                .write_all(body)
+                .and_then(|()| sys::finish_file(&out, &meta, &|err| (self.owner_error)(&key, err)))
+                .map_err(|err| with_path(err, &key))?;
+            self.created.insert(key, id);
+        }
+        self.batch_len = 0;
+        Ok(())
+    }
+}
+
+/// Write the batch of the sink on the blocking thread pool. Give back the
+/// state.
+async fn flush(mut inner: Box<Inner>) -> io::Result<Box<Inner>> {
+    if inner.batch.is_empty() {
+        return Ok(inner);
+    }
+    rt::unblock(move || {
+        inner.write_batch()?;
+        Ok(inner)
+    })
+    .await
+}
+
+/// Add a file of up to `FILE_BUFFER_SIZE` to the batch. Write the batch if
+/// it is full. Give back the state.
+///
+/// An error from the entry writes the files before it, then the sink gives
+/// the error.
+async fn queue_file<R: AsyncRead + Unpin + Send>(
+    mut inner: Box<Inner>,
+    mut file: TarRegularFile<'_, R>,
+) -> io::Result<Box<Inner>> {
+    let len = file.size() as usize;
+    if !inner.batch.is_empty() && inner.batch_len + len > rt::BATCH_BYTES {
+        inner = flush(inner).await?;
+    }
+    let meta = inner.set_meta(
+        file.mode(),
+        file.uid(),
+        file.gid(),
+        file.mtime(),
+        file.attrs_mut(),
+    );
+    if len > 0 && inner.batch_data.is_empty() {
+        inner.batch_data = vec![0; rt::BATCH_BYTES].into_boxed_slice();
+    }
+    // A batch that is not empty has room for the body, because of the flush
+    // above. A body is not larger than the buffer.
+    let start = inner.batch_len;
+    let read = match entry_key(file.path()) {
+        Ok(key) => match read_body(&mut file, &mut inner.batch_data[start..start + len]).await {
+            Ok(()) => Ok(key),
+            Err(err) => Err(with_path(err, &key)),
+        },
+        Err(err) => Err(err),
+    };
+    // If the body is empty or the read failed, the drop gives the source back
+    // to the reader and wakes the task that waits for the next entry. A body
+    // that was read to the end gave the source back already. The drop comes
+    // before the flush, so the reader can continue while the flush runs.
+    drop(file);
+    let key = match read {
+        Ok(key) => key,
+        Err(err) => {
+            flush(inner).await?;
+            return Err(err);
+        }
+    };
+    inner.batch.push(QueuedEntry {
+        key,
+        len: Some(len),
+        meta,
+    });
+    inner.batch_len += len;
+    if inner.batch.len() >= rt::BATCH_FILES || inner.batch_len >= rt::BATCH_BYTES {
+        inner = flush(inner).await?;
+    }
+    Ok(inner)
+}
+
+/// Add a directory entry to the batch. Write the batch if it is full. Give
+/// back the state.
+///
+/// An error from the entry path writes the entries before it, then the sink
+/// gives the error.
+async fn queue_dir(mut inner: Box<Inner>, mut dir: TarDirectory) -> io::Result<Box<Inner>> {
+    if is_root_path(dir.path()) {
+        return Ok(inner);
+    }
+    let key = match entry_key(dir.path()) {
+        Ok(key) => key,
+        Err(err) => {
+            flush(inner).await?;
+            return Err(err);
+        }
+    };
+    let meta = inner.set_meta(
+        dir.mode(),
+        dir.uid(),
+        dir.gid(),
+        dir.mtime(),
+        dir.attrs_mut(),
+    );
+    inner.batch.push(QueuedEntry {
+        key,
+        len: None,
+        meta,
+    });
+    if inner.batch.len() >= rt::BATCH_FILES {
+        inner = flush(inner).await?;
+    }
+    Ok(inner)
 }
 
 /// Write one entry. Give back the state.
@@ -522,38 +1190,21 @@ async fn process<R: AsyncRead + Unpin + Send>(
     mut inner: Box<Inner>,
     entry: TarEntry<'_, R>,
 ) -> io::Result<Box<Inner>> {
-    if matches!(entry, TarEntry::Directory(_)) && is_root_path(entry.path()) {
-        return Ok(inner);
-    }
+    let entry = match entry {
+        TarEntry::File(file) if file.size() <= rt::FILE_BUFFER_SIZE as u64 => {
+            return queue_file(inner, file).await;
+        }
+        TarEntry::Directory(dir) => return queue_dir(inner, dir).await,
+        entry => entry,
+    };
+    // Write the batch before each other entry. Then each entry sees the
+    // entries before it, for example a hard link sees its target. An error
+    // from the entry comes after the sink wrote the entries before it.
+    inner = flush(inner).await?;
     let key = entry_key(entry.path())?;
     match entry {
         TarEntry::File(file) => write_file(inner, key, file).await,
-        TarEntry::Directory(mut dir) => {
-            let meta = inner.set_meta(
-                dir.mode(),
-                dir.uid(),
-                dir.gid(),
-                dir.mtime(),
-                dir.attrs_mut(),
-            );
-            rt::unblock(move || {
-                let state = &mut *inner;
-                place(&mut state.root, &state.dest, &key, |_, parent, name| {
-                    make_dir(parent, name)
-                })?;
-                state.created.remove(&key);
-                let depth = key.split('/').count() as u32;
-                let seq = state.dirs.len() as u32;
-                state.dirs.push(DirMeta {
-                    path: key,
-                    depth,
-                    seq,
-                    meta,
-                });
-                Ok(inner)
-            })
-            .await
-        }
+        TarEntry::Directory(_) => unreachable!("the batch takes the directory entries"),
         TarEntry::Symlink(mut link) => {
             let meta = inner.set_meta(
                 link.mode(),
@@ -563,11 +1214,19 @@ async fn process<R: AsyncRead + Unpin + Send>(
                 link.attrs_mut(),
             );
             rt::unblock(move || {
+                let owner_error = Arc::clone(&inner.owner_error);
                 let state = &mut *inner;
-                place(&mut state.root, &state.dest, &key, |_, parent, name| {
-                    make_symlink(parent, name, link.link(), &meta)
+                let id = place(state, &key, |_, parent, name, removed| {
+                    make_symlink(
+                        parent,
+                        name,
+                        link.link(),
+                        &meta,
+                        &|err| owner_error(&key, err),
+                        removed,
+                    )
                 })?;
-                state.created.insert(key);
+                state.created.insert(key, id);
                 Ok(inner)
             })
             .await
@@ -577,22 +1236,24 @@ async fn process<R: AsyncRead + Unpin + Send>(
                 let state = &mut *inner;
                 // Check the target before any change at the entry path.
                 let target = link_target(link.link());
-                let Some(target) = target.filter(|target| state.created.contains(&**target)) else {
-                    return match state.missing_link {
-                        MissingLinkTarget::Error => Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("{key}: link target {} is not in the archive", link.link()),
-                        )),
-                        MissingLinkTarget::Skip => Ok(inner),
-                    };
+                let Some((target, id)) = target.and_then(|target| {
+                    let id = *state.created.get(&*target)?;
+                    Some((target, id))
+                }) else {
+                    return missing_link_target(state.missing_link, &key, link.link())
+                        .map(|()| inner);
                 };
                 if *target == *key {
                     return Ok(inner);
                 }
-                place(&mut state.root, &state.dest, &key, |root, parent, name| {
-                    make_link(root, &target, parent, &key, name)
+                let linked = place(state, &key, |root, parent, name, removed| {
+                    make_link(root, &target, id, parent, &key, name, removed)
                 })?;
-                state.created.insert(key);
+                if !linked {
+                    return missing_link_target(state.missing_link, &key, link.link())
+                        .map(|()| inner);
+                }
+                state.created.insert(key, id);
                 Ok(inner)
             })
             .await
@@ -605,12 +1266,23 @@ async fn process<R: AsyncRead + Unpin + Send>(
                 fifo.mtime(),
                 fifo.attrs_mut(),
             );
+            let create_mode = special_create_mode(inner.mode, FsKind::Fifo);
             rt::unblock(move || {
+                let owner_error = Arc::clone(&inner.owner_error);
                 let state = &mut *inner;
-                place(&mut state.root, &state.dest, &key, |_, parent, name| {
-                    make_special(parent, name, FsKind::Fifo, None, &meta)
+                let id = place(state, &key, |_, parent, name, removed| {
+                    make_special(
+                        parent,
+                        name,
+                        FsKind::Fifo,
+                        None,
+                        create_mode,
+                        &meta,
+                        &|err| owner_error(&key, err),
+                        removed,
+                    )
                 })?;
-                state.created.insert(key);
+                state.created.insert(key, id);
                 Ok(inner)
             })
             .await
@@ -642,12 +1314,23 @@ async fn process<R: AsyncRead + Unpin + Send>(
                 FsKind::BlockDevice
             };
             let device = Some((dev.major(), dev.minor()));
+            let create_mode = special_create_mode(inner.mode, kind);
             rt::unblock(move || {
+                let owner_error = Arc::clone(&inner.owner_error);
                 let state = &mut *inner;
-                place(&mut state.root, &state.dest, &key, |_, parent, name| {
-                    make_special(parent, name, kind, device, &meta)
+                let id = place(state, &key, |_, parent, name, removed| {
+                    make_special(
+                        parent,
+                        name,
+                        kind,
+                        device,
+                        create_mode,
+                        &meta,
+                        &|err| owner_error(&key, err),
+                        removed,
+                    )
                 })?;
-                state.created.insert(key);
+                state.created.insert(key, id);
                 Ok(inner)
             })
             .await
@@ -655,11 +1338,9 @@ async fn process<R: AsyncRead + Unpin + Send>(
     }
 }
 
-/// Write a regular file. Give back the state.
+/// Write a regular file larger than `FILE_BUFFER_SIZE`. Give back the state.
 ///
-/// A body of up to the buffer size goes to the buffer first. Then one job
-/// creates the file, writes the body and sets the metadata. A larger body
-/// goes to the file in chunks of the buffer size.
+/// The body goes to the file in chunks of the buffer size.
 async fn write_file<R: AsyncRead + Unpin + Send>(
     mut inner: Box<Inner>,
     key: Box<str>,
@@ -673,32 +1354,14 @@ async fn write_file<R: AsyncRead + Unpin + Send>(
         file.mtime(),
         file.attrs_mut(),
     );
-    if size > 0 && inner.buf.is_empty() {
+    if inner.buf.is_empty() {
         inner.buf = vec![0; rt::FILE_BUFFER_SIZE].into_boxed_slice();
     }
-    if size <= rt::FILE_BUFFER_SIZE as u64 {
-        let len = size as usize;
-        read_body(&mut file, &mut inner.buf[..len])
-            .await
-            .map_err(|err| with_path(err, &key))?;
-        drop(file);
-        return rt::unblock(move || {
-            let state = &mut *inner;
-            let body = &state.buf[..len];
-            place(&mut state.root, &state.dest, &key, |_, parent, name| {
-                let mut out = make_file(parent, name)?;
-                out.write_all(body)?;
-                sys::set_meta_file(&out, &meta)
-            })?;
-            state.created.insert(key);
-            Ok(inner)
-        })
-        .await;
-    }
+    let create_mode = file_create_mode(&meta);
     let (mut inner, key, out) = rt::unblock(move || {
         let state = &mut *inner;
-        let out = place(&mut state.root, &state.dest, &key, |_, parent, name| {
-            make_file(parent, name)
+        let out = place(state, &key, |_, parent, name, removed| {
+            make_file(parent, name, create_mode, removed)
         })?;
         Ok((inner, key, out))
     })
@@ -710,9 +1373,10 @@ async fn write_file<R: AsyncRead + Unpin + Send>(
     drop(file);
     let out = rt::into_std(out).await;
     rt::unblock(move || {
-        sys::set_meta_file(&out, &meta).map_err(|err| with_path(err, &key))?;
+        let id = sys::finish_file(&out, &meta, &|err| (inner.owner_error)(&key, err))
+            .map_err(|err| with_path(err, &key))?;
         drop(out);
-        inner.created.insert(key);
+        inner.created.insert(key, id);
         Ok(inner)
     })
     .await
@@ -720,13 +1384,6 @@ async fn write_file<R: AsyncRead + Unpin + Send>(
 
 /// Read exactly `buf.len()` bytes of a file body.
 async fn read_body<R: AsyncRead + Unpin>(body: &mut R, buf: &mut [u8]) -> io::Result<()> {
-    if buf.is_empty() {
-        // A read at the end of the body moves the tar reader to the next
-        // header and wakes the task. A body that is dropped without a read
-        // does not wake the task.
-        poll_fn(|cx| poll_read_compat(Pin::new(&mut *body), cx, &mut [])).await?;
-        return Ok(());
-    }
     let mut filled = 0;
     while filled < buf.len() {
         let n =
@@ -813,109 +1470,380 @@ fn link_target(path: &str) -> Option<Cow<'_, str>> {
     }
 }
 
+/// Apply `policy` for the hard link `key` with a target that the sink did
+/// not create.
+fn missing_link_target(policy: MissingLinkTarget, key: &str, target: &str) -> io::Result<()> {
+    match policy {
+        MissingLinkTarget::Error => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{key}: link target {target} is not in the archive"),
+        )),
+        MissingLinkTarget::Skip => Ok(()),
+    }
+}
+
 /// Open the destination and the parent of `key`, then call `f` with the
-/// destination, the parent and the last component. An error from `f` gets
-/// `key` as context.
+/// destination, the parent, the last component and a flag that `f` sets
+/// when it removes a node. Create the missing parent directories. An error
+/// gets `key` as context.
 fn place<T>(
-    root: &mut Option<sys::Dir>,
-    dest: &Path,
+    state: &mut Inner,
     key: &str,
-    f: impl FnOnce(&sys::Dir, &sys::Dir, &str) -> io::Result<T>,
+    f: impl FnOnce(&sys::Dir, &sys::Dir, &str, &mut bool) -> io::Result<T>,
 ) -> io::Result<T> {
-    let root = match root {
+    let mode = parent_mode(state.mode);
+    let root = match &mut state.root {
         Some(root) => &*root,
-        None => &*root.insert(sys::open_dest(dest)?),
+        None => &*state.root.insert(sys::open_dest(&state.dest)?),
     };
-    let parts: Vec<&str> = key.split('/').collect();
-    let parent = resolve::open_parent(root, &parts, true)?;
-    let name = parts[parts.len() - 1];
-    f(root, &parent, name).map_err(|err| with_path(err, key))
+    let (parent, name) = match key.rsplit_once('/') {
+        Some((dir, name)) => (
+            &parent_dir(root, &mut state.parents, dir, mode)
+                .map_err(|err| with_path(err, key))?
+                .dir,
+            name,
+        ),
+        None => (root, key),
+    };
+    let mut removed = false;
+    let result = f(root, parent, name, &mut removed);
+    if removed {
+        state.parents.clear();
+    }
+    result.map_err(|err| with_path(err, key))
+}
+
+/// Give the mode for the create of a missing parent directory with the
+/// mode policy `policy`. The umask applies to this mode, and the sink does
+/// not change the mode later. `None` is the mode 0o777 less the umask. With
+/// [`ModePolicy::Mask`], the mode is 0o777 without the bits of the mask,
+/// less the umask.
+fn parent_mode(policy: ModePolicy) -> Option<u32> {
+    match policy {
+        ModePolicy::Mask(mask) => Some(0o777 & !mask),
+        ModePolicy::Apply | ModePolicy::Skip => None,
+    }
+}
+
+/// Give the directory at the normalized path `dir` in `root`. Remove the
+/// directories from the end of `stack` that are not `dir` and not an
+/// ancestor of `dir`. If the last directory of `stack` has the path `dir`,
+/// it is the result. Else open `dir`, create the missing directories with
+/// the mode `mode`, as [`resolve::open_dir`] does, and push the directory on
+/// `stack` for the next entries. The rules of the open are in
+/// `parent_dir_with`.
+fn parent_dir<'c>(
+    root: &sys::Dir,
+    stack: &'c mut Vec<OpenDir>,
+    dir: &str,
+    mode: Option<u32>,
+) -> io::Result<&'c mut OpenDir> {
+    parent_dir_with(root, stack, dir, |base, path| {
+        resolve::open_dir(base, path, true, mode)
+    })
+}
+
+/// Give the directory at the normalized path `dir` in `root`, by the rules
+/// of `parent_dir`. `open(base, path)` opens the directory at `path` in
+/// `base`. If the last directory of `stack` is an ancestor of `dir`, open
+/// the rest of `dir` in this ancestor. If this open fails, open `dir` in
+/// `root`, and use that result. Thus a symlink in the rest can lead outside
+/// the ancestor if its target stays inside `root`. If no directory of
+/// `stack` is an ancestor of `dir`, open `dir` in `root`.
+///
+/// An open in the ancestor creates directories only below the ancestor.
+/// These are the directories that an open of `dir` from `root` through the
+/// same ancestor also creates.
+fn parent_dir_with<'c>(
+    root: &sys::Dir,
+    stack: &'c mut Vec<OpenDir>,
+    dir: &str,
+    mut open: impl FnMut(&sys::Dir, &str) -> io::Result<sys::Dir>,
+) -> io::Result<&'c mut OpenDir> {
+    while stack
+        .last()
+        .is_some_and(|top| *top.path != *dir && !is_below(dir, &top.path))
+    {
+        stack.pop();
+    }
+    if stack.last().is_none_or(|top| *top.path != *dir) {
+        let opened = match stack.last() {
+            Some(top) => open(&top.dir, &dir[top.path.len() + 1..]).or_else(|_| open(root, dir)),
+            None => open(root, dir),
+        }?;
+        push_dir(
+            stack,
+            OpenDir {
+                path: dir.into(),
+                dir: opened,
+                id: None,
+            },
+        );
+    }
+    Ok(stack.last_mut().expect("the stack has a directory"))
+}
+
+/// Push `open` on `stack`. Remove the directories from the end of `stack`
+/// that are not an ancestor of `open` first. If `stack` has `OPEN_DIRS`
+/// directories, remove the first one.
+fn push_dir(stack: &mut Vec<OpenDir>, open: OpenDir) {
+    while stack
+        .last()
+        .is_some_and(|top| !is_below(&open.path, &top.path))
+    {
+        stack.pop();
+    }
+    if stack.len() == OPEN_DIRS {
+        stack.remove(0);
+    }
+    stack.push(open);
+}
+
+/// Give `true` if the normalized path `path` is below the normalized path
+/// `dir`.
+fn is_below(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Make room at `name` after a create failed with `AlreadyExists`. Remove a
-/// node that is not a directory. Give `true` if a directory has the name.
-fn clear(parent: &sys::Dir, name: &str) -> io::Result<bool> {
+/// node that is not a directory, and set `removed`. If a directory has the
+/// name, give its identity.
+fn clear(parent: &sys::Dir, name: &str, removed: &mut bool) -> io::Result<Option<sys::FileId>> {
     match sys::lookup(parent, name)? {
-        Existing::Directory => Ok(true),
+        Existing::Directory(id) => Ok(Some(id)),
         Existing::Other => {
+            *removed = true;
             sys::remove(parent, name)?;
-            Ok(false)
+            Ok(None)
         }
-        Existing::Missing => Ok(false),
+        Existing::Missing => Ok(None),
     }
 }
 
 /// Create a node that is not a directory with `make`. If the name exists,
-/// remove the node and call `make` again. A directory at the name gives
-/// `AlreadyExists`.
+/// remove the node, set `removed` and call `make` again. A directory at the
+/// name gives `AlreadyExists`.
 fn create<T>(
     parent: &sys::Dir,
     name: &str,
+    removed: &mut bool,
     mut make: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
     match make() {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            if clear(parent, name)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "a directory exists at the path",
-                ));
-            }
-            make()
+            replace(parent, name, removed, make)
         }
         result => result,
     }
 }
 
-/// Create the directory `name` in `parent`. An existing directory stays.
-fn make_dir(parent: &sys::Dir, name: &str) -> io::Result<()> {
-    match sys::create_dir(parent, name) {
+/// Create a node that is not a directory with `make` after a create failed
+/// with `AlreadyExists`. Remove the node at the name, set `removed` and call
+/// `make`. A directory at the name gives `AlreadyExists`.
+fn replace<T>(
+    parent: &sys::Dir,
+    name: &str,
+    removed: &mut bool,
+    make: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    if clear(parent, name, removed)?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a directory exists at the path",
+        ));
+    }
+    make()
+}
+
+/// Create the directory `name` in `parent`. With `umask` set, use the mode
+/// 0o777 less the umask, else 0o700. Give the open new directory and its
+/// identity, as [`sys::create_dir`] does. An existing directory stays and
+/// gives only its identity. If a node that is not a directory has the name,
+/// remove it and set `removed`.
+fn make_dir(
+    parent: &sys::Dir,
+    name: &str,
+    umask: bool,
+    removed: &mut bool,
+) -> io::Result<(Option<sys::Dir>, Option<sys::FileId>)> {
+    let created = match sys::create_dir(parent, name, umask) {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            if clear(parent, name)? {
-                Ok(())
-            } else {
-                sys::create_dir(parent, name)
+            if let Some(id) = clear(parent, name, removed)? {
+                return Ok((None, Some(id)));
             }
+            sys::create_dir(parent, name, umask)?
         }
-        result => result,
+        result => result?,
+    };
+    Ok(created.unzip())
+}
+
+/// Create the directory `name` in `parent` for a directory entry with the
+/// metadata `meta`, as [`make_dir`] does. If the finish does not set the
+/// metadata of the directory, set the owner and the extended attributes now
+/// with `on_owner_error` and give `None`. Else give the identity of the
+/// directory and its depth on disk below `root`. `root_id` and `parent_id`
+/// keep the identities of `root` and `parent` when they are known.
+/// `parent_id` is `None` if `parent` is `root`. `depths` is the cache of
+/// [`disk_depth`]. Set `created` to the open new directory and its identity,
+/// as [`make_dir`] gives them.
+#[allow(clippy::too_many_arguments)]
+fn make_entry_dir(
+    root: &sys::Dir,
+    root_id: &mut Option<sys::FileId>,
+    parent: &sys::Dir,
+    parent_id: Option<&mut Option<sys::FileId>>,
+    name: &str,
+    meta: &SetMeta,
+    umask: bool,
+    depths: &mut HashMap<sys::FileId, u32>,
+    on_owner_error: &dyn Fn(io::Error) -> io::Result<()>,
+    removed: &mut bool,
+    created: &mut Option<(sys::Dir, sys::FileId)>,
+) -> io::Result<Option<(sys::FileId, u32)>> {
+    let (dir, id) = make_dir(parent, name, umask, removed)?;
+    *created = dir.zip(id);
+    // Without a mode and a time to set, the children have no effect on the
+    // metadata. Thus the sink sets it now.
+    if meta.mode.is_none() && meta.mtime.is_none() {
+        if meta.owner.is_some() || !meta.xattrs.is_empty() {
+            sys::set_meta_dir(&sys::open_child_dir(parent, name)?, meta, on_owner_error)?;
+        }
+        return Ok(None);
+    }
+    // The finish uses the identity to find the directory, and the depth to
+    // set the metadata of the directories below it first.
+    let parent_id = match parent_id {
+        Some(id) => known_id(parent, id)?,
+        None => known_id(root, root_id)?,
+    };
+    let depth = disk_depth(root, root_id, parent, parent_id, depths)? + 1;
+    let id = match id {
+        Some(id) => id,
+        None => sys::id_at(parent, name)?,
+    };
+    depths.insert(id, depth);
+    Ok(Some((id, depth)))
+}
+
+/// Give the identity of the open directory `dir`. Keep it in `id`. If `id`
+/// has an identity, give it.
+fn known_id(dir: &sys::Dir, id: &mut Option<sys::FileId>) -> io::Result<sys::FileId> {
+    match *id {
+        Some(id) => Ok(id),
+        None => Ok(*id.insert(sys::dir_id(dir)?)),
     }
 }
 
-/// Create the regular file `name` in `parent` and open it for writing.
-fn make_file(parent: &sys::Dir, name: &str) -> io::Result<std::fs::File> {
-    create(parent, name, || sys::create_file(parent, name))
+/// Give the depth on disk of the directory `dir` with the identity `dir_id`
+/// below `root`. `root` has depth 0. `root_id` keeps the identity of `root`
+/// when it is known. Go up from `dir` until a directory in `depths` or
+/// `root`, and keep the depth of each directory on the way in `depths`. The
+/// walk needs search permission on each directory on the way. A directory
+/// that is not below `root` gives an
+/// [`InvalidData`](io::ErrorKind::InvalidData) error "file changed".
+fn disk_depth(
+    root: &sys::Dir,
+    root_id: &mut Option<sys::FileId>,
+    dir: &sys::Dir,
+    dir_id: sys::FileId,
+    depths: &mut HashMap<sys::FileId, u32>,
+) -> io::Result<u32> {
+    if depths.is_empty() {
+        depths.insert(known_id(root, root_id)?, 0);
+    }
+    let mut ids = Vec::new();
+    let mut id = dir_id;
+    let mut opened = None;
+    let base = loop {
+        if let Some(&depth) = depths.get(&id) {
+            break depth;
+        }
+        ids.push(id);
+        let parent = sys::open_parent(opened.as_ref().unwrap_or(dir))?;
+        id = sys::dir_id(&parent)?;
+        // The root of the filesystem is its own parent.
+        if ids.last() == Some(&id) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "file changed"));
+        }
+        opened = Some(parent);
+    };
+    for (depth, id) in (base + 1..).zip(ids.iter().rev()) {
+        depths.insert(*id, depth);
+    }
+    Ok(base + ids.len() as u32)
 }
 
-/// Create the symlink `name` in `parent` and set its metadata.
-fn make_symlink(parent: &sys::Dir, name: &str, target: &str, meta: &SetMeta) -> io::Result<()> {
-    create(parent, name, || sys::create_symlink(parent, name, target))?;
-    sys::set_meta_at(parent, name, FsKind::Symlink, meta)
+/// Create the regular file `name` in `parent` with `mode` less the umask
+/// and open it for writing. Set `removed` if a node is removed.
+fn make_file(
+    parent: &sys::Dir,
+    name: &str,
+    mode: u32,
+    removed: &mut bool,
+) -> io::Result<std::fs::File> {
+    create(parent, name, removed, || {
+        sys::create_file(parent, name, mode)
+    })
 }
 
-/// Create the FIFO or device `name` in `parent` and set its metadata.
+/// Create the symlink `name` in `parent` and set its metadata with
+/// `on_owner_error`. Give the identity of the symlink. Set `removed` if a
+/// node is removed.
+fn make_symlink(
+    parent: &sys::Dir,
+    name: &str,
+    target: &str,
+    meta: &SetMeta,
+    on_owner_error: &dyn Fn(io::Error) -> io::Result<()>,
+    removed: &mut bool,
+) -> io::Result<sys::FileId> {
+    create(parent, name, removed, || {
+        sys::create_symlink(parent, name, target)
+    })?;
+    let id = sys::id_at(parent, name)?;
+    sys::set_meta_at(parent, name, FsKind::Symlink, meta, on_owner_error)?;
+    Ok(id)
+}
+
+/// Create the FIFO or device `name` in `parent` with `mode` less the umask
+/// and set its metadata with `on_owner_error`. Give the identity of the
+/// node. Set `removed` if a node is removed.
+#[allow(clippy::too_many_arguments)]
 fn make_special(
     parent: &sys::Dir,
     name: &str,
     kind: FsKind,
     device: Option<(u32, u32)>,
+    mode: u32,
     meta: &SetMeta,
-) -> io::Result<()> {
-    create(parent, name, || {
-        sys::create_special(parent, name, kind, device)
+    on_owner_error: &dyn Fn(io::Error) -> io::Result<()>,
+    removed: &mut bool,
+) -> io::Result<sys::FileId> {
+    create(parent, name, removed, || {
+        sys::create_special(parent, name, kind, device, mode)
     })?;
-    sys::set_meta_at(parent, name, kind, meta)
+    let id = sys::id_at(parent, name)?;
+    sys::set_meta_at(parent, name, kind, meta, on_owner_error)?;
+    Ok(id)
 }
 
 /// Create the name `name` in `parent` for the node at the normalized path
 /// `target` in `root`. `key` is the normalized path of `name`. If `target`
-/// is in the same directory, the link uses `parent` for the target.
+/// is in the same directory, the link uses `parent` for the target. If
+/// `target` leads to no node or to a node without the identity `id`, give
+/// `false` and create nothing. If `name` is a link to the node already,
+/// change nothing and give `true`. Set `removed` if a node is removed.
 fn make_link(
     root: &sys::Dir,
     target: &str,
+    id: sys::FileId,
     parent: &sys::Dir,
     key: &str,
     name: &str,
-) -> io::Result<()> {
+    removed: &mut bool,
+) -> io::Result<bool> {
     let (target_dir, from_name) = match target.rsplit_once('/') {
         Some((dir, from_name)) => (Some(dir), from_name),
         None => (None, target),
@@ -923,16 +1851,48 @@ fn make_link(
     let opened;
     let from = if target_dir == key.rsplit_once('/').map(|(dir, _)| dir) {
         parent
+    } else if let Some(dir) = target_dir {
+        opened = match resolve::open_dir(root, dir, false, None) {
+            Ok(opened) => opened,
+            // A missing component, a component that is not a directory and a
+            // symlink loop: the target path leads to no node.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) || err.raw_os_error() == Some(Errno::LOOP.raw_os_error()) =>
+            {
+                return Ok(false)
+            }
+            Err(err) => return Err(with_path(err, &format!("link target {target}"))),
+        };
+        &opened
     } else {
-        let parts: Vec<&str> = target.split('/').collect();
-        // The error of `open_parent` starts with the target path.
-        opened = resolve::open_parent(root, &parts, false)
-            .map_err(|err| io::Error::new(err.kind(), format!("link target {err}")))?;
-        &*opened
+        root
     };
-    create(parent, name, || {
-        sys::create_link(from, from_name, parent, name)
-    })
+    // A parent symlink that changed after the create of the target can lead
+    // `target` to another node or to no node.
+    match sys::id_at(from, from_name) {
+        Ok(found) if found == id => {}
+        Ok(_) => return Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    }
+    let link = || sys::create_link(from, from_name, parent, name);
+    match link() {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            // Two paths can lead to one directory entry, for example through
+            // a parent symlink. Then `name` is the target, and a remove of
+            // `name` deletes the target.
+            match sys::id_at(parent, name) {
+                Ok(found) if found == id => {}
+                _ => replace(parent, name, removed, link)?,
+            }
+        }
+        Err(err) => return Err(err),
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -940,19 +1900,21 @@ mod tests {
     use {
         super::*,
         crate::{rt::block_on, testutil::TempDir, FsFile},
-        futures::StreamExt,
+        futures::{task::noop_waker_ref, SinkExt, StreamExt},
         smol_tar::{TarDirectory, TarLink, TarReader, TarRegularFileReader, TarWriter},
         static_assertions::assert_impl_all,
         std::{
             fs,
             io::ErrorKind,
-            os::unix::fs::{MetadataExt, PermissionsExt},
-            pin::pin,
+            os::unix::fs::{symlink, MetadataExt, PermissionsExt},
+            path::Path,
             sync::{
                 atomic::{AtomicUsize, Ordering},
+                mpsc::{self, RecvTimeoutError},
                 Arc,
             },
             task::{Wake, Waker},
+            thread,
             time::{Duration, UNIX_EPOCH},
         },
     };
@@ -996,6 +1958,10 @@ mod tests {
             "/../smol-tar/tests/data/pax.tar"
         ))
         .unwrap();
+        // A directory that the process creates with the mode 0o777 and its
+        // umask.
+        fs::create_dir(tmp.path().join("ref")).unwrap();
+        let ref_meta = fs::metadata(tmp.path().join("ref")).unwrap();
         extract(&data, tmp.path()).unwrap();
         let mut dir = tmp.path().join("pax");
         for _ in 0..10 {
@@ -1009,7 +1975,7 @@ mod tests {
         for parent in [tmp.path().join("pax"), dir] {
             let meta = fs::symlink_metadata(parent).unwrap();
             assert!(meta.is_dir());
-            assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+            assert_eq!(meta.mode() & 0o777, ref_meta.mode() & 0o777);
         }
     }
 
@@ -1036,8 +2002,7 @@ mod tests {
         assert!(err.to_string().starts_with(".: "), "{err}");
     }
 
-    /// An archive with an empty file extracts completely. The test
-    /// `empty_body_read_wakes_reader` checks the wake of the reader.
+    /// An archive with an empty file extracts completely.
     #[test]
     fn forward_after_empty_file() {
         let tmp = TempDir::new();
@@ -1050,39 +2015,192 @@ mod tests {
     /// Waker that counts its wakes.
     struct CountWaker(AtomicUsize);
 
-    impl Wake for CountWaker {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
+    impl CountWaker {
+        /// Make a counter and a waker that increments it.
+        fn new() -> (Arc<Self>, Waker) {
+            let count = Arc::new(Self(AtomicUsize::new(0)));
+            (count.clone(), Waker::from(count))
         }
 
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
+        /// Number of wakes.
+        fn get(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
         }
     }
 
-    /// `forward` polls the reader after the sink completes an entry. The read
-    /// of an empty body moves the reader to the next header and wakes the
-    /// task.
+    impl Wake for CountWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The `poll_ready` that queues an empty file gives the source back to
+    /// the reader and wakes the reader task. The sink is idle after the call
+    /// and does not wake its own task.
     #[test]
-    fn empty_body_read_wakes_reader() {
+    fn empty_body_drop_wakes_reader() {
+        let tmp = TempDir::new();
         let data = archive(vec![file("e", b""), file("f", b"data")]);
         let mut reader = TarReader::new(&data[..]);
-        let Some(Ok(TarEntry::File(mut body))) = block_on(reader.next()) else {
-            panic!("no file entry");
-        };
-        let count = Arc::new(CountWaker(AtomicUsize::new(0)));
-        let waker = Waker::from(Arc::clone(&count));
-        let mut cx = Context::from_waker(&waker);
-        {
-            let read = pin!(read_body(&mut body, &mut []));
-            assert!(matches!(read.poll(&mut cx), Poll::Ready(Ok(()))));
-        }
-        assert!(count.0.load(Ordering::Relaxed) > 0);
-        drop(body);
-        let Some(Ok(entry)) = block_on(reader.next()) else {
-            panic!("no second entry");
+        let mut sink = FsSink::new(tmp.path());
+        let entry = block_on(reader.next()).unwrap().unwrap();
+        Pin::new(&mut sink).start_send(entry).unwrap();
+        let (stream_wakes, stream_waker) = CountWaker::new();
+        let mut stream_cx = Context::from_waker(&stream_waker);
+        assert!(Pin::new(&mut reader).poll_next(&mut stream_cx).is_pending());
+        assert_eq!(stream_wakes.get(), 0);
+        let (sink_wakes, sink_waker) = CountWaker::new();
+        let poll = Pin::new(&mut sink).poll_ready(&mut Context::from_waker(&sink_waker));
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert!(matches!(sink.state, SinkState::Idle(_)));
+        assert_eq!(sink_wakes.get(), 0);
+        assert_eq!(stream_wakes.get(), 1);
+        let Poll::Ready(Some(Ok(entry))) = Pin::new(&mut reader).poll_next(&mut stream_cx) else {
+            panic!("the reader does not give the second entry");
         };
         assert_eq!(entry.path(), "f");
+    }
+
+    /// The first `poll_flush` after the `start_send` of an empty file wakes
+    /// the reader task. This is the call order of `StreamExt::forward`.
+    #[test]
+    fn empty_body_flush_wakes_reader() {
+        let tmp = TempDir::new();
+        let data = archive(vec![file("e", b""), file("f", b"data")]);
+        let mut reader = TarReader::new(&data[..]);
+        let mut sink = FsSink::new(tmp.path());
+        // The flush job uses the blocking thread pool of the runtime. Thus
+        // the test polls the sink in `block_on`.
+        block_on(async {
+            let entry = reader.next().await.unwrap()?;
+            Pin::new(&mut sink).start_send(entry)?;
+            let (stream_wakes, stream_waker) = CountWaker::new();
+            let mut stream_cx = Context::from_waker(&stream_waker);
+            assert!(Pin::new(&mut reader).poll_next(&mut stream_cx).is_pending());
+            assert_eq!(stream_wakes.get(), 0);
+            let mut sink_cx = Context::from_waker(noop_waker_ref());
+            if let Poll::Ready(result) = Pin::new(&mut sink).poll_flush(&mut sink_cx) {
+                result?;
+            }
+            assert_eq!(stream_wakes.get(), 1);
+            sink.flush().await?;
+            let entry = reader.next().await.unwrap()?;
+            assert_eq!(entry.path(), "f");
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+
+    /// After `feed` of a file with a body, the reader does not give the next
+    /// entry. The `flush` runs the job, and the job gives the source back to
+    /// the reader and wakes the reader task.
+    #[test]
+    fn feed_then_next_waits_for_sink() {
+        let tmp = TempDir::new();
+        let data = archive(vec![file("f", b"data"), file("g", b"more")]);
+        let mut reader = TarReader::new(&data[..]);
+        let mut sink = FsSink::new(tmp.path());
+        block_on(async {
+            let entry = reader.next().await.unwrap()?;
+            sink.feed(entry).await?;
+            let (stream_wakes, stream_waker) = CountWaker::new();
+            let mut stream_cx = Context::from_waker(&stream_waker);
+            assert!(reader.poll_next_unpin(&mut stream_cx).is_pending());
+            assert_eq!(stream_wakes.get(), 0);
+            SinkExt::flush(&mut sink).await?;
+            assert_eq!(stream_wakes.get(), 1);
+            let entry = reader.next().await.unwrap()?;
+            assert_eq!(entry.path(), "g");
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+
+    /// Run `f` on a new thread and give its result. Panic if `f` does not
+    /// return in 10 seconds.
+    fn within_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(value) => value,
+            Err(RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(handle.join().unwrap_err())
+            }
+            Err(RecvTimeoutError::Timeout) => panic!("the call does not return in 10 seconds"),
+        }
+    }
+
+    /// A `flush` after each `feed` lets the reader give each entry.
+    #[test]
+    fn feed_flush_then_next_extracts_all() {
+        let tmp = TempDir::new();
+        let big = (0..rt::FILE_BUFFER_SIZE + 100).map(|i| (i % 251) as u8);
+        let big: &'static [u8] = Vec::leak(big.collect());
+        let data = archive(vec![
+            TarDirectory::new("d/").into(),
+            file("d/e", b""),
+            file("d/big", big),
+            file("d/f", b"data"),
+        ]);
+        let dest = tmp.path().to_path_buf();
+        within_timeout(move || {
+            block_on(async {
+                let mut reader = TarReader::new(&data[..]);
+                let mut sink = FsSink::new(dest);
+                while let Some(entry) = reader.next().await {
+                    sink.feed(entry?).await?;
+                    SinkExt::flush(&mut sink).await?;
+                }
+                SinkExt::close(&mut sink).await
+            })
+        })
+        .unwrap();
+        assert_eq!(fs::read(tmp.path().join("d/e")).unwrap(), b"");
+        assert_eq!(fs::read(tmp.path().join("d/big")).unwrap(), big);
+        assert_eq!(fs::read(tmp.path().join("d/f")).unwrap(), b"data");
+    }
+
+    /// `write` runs the job before it returns. Thus the reader gives each
+    /// entry. The small entries wait in one batch until the large file.
+    #[test]
+    fn write_then_next_keeps_batch() {
+        let tmp = TempDir::new();
+        let big = (0..rt::FILE_BUFFER_SIZE + 100).map(|i| (i % 251) as u8);
+        let big: &'static [u8] = Vec::leak(big.collect());
+        let data = archive(vec![
+            TarDirectory::new("d/").into(),
+            file("d/e", b""),
+            file("d/f", b"data"),
+            file("d/big", big),
+        ]);
+        let dest = tmp.path().to_path_buf();
+        let batch_len = within_timeout(move || {
+            block_on(async {
+                let mut reader = TarReader::new(&data[..]);
+                let mut sink = FsSink::new(dest);
+                let mut batch_len = None;
+                while let Some(entry) = reader.next().await {
+                    let entry = entry?;
+                    if entry.path() == "d/big" {
+                        let SinkState::Idle(inner) = &sink.state else {
+                            panic!("the sink is not idle");
+                        };
+                        batch_len = Some(inner.batch.len());
+                    }
+                    sink.write(entry).await?;
+                }
+                sink.finish().await?;
+                Ok::<_, io::Error>(batch_len)
+            })
+        })
+        .unwrap();
+        assert_eq!(batch_len, Some(3));
+        assert!(fs::metadata(tmp.path().join("d")).unwrap().is_dir());
+        assert_eq!(fs::read(tmp.path().join("d/e")).unwrap(), b"");
+        assert_eq!(fs::read(tmp.path().join("d/f")).unwrap(), b"data");
+        assert_eq!(fs::read(tmp.path().join("d/big")).unwrap(), big);
     }
 
     #[test]
@@ -1203,5 +2321,271 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "{size}");
             assert!(err.to_string().starts_with("f: "), "{err}");
         }
+    }
+
+    #[test]
+    fn file_create_mode_with_owner_has_common_bits() {
+        let meta = |mode: Option<u32>, owner: Option<(u32, u32)>| SetMeta {
+            mode,
+            owner,
+            mtime: None,
+            xattrs: AttrList::new(),
+            xattr_filter: Arc::new(|_| true),
+            xattr_policy: UnsupportedXattr::Error,
+        };
+        assert_eq!(file_create_mode(&meta(Some(0o640), None)), 0o640);
+        assert_eq!(file_create_mode(&meta(Some(0o640), Some((1, 2)))), 0o600);
+        assert_eq!(file_create_mode(&meta(Some(0o644), Some((1, 2)))), 0o644);
+        assert_eq!(file_create_mode(&meta(Some(0o755), Some((1, 2)))), 0o755);
+        assert_eq!(file_create_mode(&meta(Some(0o750), Some((1, 2)))), 0o700);
+        assert_eq!(file_create_mode(&meta(Some(0o604), Some((1, 2)))), 0o600);
+        assert_eq!(file_create_mode(&meta(Some(0o477), Some((1, 2)))), 0o444);
+        assert_eq!(file_create_mode(&meta(Some(0o4755), Some((1, 2)))), 0o600);
+        // Without a mode to set, the sink does not change the mode later.
+        assert_eq!(file_create_mode(&meta(None, Some((1, 2)))), 0o666);
+    }
+
+    #[test]
+    fn special_create_mode_is_owner_only_except_skipped_fifo() {
+        let policies = [
+            (ModePolicy::Skip, 0o666),
+            (ModePolicy::Apply, 0o600),
+            (ModePolicy::Mask(0o022), 0o600),
+        ];
+        for (policy, fifo) in policies {
+            let kinds = [
+                (FsKind::Fifo, fifo),
+                (FsKind::CharDevice, 0o600),
+                (FsKind::BlockDevice, 0o600),
+            ];
+            for (kind, mode) in kinds {
+                let got = special_create_mode(policy, kind);
+                assert_eq!(got, mode, "{policy:?} {kind:?}");
+            }
+        }
+    }
+
+    /// With the owner option, a partly written file with mode 0o640 has no
+    /// group and other bits. The body ends early, thus the sink does not set
+    /// the owner.
+    #[test]
+    fn partial_file_with_owner_hides_group_bits() {
+        let tmp = TempDir::new();
+        let size = rt::FILE_BUFFER_SIZE as u64 + 10;
+        let err = block_on(async {
+            let mut sink = FsSink::new(tmp.path()).with_owner(true);
+            let entry = TarRegularFile::new("f", size, &b"12345"[..]).with_mode(0o640);
+            sink.write(entry.into()).await.unwrap_err()
+        });
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        let mode = fs::metadata(tmp.path().join("f"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    /// Files of size 0 do not allocate the buffer of the batch.
+    #[test]
+    fn empty_files_do_not_allocate_batch_buffer() {
+        let tmp = TempDir::new();
+        block_on(async {
+            let mut sink = FsSink::new(tmp.path());
+            for name in ["e1", "e2", "e3"] {
+                sink.write(file(name, b"")).await.unwrap();
+            }
+            match &sink.state {
+                SinkState::Idle(inner) => assert!(inner.batch_data.is_empty()),
+                _ => panic!("the sink is not idle"),
+            }
+            sink.finish().await.unwrap();
+        });
+        for name in ["e1", "e2", "e3"] {
+            assert_eq!(fs::metadata(tmp.path().join(name)).unwrap().len(), 0);
+        }
+    }
+
+    /// Give the paths of the open directories of the idle sink `sink`.
+    fn open_paths<'s, R>(sink: &'s FsSink<'_, R>) -> Vec<&'s str> {
+        match &sink.state {
+            SinkState::Idle(inner) => inner.parents.iter().map(|open| &*open.path).collect(),
+            _ => panic!("the sink is not idle"),
+        }
+    }
+
+    /// The open directories of the sink are a chain of ancestors. A new
+    /// directory goes on the stack with its identity.
+    #[test]
+    fn open_parents_are_a_chain() {
+        let tmp = TempDir::new();
+        block_on(async {
+            let mut sink = FsSink::new(tmp.path());
+            sink.write(TarDirectory::new("a/").into()).await.unwrap();
+            sink.write(TarDirectory::new("a/b1/").into()).await.unwrap();
+            sink.write(file("a/b1/f", b"f")).await.unwrap();
+            sink.flush().await.unwrap();
+            assert_eq!(open_paths(&sink), ["a", "a/b1"]);
+            sink.write(TarDirectory::new("a/b2/").into()).await.unwrap();
+            sink.flush().await.unwrap();
+            assert_eq!(open_paths(&sink), ["a", "a/b2"]);
+            // A chain deeper than `OPEN_DIRS` keeps the deepest directories.
+            let paths: Vec<String> = (1..=20).map(|depth| vec!["c"; depth].join("/")).collect();
+            for path in &paths {
+                sink.write(TarDirectory::new(path.as_str()).into())
+                    .await
+                    .unwrap();
+            }
+            sink.flush().await.unwrap();
+            assert_eq!(open_paths(&sink), paths[20 - OPEN_DIRS..]);
+            match &sink.state {
+                SinkState::Idle(inner) => {
+                    for open in &inner.parents {
+                        let meta = fs::metadata(tmp.path().join(&*open.path)).unwrap();
+                        assert_eq!(open.id, Some((meta.dev(), meta.ino())), "{}", open.path);
+                    }
+                }
+                _ => panic!("the sink is not idle"),
+            }
+            sink.finish().await.unwrap();
+            assert!(open_paths(&sink).is_empty());
+        });
+        assert_eq!(fs::read(tmp.path().join("a/b1/f")).unwrap(), b"f");
+        assert!(tmp.path().join(["c"; 20].join("/")).is_dir());
+    }
+
+    /// With [`ModePolicy::Skip`], the sink does not open a new directory. A
+    /// later entry opens its parent path.
+    #[test]
+    fn skipped_mode_does_not_keep_new_directory() {
+        let tmp = TempDir::new();
+        block_on(async {
+            let mut sink = FsSink::new(tmp.path()).with_mode(ModePolicy::Skip);
+            sink.write(TarDirectory::new("a/").into()).await.unwrap();
+            sink.flush().await.unwrap();
+            assert!(open_paths(&sink).is_empty());
+            sink.write(file("a/f", b"f")).await.unwrap();
+            sink.flush().await.unwrap();
+            assert_eq!(open_paths(&sink), ["a"]);
+            sink.finish().await.unwrap();
+        });
+        assert_eq!(fs::read(tmp.path().join("a/f")).unwrap(), b"f");
+    }
+
+    /// Give the identity of the directory at `path`.
+    fn id_of(path: &Path) -> sys::FileId {
+        let meta = fs::metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    /// Give a stack with the directory `path` in `root`.
+    fn stack_with(root: &sys::Dir, path: &str) -> Vec<OpenDir> {
+        let dir = resolve::open_dir(root, path, false, None).unwrap();
+        let path = path.into();
+        vec![OpenDir {
+            path,
+            dir,
+            id: None,
+        }]
+    }
+
+    /// Give the directory at `dir` in `root` with `parent_dir_with` and
+    /// `stack`. Give the paths that `open` got and the identity of the
+    /// result. `open` creates the missing directories.
+    fn parent_with(
+        root: &sys::Dir,
+        stack: &mut Vec<OpenDir>,
+        dir: &str,
+    ) -> (Vec<String>, io::Result<sys::FileId>) {
+        let mut calls = Vec::new();
+        let result = parent_dir_with(root, stack, dir, |base, path| {
+            calls.push(path.to_owned());
+            resolve::open_dir(base, path, true, None)
+        })
+        .and_then(|open| sys::dir_id(&open.dir));
+        (calls, result)
+    }
+
+    /// Give the paths of the directories of `stack`.
+    fn stack_paths(stack: &[OpenDir]) -> Vec<&str> {
+        stack.iter().map(|open| &*open.path).collect()
+    }
+
+    /// An open ancestor gives the start of the open of the rest of the
+    /// path. An open directory with the path gives the result without an
+    /// open. With no open ancestor, the open starts at the destination.
+    #[test]
+    fn parent_below_open_ancestor_resolves_rest() {
+        let tmp = TempDir::new();
+        fs::create_dir(tmp.path().join("a")).unwrap();
+        let root = sys::open_dest(tmp.path()).unwrap();
+        let mut stack = stack_with(&root, "a");
+        let (calls, id) = parent_with(&root, &mut stack, "a/c");
+        assert_eq!(calls, ["c"]);
+        assert!(tmp.path().join("a/c").is_dir());
+        assert_eq!(id.unwrap(), id_of(&tmp.path().join("a/c")));
+        assert_eq!(stack_paths(&stack), ["a", "a/c"]);
+        let (calls, id) = parent_with(&root, &mut stack, "a/c");
+        assert!(calls.is_empty());
+        assert_eq!(id.unwrap(), id_of(&tmp.path().join("a/c")));
+        let mut stack = Vec::new();
+        let (calls, id) = parent_with(&root, &mut stack, "a/c");
+        assert_eq!(calls, ["a/c"]);
+        assert_eq!(id.unwrap(), id_of(&tmp.path().join("a/c")));
+        assert_eq!(stack_paths(&stack), ["a/c"]);
+    }
+
+    /// A symlink below an open ancestor leads outside the ancestor and
+    /// stays inside the destination. The open from the destination gives
+    /// the result.
+    #[test]
+    fn parent_symlink_outside_ancestor_resolves_from_root() {
+        let tmp = TempDir::new();
+        fs::create_dir(tmp.path().join("a")).unwrap();
+        fs::create_dir(tmp.path().join("b")).unwrap();
+        symlink("../b", tmp.path().join("a/c")).unwrap();
+        let root = sys::open_dest(tmp.path()).unwrap();
+        let mut stack = stack_with(&root, "a");
+        let (calls, id) = parent_with(&root, &mut stack, "a/c");
+        assert_eq!(calls, ["c", "a/c"]);
+        assert_eq!(id.unwrap(), id_of(&tmp.path().join("b")));
+        assert_eq!(stack_paths(&stack), ["a", "a/c"]);
+    }
+
+    /// An absolute symlink below an open ancestor gives the escape error
+    /// from the ancestor and from the destination.
+    #[test]
+    fn parent_absolute_symlink_below_ancestor_fails() {
+        let tmp = TempDir::new();
+        fs::create_dir(tmp.path().join("a")).unwrap();
+        fs::create_dir(tmp.path().join("b")).unwrap();
+        symlink(tmp.path().join("b"), tmp.path().join("a/abs")).unwrap();
+        let root = sys::open_dest(tmp.path()).unwrap();
+        let mut stack = stack_with(&root, "a");
+        let (calls, id) = parent_with(&root, &mut stack, "a/abs");
+        assert_eq!(calls, ["abs", "a/abs"]);
+        let err = id.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(err.to_string(), "a path led outside of the filesystem");
+        assert_eq!(fs::read_dir(tmp.path().join("b")).unwrap().count(), 0);
+    }
+
+    /// A symlink below an open ancestor that leads outside the destination
+    /// gives the escape error from the ancestor and from the destination.
+    #[test]
+    fn parent_symlink_outside_root_fails() {
+        let tmp = TempDir::new();
+        let dest = tmp.path().join("dest");
+        let out = tmp.path().join("out");
+        fs::create_dir_all(dest.join("a")).unwrap();
+        fs::create_dir(&out).unwrap();
+        symlink("../../out", dest.join("a/c")).unwrap();
+        let root = sys::open_dest(&dest).unwrap();
+        let mut stack = stack_with(&root, "a");
+        let (calls, id) = parent_with(&root, &mut stack, "a/c");
+        assert_eq!(calls, ["c", "a/c"]);
+        let err = id.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(err.to_string(), "a path led outside of the filesystem");
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
     }
 }

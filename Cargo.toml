@@ -4,8 +4,8 @@ members = ["smol-tar", "smol-tar-fs", "picotar"]
 exclude = ["bench", "fuzz", "xtask"]
 
 [workspace.package]
-version = "0.1.12"
+version = "0.2.0"
 
 [workspace.dependencies]
-smol-tar = { version = "0.1.12", path = "smol-tar", default-features = false }
-smol-tar-fs = { version = "0.1.12", path = "smol-tar-fs", default-features = false }
+smol-tar = { version = "0.2.0", path = "smol-tar", default-features = false }
+smol-tar-fs = { version = "0.2.0", path = "smol-tar-fs", default-features = false }

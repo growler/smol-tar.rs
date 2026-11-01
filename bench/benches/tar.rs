@@ -69,6 +69,20 @@ mod read_all {
         });
     }
 
+    #[cfg(feature = "tokio")]
+    #[divan::bench(args = Corpus::ALL)]
+    fn tar_codec(bencher: Bencher, corpus: Corpus) {
+        let (rt, data, mut buf) = (
+            Runtime::new(),
+            &corpus.data().archive[..],
+            Vec::with_capacity(BUF_SIZE),
+        );
+        counted(bencher, corpus).bench_local(|| {
+            rt.block_on(adapters::tar_codec::read_all(data, &mut buf))
+                .unwrap()
+        });
+    }
+
     #[divan::bench(args = Corpus::ALL)]
     fn tar(bencher: Bencher, corpus: Corpus) {
         let (data, mut buf) = (&corpus.data().archive[..], vec![0; BUF_SIZE]);
@@ -102,6 +116,14 @@ mod read_skip {
             rt.block_on(adapters::astral_tokio_tar::read_skip(data))
                 .unwrap()
         });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[divan::bench(args = Corpus::ALL)]
+    fn tar_codec(bencher: Bencher, corpus: Corpus) {
+        let (rt, data) = (Runtime::new(), &corpus.data().archive[..]);
+        counted(bencher, corpus)
+            .bench_local(|| rt.block_on(adapters::tar_codec::read_skip(data)).unwrap());
     }
 
     #[divan::bench(args = Corpus::ALL)]
@@ -147,6 +169,21 @@ mod write {
         counted(bencher, corpus).bench_local(|| {
             out.clear();
             rt.block_on(adapters::astral_tokio_tar::write(specs, &mut out))
+                .unwrap();
+            out.len()
+        });
+    }
+
+    /// The tar-codec builder cannot write a symbolic link, so the mixed
+    /// corpus is not in this benchmark.
+    #[cfg(feature = "tokio")]
+    #[divan::bench(args = [Corpus::Small, Corpus::Large])]
+    fn tar_codec(bencher: Bencher, corpus: Corpus) {
+        let (rt, specs) = (Runtime::new(), &corpus.data().specs[..]);
+        let mut out = Vec::with_capacity(corpus.data().archive.len());
+        counted(bencher, corpus).bench_local(|| {
+            out.clear();
+            rt.block_on(adapters::tar_codec::write(specs, &mut out))
                 .unwrap();
             out.len()
         });
