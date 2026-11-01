@@ -994,6 +994,53 @@ fn tar_writer_round_trip_long_names() -> Result<()> {
     })
 }
 
+/// Archive with the one entry `entry`.
+fn one_entry_archive(entry: TarEntry<'static, &'static [u8]>) -> Result<Vec<u8>> {
+    block_on_test(async {
+        let (sink, bytes) = VecAsyncWriter::new();
+        let mut writer = TarWriter::new(sink);
+        writer.write(entry).await?;
+        writer.finish().await?;
+        let archive = bytes.lock().unwrap().clone();
+        Ok(archive)
+    })
+}
+
+#[test]
+fn writer_keeps_leading_slash_of_101_byte_path() -> Result<()> {
+    let path = format!("/{}", "a".repeat(100));
+    let entries: [(TarEntry<'static, &'static [u8]>, Option<&str>); 3] = [
+        (TarRegularFile::new(path.clone(), 0, &[][..]).into(), None),
+        (TarDirectory::new(path.clone()).into(), None),
+        (TarLink::new(path.clone(), "target").into(), Some("target")),
+    ];
+    for (entry, link) in entries {
+        let archive = one_entry_archive(entry)?;
+        let observed = collect_entries(Cursor::new(&archive))?;
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].path, path);
+        assert_eq!(observed[0].link.as_deref(), link);
+        assert_eq!(archive[TYPEFLAG_START], b'x');
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_writes_no_pax_header_for_absolute_paths_that_fit_ustar() -> Result<()> {
+    for path in [
+        format!("/{}", "a".repeat(99)),
+        format!("//{}", "a".repeat(99)),
+    ] {
+        let archive = one_entry_archive(TarRegularFile::new(path.clone(), 0, &[][..]).into())?;
+        assert_eq!(archive.len(), 3 * BLOCK_SIZE);
+        assert_eq!(archive[TYPEFLAG_START], b'0');
+        let observed = collect_entries(Cursor::new(&archive))?;
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].path, path);
+    }
+    Ok(())
+}
+
 #[test]
 fn writer_entry_builders_set_defaults_and_overrides() {
     let dir = TarDirectory::new("dir/")

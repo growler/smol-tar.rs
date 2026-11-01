@@ -821,7 +821,8 @@ impl UstarHeader {
         bytes
             .iter()
             .enumerate()
-            .rfind(|(i, b)| **b == b'/' && i <= &PREFIX_LEN)
+            // A split at index 0 gives an empty prefix, which the reader reads as no prefix.
+            .rfind(|(i, b)| **b == b'/' && *i > 0 && i <= &PREFIX_LEN)
             .map(|(i, _)| i)
     }
     fn set_path(&mut self, path: &str, split_pos: Option<usize>) {
