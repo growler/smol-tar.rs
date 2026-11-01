@@ -3959,7 +3959,8 @@ pin_project! {
     /// The writer also has inherent methods, so you can use it without the
     /// `futures` crate. Use [`TarWriter::write`] to write each entry. When all
     /// entries are written, call [`TarWriter::finish`] to write the two zero
-    /// blocks that end the archive. [`SinkExt::close`] does the same.
+    /// blocks that end the archive. [`SinkExt::close`] does the same. After
+    /// that, the writer accepts no more entries.
     ///
     /// [`SinkExt::close`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.close
     ///
@@ -4053,11 +4054,17 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     ///   extended-attribute name contains characters that are not ASCII
     ///   graphic characters or contains `=`, or the headers of the entry,
     ///   with the PAX records, are larger than 128 KiB.
+    /// - [`ErrorKind::Other`]: the archive is finished. A call to
+    ///   [`TarWriter::finish`] or to [`SinkExt::close`] started to write the
+    ///   two zero blocks. This error also occurs when that call did not
+    ///   complete.
     /// - [`ErrorKind::UnexpectedEof`]: the file body ends before
     ///   [`TarRegularFile::size`] bytes.
     /// - [`ErrorKind::WriteZero`]: the underlying writer accepts zero bytes.
     /// - The file body reader or the underlying writer returns an error. The
     ///   method returns that error.
+    ///
+    /// [`SinkExt::close`]: https://docs.rs/futures/0.3/futures/sink/trait.SinkExt.html#method.close
     pub async fn write(&mut self, entry: TarEntry<'b, R>) -> std::io::Result<()> {
         poll_fn(|cx| {
             // SAFETY: the mutable borrow of `self` is held for the duration of
@@ -4080,13 +4087,15 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     /// Finish the archive by emitting the trailing zero blocks and closing.
     ///
     /// The method writes the remaining buffered data, then the two zero blocks
-    /// that end the archive. Then it closes the underlying writer.
+    /// that end the archive. Then it closes the underlying writer. After this
+    /// method starts to write the zero blocks, [`TarWriter::write`] returns an
+    /// error.
     ///
     /// # Errors
     ///
     /// The method returns the same errors as [`TarWriter::write`] for data
-    /// that is not yet written. It also returns an error from the underlying
-    /// writer when the close fails.
+    /// that is not yet written, but not the error for a finished archive. It
+    /// also returns an error from the underlying writer when the close fails.
     pub async fn finish(&mut self) -> std::io::Result<()> {
         poll_fn(|cx| {
             // SAFETY: the mutable borrow of `self` is held for the duration of
@@ -4168,11 +4177,18 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> Sink<TarEntry<'b,
     type Error = std::io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.closed {
+            return Poll::Ready(Err(std::io::Error::other("archive is already finished")));
+        }
         self.poll_drain(cx)
     }
 
     fn start_send(self: Pin<&mut Self>, item: TarEntry<'b, R>) -> std::io::Result<()> {
         let this = self.project();
+
+        if *this.closed {
+            return Err(std::io::Error::other("archive is already finished"));
+        }
 
         if *this.len != 0 || this.reader.is_some() {
             return Err(std::io::Error::other(

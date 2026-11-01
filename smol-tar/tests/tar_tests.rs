@@ -1311,6 +1311,60 @@ fn writer_inherent_write_reports_write_zero() {
 }
 
 #[test]
+fn writer_rejects_entry_after_finish() -> Result<()> {
+    block_on_test(async {
+        let (sink, bytes) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(sink);
+        writer
+            .write(TarEntry::from(TarDirectory::new("dir/")))
+            .await?;
+        writer.finish().await?;
+        let archive = bytes.lock().unwrap().clone();
+        assert_eq!(archive.len(), 3 * BLOCK_SIZE);
+        assert!(archive[BLOCK_SIZE..].iter().all(|&b| b == 0));
+
+        let err = writer
+            .write(TarEntry::from(TarDirectory::new("late/")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(err.to_string().contains("already finished"));
+        assert_eq!(*bytes.lock().unwrap(), archive);
+
+        let entries = collect_entries_async(Cursor::new(archive)).await?;
+        let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["dir/"]);
+        Ok(())
+    })
+}
+
+#[test]
+fn writer_sink_rejects_entry_after_close() -> Result<()> {
+    block_on_test(async {
+        let (sink, _bytes) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(sink);
+        writer
+            .send(TarEntry::from(TarDirectory::new("dir/")))
+            .await?;
+        writer.close().await?;
+
+        let err = writer
+            .send(TarEntry::from(TarDirectory::new("late/")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(err.to_string().contains("already finished"));
+
+        let err = Pin::new(&mut writer)
+            .start_send(TarEntry::from(TarDirectory::new("late/")))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(err.to_string().contains("already finished"));
+        Ok(())
+    })
+}
+
+#[test]
 fn attr_list_with_and_from_preserve_pairs() {
     let attrs = AttrList::new()
         .with("user.first", b"one".as_slice())
@@ -5034,6 +5088,42 @@ fn buffered_entries_feed_writer_with_pending_reads_and_short_writes() -> Result<
             assert_eq!(data, body);
         }
         assert!(tar.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn writer_rejects_entry_after_dropped_finish() -> Result<()> {
+    block_on_test(async {
+        let (sink, bytes) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(
+            InterleavePending::new(sink),
+        );
+        writer
+            .write(TarEntry::from(TarDirectory::new("dir/")))
+            .await?;
+        let wakes = Arc::new(WakeCount::default());
+        assert!(poll_once(writer.finish(), &wakes).is_pending());
+
+        let err = writer
+            .write(TarEntry::from(TarDirectory::new("late/")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(err.to_string().contains("already finished"));
+        let err = Pin::new(&mut writer)
+            .start_send(TarEntry::from(TarDirectory::new("late/")))
+            .unwrap_err();
+        assert!(err.to_string().contains("already finished"));
+        assert_eq!(bytes.lock().unwrap().len(), BLOCK_SIZE);
+
+        writer.finish().await?;
+        let archive = bytes.lock().unwrap().clone();
+        assert_eq!(archive.len(), 3 * BLOCK_SIZE);
+        assert!(archive[BLOCK_SIZE..].iter().all(|&b| b == 0));
+        let entries = collect_entries_async(Cursor::new(archive)).await?;
+        let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["dir/"]);
         Ok(())
     })
 }
