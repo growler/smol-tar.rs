@@ -1116,12 +1116,14 @@ enum ExtensionHeader {
 
 struct ExtensionBuffer {
     buf: Vec<u8>,
+    filled: usize,
 }
 
 impl ExtensionBuffer {
     fn new(size: usize) -> Self {
         ExtensionBuffer {
-            buf: Vec::<u8>::with_capacity(size),
+            buf: vec![0; size],
+            filled: 0,
         }
     }
     fn into_bytes(mut self, size: usize) -> Box<[u8]> {
@@ -1136,12 +1138,11 @@ impl ExtensionBuffer {
             .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
             .map(|p| p.to_string().into_boxed_str())
     }
-    unsafe fn remaining_buf(&mut self) -> &mut [u8] {
-        let remaining = self.buf.spare_capacity_mut();
-        std::slice::from_raw_parts_mut(remaining.as_mut_ptr() as *mut u8, remaining.len())
+    fn remaining_buf(&mut self) -> &mut [u8] {
+        &mut self.buf[self.filled..]
     }
-    unsafe fn advance(&mut self, n: usize) {
-        self.buf.set_len(self.buf.len() + n)
+    fn advance(&mut self, n: usize) {
+        self.filled += n;
     }
 }
 
@@ -3248,10 +3249,12 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                             ready_opt!(poll_read_compat(pin!(reader), ctx, hdr.buf_mut(filled..)))
                         } else {
                             let buf = ext.as_mut().unwrap();
-                            let n = ready_opt!(poll_read_compat(pin!(reader), ctx, unsafe {
+                            let n = ready_opt!(poll_read_compat(
+                                pin!(reader),
+                                ctx,
                                 buf.remaining_buf()
-                            }));
-                            unsafe { buf.advance(n) };
+                            ));
+                            buf.advance(n);
                             n
                         };
                         *this.pos += if n == 0 {
@@ -3262,6 +3265,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                         } else {
                             Ok(n as u64)
                         }?;
+                        debug_assert!(*this.pos <= *this.nxt);
                     }
                     if *this.pos == *this.nxt {
                         match kind {
@@ -4425,6 +4429,15 @@ mod tests {
         );
         let merged = PaxSet::default().merge(&new, |_, _| true).unwrap();
         assert_eq!(pax_records(&merged), pax_records(&new));
+    }
+
+    #[test]
+    fn extension_buffer_read_window_ignores_vec_capacity() {
+        let mut ext = ExtensionBuffer::new(1024);
+        ext.buf.reserve(4096);
+        assert_eq!(ext.remaining_buf().len(), 1024);
+        ext.advance(1000);
+        assert_eq!(ext.remaining_buf().len(), 24);
     }
 
     #[test]
