@@ -170,6 +170,66 @@ impl<R: AsyncRead + Unpin> AsyncRead for ChunkedReader<R> {
     }
 }
 
+/// Reader that fails one time on read number `fail_at` (from 1) and passes
+/// all other reads to `inner`. `failed_len` holds the buffer length of the
+/// failed read.
+struct FailingReader<R> {
+    inner: R,
+    fail_at: usize,
+    reads: usize,
+    failed_len: Option<usize>,
+}
+
+impl<R> FailingReader<R> {
+    fn new(inner: R, fail_at: usize) -> Self {
+        Self {
+            inner,
+            fail_at,
+            reads: 0,
+            failed_len: None,
+        }
+    }
+
+    /// Count the read and give `true` if this read must fail.
+    fn fail_now(&mut self, len: usize) -> bool {
+        self.reads += 1;
+        if self.reads == self.fail_at {
+            self.failed_len = Some(len);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+impl<R: AsyncRead + Unpin> AsyncRead for FailingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.fail_now(buf.len()) {
+            return Poll::Ready(Err(io::Error::other("source failure")));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<R: AsyncRead + Unpin> AsyncRead for FailingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.fail_now(buf.remaining()) {
+            return Poll::Ready(Err(io::Error::other("source failure")));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
 struct ChunkedAsyncWriter {
     inner: Arc<Mutex<Vec<u8>>>,
     max_chunk: usize,
@@ -2676,6 +2736,65 @@ fn reader_rejects_large_global_pax_records() {
 }
 
 #[test]
+fn reader_ends_after_large_malformed_pax_extension() {
+    for typeflag in [b'x', b'g'] {
+        let mut archive = Vec::new();
+        append_pax_entry(&mut archive, typeflag, &[b'a'; 600]);
+        append_entry(
+            &mut archive,
+            build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+            &[],
+        );
+        append_eof(&mut archive);
+        block_on_test(async {
+            let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+            let err = match stream.next().await {
+                Some(Err(err)) => err,
+                other => panic!("expected PAX error, got {:?}", other),
+            };
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("missing length separator"),
+                "{err}"
+            );
+            assert!(stream.next().await.is_none());
+        });
+    }
+}
+
+#[test]
+fn reader_ends_after_large_global_pax_records() {
+    let mut archive = Vec::new();
+    let value = vec![b'v'; PAX_HEADER_MAX_SIZE / 2];
+    for name in ["user.a", "user.b", "user.c"] {
+        append_pax_entry(
+            &mut archive,
+            b'g',
+            &pax_record_bytes(&format!("SCHILY.xattr.{name}"), &value),
+        );
+    }
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+    block_on_test(async {
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+        let err = match stream.next().await {
+            Some(Err(err)) => err,
+            other => panic!("expected global PAX error, got {:?}", other),
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("global PAX records exceed"),
+            "{err}"
+        );
+        assert!(stream.next().await.is_none());
+    });
+}
+
+#[test]
 fn reader_applies_extended_pax_metadata() -> Result<()> {
     block_on_test(async {
         let mut archive = Vec::new();
@@ -2969,6 +3088,149 @@ fn reader_returns_no_entry_after_symlink_size_error() {
             }
         }
     });
+}
+
+#[test]
+fn reader_returns_no_entry_after_directory_mode_error() {
+    let mut archive = Vec::new();
+    let mut header = build_header(b"dir/", b'5', 0, HeaderFlavor::Ustar);
+    set_bytes(&mut header, MODE_START, 8, b"zzzzzzz");
+    finalize_checksum(&mut header);
+    append_entry(&mut archive, header, &[]);
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+    block_on_test(async {
+        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+        let mut error = None;
+        for _ in 0..5 {
+            match stream.next().await {
+                None => break,
+                Some(Ok(entry)) if error.is_some() => {
+                    panic!("unexpected entry {} after error", entry.path())
+                }
+                Some(Ok(entry)) => panic!("unexpected entry {} before error", entry.path()),
+                Some(Err(err)) => {
+                    error.get_or_insert(err);
+                }
+            }
+        }
+        let err = error.expect("expected mode error");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(stream.next().await.is_none());
+    });
+}
+
+#[test]
+fn reader_reads_extension_again_after_source_error() {
+    let path = vec![b'p'; 600];
+    let mut archive = Vec::new();
+    append_pax_entry(&mut archive, b'x', &pax_record_bytes("path", &path));
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+    // The first read gets the PAX header block. The second read gets the PAX
+    // data blocks.
+    let mut reader = FailingReader::new(Cursor::new(archive), 2);
+    block_on_test(async {
+        let mut stream = Box::pin(TarReader::new(&mut reader));
+        let err = match stream.next().await {
+            Some(Err(err)) => err,
+            other => panic!("expected source error, got {:?}", other),
+        };
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(err.to_string().contains("source failure"), "{err}");
+        match stream.next().await {
+            Some(Ok(entry)) => assert_eq!(entry.path().as_bytes(), path.as_slice()),
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        assert!(stream.next().await.is_none());
+    });
+    // Only the read of the PAX data blocks uses a buffer larger than one
+    // block.
+    assert!(reader.failed_len.unwrap() > BLOCK_SIZE);
+}
+
+#[test]
+fn reader_continues_after_source_error_at_any_read() {
+    // The archive has a file body with padding, a body that the reader skips
+    // in more than one read, a PAX extension larger than one block, the end
+    // marker and data after the end marker.
+    let long_path = "p".repeat(600);
+    let mut archive = Vec::new();
+    append_entry(
+        &mut archive,
+        build_header(b"padded.txt", b'0', 100, HeaderFlavor::Ustar),
+        &[b'a'; 100],
+    );
+    append_entry(
+        &mut archive,
+        build_header(b"skipped.bin", b'0', 70000, HeaderFlavor::Ustar),
+        &[b'b'; 70000],
+    );
+    append_pax_entry(
+        &mut archive,
+        b'x',
+        &pax_record_bytes("path", long_path.as_bytes()),
+    );
+    append_entry(
+        &mut archive,
+        build_header(b"file.txt", b'0', 0, HeaderFlavor::Ustar),
+        &[],
+    );
+    append_eof(&mut archive);
+    archive.extend_from_slice(&[b'z'; 700]);
+
+    // Read all entries and the body of "padded.txt". Poll again after each
+    // source error. Give the entry paths and the number of source errors.
+    async fn read_all(reader: &mut FailingReader<Cursor<Vec<u8>>>) -> (Vec<String>, usize) {
+        let mut stream = Box::pin(TarReader::new(reader));
+        let (mut paths, mut errors) = (Vec::new(), 0);
+        while let Some(item) = stream.next().await {
+            let entry = match item {
+                Ok(entry) => entry,
+                Err(err) if err.kind() == ErrorKind::Other => {
+                    errors += 1;
+                    continue;
+                }
+                Err(err) => panic!("unexpected error {err}"),
+            };
+            paths.push(entry.path().to_string());
+            if let TarEntry::File(mut file) = entry {
+                if file.path() == "padded.txt" {
+                    let (mut data, mut buf) = (Vec::new(), [0u8; 64]);
+                    loop {
+                        match file.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => data.extend_from_slice(&buf[..n]),
+                            Err(err) if err.kind() == ErrorKind::Other => errors += 1,
+                            Err(err) => panic!("unexpected body error {err}"),
+                        }
+                    }
+                    assert_eq!(data, [b'a'; 100]);
+                }
+            }
+        }
+        assert!(stream.next().await.is_none());
+        (paths, errors)
+    }
+
+    let mut reader = FailingReader::new(Cursor::new(archive.clone()), 0);
+    let (expected, errors) = block_on_test(read_all(&mut reader));
+    assert_eq!(errors, 0);
+    assert_eq!(expected, ["padded.txt", "skipped.bin", long_path.as_str()]);
+    for fail_at in 1..=reader.reads {
+        let mut reader = FailingReader::new(Cursor::new(archive.clone()), fail_at);
+        let (paths, errors) = block_on_test(read_all(&mut reader));
+        assert_eq!(paths, expected, "fail at read {fail_at}");
+        assert_eq!(errors, 1, "fail at read {fail_at}");
+    }
 }
 
 #[test]
@@ -4741,10 +5003,7 @@ fn invalid_file_mode_does_not_leave_an_active_file() -> Result<()> {
             ErrorKind::InvalidData
         );
         let wakes = Arc::new(WakeCount::default());
-        assert!(matches!(
-            poll_once(tar.next(), &wakes),
-            Poll::Ready(Some(Err(_)))
-        ));
+        assert!(matches!(poll_once(tar.next(), &wakes), Poll::Ready(None)));
         Ok(())
     })
 }

@@ -445,10 +445,25 @@ macro_rules! ready_opt {
     ($e:expr $(,)?) => {
         match $e {
             Poll::Ready(Ok(t)) => t,
-            Poll::Ready(Err(err)) => return Poll::Ready(Some(Err(err))),
+            Poll::Ready(Err(err)) => return Poll::Ready(Some(Err(ReadError::Source(err)))),
             Poll::Pending => return Poll::Pending,
         }
     };
+}
+
+/// Error of one step of the header state machine.
+enum ReadError {
+    /// The source reader returned the error. The error keeps the current
+    /// state and position.
+    Source(Error),
+    /// The archive data is not valid, or the source ends too early.
+    Archive(Error),
+}
+
+impl From<Error> for ReadError {
+    fn from(err: Error) -> Self {
+        ReadError::Archive(err)
+    }
 }
 
 #[repr(C)]
@@ -982,6 +997,7 @@ enum State {
     Eof,
     Eoff,
     Done,
+    Failed,
 }
 use State::*;
 
@@ -1269,7 +1285,8 @@ impl<'a, R: AsyncBufRead> AsyncBufRead for TarRegularFileReader<'a, R> {
 /// Until then, a poll for the next entry registers a waker and returns `Pending`.
 /// Canceling that wait does not prevent further reads of the current file.
 ///
-/// The stream ends after the two zero blocks that end the archive.
+/// The stream ends after the two zero blocks that end the archive. It also
+/// ends after an error that the reader makes. See [Errors](#errors).
 ///
 /// # Entry sizes
 ///
@@ -1318,6 +1335,12 @@ impl<'a, R: AsyncBufRead> AsyncBufRead for TarRegularFileReader<'a, R> {
 /// - [`ErrorKind::UnexpectedEof`]: the source ends before the two zero blocks
 ///   that end the archive.
 /// - The source reader returns an error. The stream yields that error.
+///
+/// An [`ErrorKind::InvalidData`] or [`ErrorKind::UnexpectedEof`] error that
+/// the reader makes ends the stream. The next poll gives `None`. An error
+/// that the source reader returns passes through without change and does not
+/// end the stream. The reader keeps its position, and the next poll reads
+/// from the source again.
 ///
 /// A [`TarRegularFile`] body read returns [`ErrorKind::UnexpectedEof`] when
 /// the source ends before the end of the file body.
@@ -2901,10 +2924,37 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
         }
     }
     /// Advance the state machine until the next entry or EOF marker is decoded.
+    /// After an error for the archive data, the state is `Failed` and the
+    /// stream ends.
     fn poll_read_header(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
     ) -> Poll<Option<Result<Entry>>> {
+        match task::ready!(self.as_mut().poll_read_header_inner(ctx)) {
+            None => Poll::Ready(None),
+            Some(Ok(entry)) => Poll::Ready(Some(Ok(entry))),
+            Some(Err(ReadError::Source(err))) => Poll::Ready(Some(Err(err))),
+            Some(Err(ReadError::Archive(err))) => {
+                let this = self.project();
+                *this.state = Failed;
+                // Release the buffers. The reader does not use them in the
+                // `Failed` state.
+                this.ext.take();
+                this.skip.take();
+                *this.exts = Vec::new();
+                if let Some(globs) = Arc::get_mut(this.globs) {
+                    *globs = PaxSet::default();
+                }
+                Poll::Ready(Some(Err(err)))
+            }
+        }
+    }
+    /// Run the state machine for [`Self::poll_read_header`]. The error tells
+    /// a source reader error from an error for the archive data.
+    fn poll_read_header_inner(
+        self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Entry, ReadError>>> {
         let mut this = self.project();
         loop {
             match this.state {
@@ -3096,7 +3146,8 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                 return Poll::Ready(Some(Err(Error::new(
                                     ErrorKind::InvalidData,
                                     "symlink entry has a non-zero size",
-                                ))));
+                                )
+                                .into())));
                             }
                             let uid = effective_uid(this.header, info.uid)?;
                             let gid = effective_gid(this.header, info.gid)?;
@@ -3181,7 +3232,8 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                         kind => Err(Error::new(
                             ErrorKind::InvalidData,
                             format!("invalid tar entry header {}", kind),
-                        )),
+                        )
+                        .into()),
                     }));
                 }
                 Extension((size, kind)) => {
@@ -3230,7 +3282,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                         format!(
                                             "too many global PAX extensions (max {PAX_GLOBAL_MAX_COUNT})"
                                         ),
-                                    ))));
+                                    ).into())));
                                 }
                                 *this.glob_count += 1;
                                 let ext = ext_as_bytes(this.header, *size as usize, ext);
@@ -3248,7 +3300,8 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                         format!(
                                             "global PAX records exceed {PAX_HEADER_MAX_SIZE} bytes"
                                         ),
-                                    ))));
+                                    )
+                                    .into())));
                                 }
                                 *this.globs = Arc::new(globs);
                             }
@@ -3344,7 +3397,8 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                     return Poll::Ready(Some(Err(Error::new(
                         ErrorKind::InvalidData,
                         "unexpected data after first zero block",
-                    ))));
+                    )
+                    .into())));
                 }
                 Eoff => {
                     // Discard everything after the end-of-archive marker until
@@ -3357,7 +3411,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                     }
                     continue;
                 }
-                Done => return Poll::Ready(None),
+                Done | Failed => return Poll::Ready(None),
             }
         }
     }

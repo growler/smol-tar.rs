@@ -102,6 +102,11 @@ All functions return `std::io::Error`. The reader uses these error kinds:
   or before the end of a file body.
 - Errors from the source reader pass through without change.
 
+An `InvalidData` or `UnexpectedEof` error that the reader makes ends the
+stream. The next poll gives `None`. An error that the source reader returns
+passes through without change and does not end the stream. The reader keeps
+its position, and the next poll reads from the source again.
+
 ## Examples
 
 Each example is a program in the [`examples`](examples) directory. The test
