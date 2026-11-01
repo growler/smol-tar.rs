@@ -103,6 +103,8 @@ const MAGIC_START: usize = 257;
 const VERSION_START: usize = 263;
 const UNAME_START: usize = 265;
 const GNAME_START: usize = 297;
+const DEVMAJOR_START: usize = 329;
+const DEVMINOR_START: usize = 337;
 const GNU_ATIME_START: usize = 345;
 const GNU_CTIME_START: usize = 357;
 
@@ -3237,6 +3239,24 @@ fn reader_returns_no_entry_after_symlink_size_error() {
     });
 }
 
+/// Read `archive` and return the first item, which must be an error. Panic
+/// if the stream gives an entry or ends before the error. Panic if the next
+/// item after the error is not `None`.
+async fn assert_no_entry_after_error(archive: Vec<u8>, context: &str) -> io::Error {
+    let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
+    let err = match stream.next().await {
+        Some(Err(err)) => err,
+        Some(Ok(entry)) => panic!("{context}: unexpected entry {} before error", entry.path()),
+        None => panic!("{context}: expected an error, got end of stream"),
+    };
+    match stream.next().await {
+        None => {}
+        Some(Ok(entry)) => panic!("{context}: unexpected entry {} after error", entry.path()),
+        Some(Err(err)) => panic!("{context}: unexpected second error {err}"),
+    }
+    err
+}
+
 #[test]
 fn reader_returns_no_entry_after_directory_mode_error() {
     let mut archive = Vec::new();
@@ -3250,25 +3270,52 @@ fn reader_returns_no_entry_after_directory_mode_error() {
         &[],
     );
     append_eof(&mut archive);
-    block_on_test(async {
-        let mut stream = Box::pin(TarReader::new(Cursor::new(archive)));
-        let mut error = None;
-        for _ in 0..5 {
-            match stream.next().await {
-                None => break,
-                Some(Ok(entry)) if error.is_some() => {
-                    panic!("unexpected entry {} after error", entry.path())
-                }
-                Some(Ok(entry)) => panic!("unexpected entry {} before error", entry.path()),
-                Some(Err(err)) => {
-                    error.get_or_insert(err);
-                }
+    let err = block_on_test(assert_no_entry_after_error(archive, "directory mode"));
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(err.to_string().contains("invalid numeric field"), "{err}");
+}
+
+#[test]
+fn reader_returns_no_entry_after_late_field_error() {
+    const PATH: &str = "invalid utf8 in file path";
+    const NUMERIC: &str = "invalid numeric field";
+    for (name, typeflag, field_start, field_len, bad_bytes, expected) in [
+        (&b"dir/"[..], b'5', NAME_START, 100, &[0xff][..], PATH),
+        (&b"fifo"[..], b'6', MODE_START, 8, &b"zzzzzzz"[..], NUMERIC),
+        (&b"fifo"[..], b'6', NAME_START, 100, &[0xff][..], PATH),
+        (&b"chr"[..], b'3', MODE_START, 8, &b"zzzzzzz"[..], NUMERIC),
+        (&b"chr"[..], b'3', DEVMAJOR_START, 8, &b"8"[..], NUMERIC),
+        (&b"blk"[..], b'4', DEVMINOR_START, 8, &b"8"[..], NUMERIC),
+        (&b"sl"[..], b'2', MODE_START, 8, &b"zzzzzzz"[..], NUMERIC),
+        (&b"sl"[..], b'2', LINKNAME_START, 100, &[0xff][..], PATH),
+    ] {
+        for (flavor, flavor_name) in [(HeaderFlavor::Ustar, "ustar"), (HeaderFlavor::Gnu, "gnu")] {
+            let context = format!(
+                "typeflag {} {flavor_name} field at {field_start}",
+                typeflag as char
+            );
+            let mut archive = Vec::new();
+            let mut header = build_header(name, typeflag, 0, flavor);
+            if typeflag == b'2' {
+                set_bytes(&mut header, LINKNAME_START, 100, b"target");
             }
+            set_bytes(&mut header, field_start, field_len, bad_bytes);
+            finalize_checksum(&mut header);
+            append_entry(&mut archive, header, &[]);
+            append_entry(
+                &mut archive,
+                build_header(b"file.txt", b'0', 0, flavor),
+                &[],
+            );
+            append_eof(&mut archive);
+            let err = block_on_test(assert_no_entry_after_error(archive, &context));
+            assert_eq!(err.kind(), ErrorKind::InvalidData, "{context}: {err}");
+            assert!(
+                err.to_string().contains(expected),
+                "{context}: expected {expected:?}, got {err}"
+            );
         }
-        let err = error.expect("expected mode error");
-        assert_eq!(err.kind(), ErrorKind::InvalidData);
-        assert!(stream.next().await.is_none());
-    });
+    }
 }
 
 #[test]
@@ -3908,8 +3955,20 @@ fn reader_rejects_invalid_header_numeric_fields() {
             HeaderFlavor::Gnu,
             "invalid numeric field",
         ),
-        (329, 8, b'3', HeaderFlavor::Ustar, "invalid numeric field"),
-        (337, 8, b'4', HeaderFlavor::Ustar, "invalid numeric field"),
+        (
+            DEVMAJOR_START,
+            8,
+            b'3',
+            HeaderFlavor::Ustar,
+            "invalid numeric field",
+        ),
+        (
+            DEVMINOR_START,
+            8,
+            b'4',
+            HeaderFlavor::Ustar,
+            "invalid numeric field",
+        ),
         (
             SIZE_START,
             12,
@@ -4122,10 +4181,15 @@ fn reader_reads_gnu_base256_device_numbers() -> Result<()> {
         let mut archive = Vec::new();
         for (name, typeflag) in [(&b"char"[..], b'3'), (&b"block"[..], b'4')] {
             let mut header = build_header(name, typeflag, 0, HeaderFlavor::Gnu);
-            set_bytes(&mut header, 329, 8, &[0x80, 0, 0, 0, 0x01, 0, 0, 0]);
             set_bytes(
                 &mut header,
-                337,
+                DEVMAJOR_START,
+                8,
+                &[0x80, 0, 0, 0, 0x01, 0, 0, 0],
+            );
+            set_bytes(
+                &mut header,
+                DEVMINOR_START,
                 8,
                 &[0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff],
             );
