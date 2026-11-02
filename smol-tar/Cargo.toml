@@ -13,8 +13,8 @@ categories = ["compression", "asynchronous", "encoding"]
 readme = "README.md"
 include = [
     "src/**",
-    "Cargo.toml",
-    "README.md",
+    "/Cargo.toml",
+    "/README.md",
 ]
 rust-version = "1.85"
 
