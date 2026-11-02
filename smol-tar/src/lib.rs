@@ -794,10 +794,12 @@ impl UstarHeader {
         format_octal(gid as u64, &mut self.gid)
     }
     fn set_uname(&mut self, uname: &str) {
+        debug_assert!(uname.len() < self.uname.len());
         self.uname.fill(0);
         self.uname[..uname.len()].copy_from_slice(uname.as_bytes());
     }
     fn set_gname(&mut self, gname: &str) {
+        debug_assert!(gname.len() < self.gname.len());
         self.gname.fill(0);
         self.gname[..gname.len()].copy_from_slice(gname.as_bytes());
     }
@@ -3727,13 +3729,13 @@ fn write_header(
     }
     let uname_requires_pax =
         supports_pax_metadata && uname.is_some_and(|uname| !ustar_name_fits(uname));
-    if let Some(uname) = uname.filter(|uname| !ustar_name_fits(uname)) {
-        records.push(PaxRecord::string("uname", uname.to_string()));
+    if uname_requires_pax {
+        records.push(PaxRecord::string("uname", uname.unwrap().to_string()));
     }
     let gname_requires_pax =
         supports_pax_metadata && gname.is_some_and(|gname| !ustar_name_fits(gname));
-    if let Some(gname) = gname.filter(|gname| !ustar_name_fits(gname)) {
-        records.push(PaxRecord::string("gname", gname.to_string()));
+    if gname_requires_pax {
+        records.push(PaxRecord::string("gname", gname.unwrap().to_string()));
     }
     let size_requires_pax = supports_pax_metadata && !octal_fits(size, 12);
     if size_requires_pax {
@@ -3812,15 +3814,11 @@ fn write_header(
         let header = unsafe { UstarHeader::from_buf(&mut data_buf[padded..padded + BLOCK_SIZE]) };
         header.set_uid(if uid_requires_pax { 0 } else { uid })?;
         header.set_gid(if gid_requires_pax { 0 } else { gid })?;
-        if !uname_requires_pax {
-            if let Some(uname) = uname {
-                header.set_uname(uname);
-            }
+        if let Some(uname) = uname.filter(|uname| ustar_name_fits(uname)) {
+            header.set_uname(uname);
         }
-        if !gname_requires_pax {
-            if let Some(gname) = gname {
-                header.set_gname(gname);
-            }
+        if let Some(gname) = gname.filter(|gname| ustar_name_fits(gname)) {
+            header.set_gname(gname);
         }
         header.set_mode(mode)?;
         header.set_mtime(stored_header_mtime)?;
@@ -4571,6 +4569,49 @@ mod tests {
         assert_eq!(parse_numeric(b"   \0\0\0\0"), Ok(0));
         assert_eq!(parse_numeric(b"\0\0\0\0"), Ok(0));
         assert_eq!(parse_numeric(b"  8\0"), Err(&b"  8\0"[..]));
+    }
+
+    #[test]
+    fn write_header_omits_long_owner_names_of_hard_link() {
+        let uname = "u".repeat(40);
+        let gname = "g".repeat(40);
+        for name in ["link".to_string(), "x".repeat(120)] {
+            let mut buffer = vec![0u8; HEADER_BUFFER_SIZE];
+            let len = write_header(
+                &mut buffer,
+                &name,
+                Some("target"),
+                Kind::Link,
+                0,
+                0o644,
+                0,
+                0,
+                Some(&uname),
+                Some(&gname),
+                &EntryTimes::default(),
+                None,
+                &AttrList::default(),
+            )
+            .unwrap();
+            let header_at = |at: usize| {
+                let mut hdr = Header::new();
+                hdr.record.copy_from_slice(&buffer[at..at + BLOCK_SIZE]);
+                hdr
+            };
+            // A long path needs a PAX header with only the path record.
+            if name.len() > NAME_LEN {
+                let ext = &buffer[BLOCK_SIZE..len - BLOCK_SIZE];
+                assert_eq!(header_at(0).entry_type(), Ok(Kind::PAXLocal));
+                assert!(ext.windows(5).any(|w| w == b"path="));
+                assert!(!ext.windows(6).any(|w| w == b"uname=" || w == b"gname="));
+            } else {
+                assert_eq!(len, BLOCK_SIZE);
+            }
+            let header = header_at(len - BLOCK_SIZE);
+            assert_eq!(header.entry_type(), Ok(Kind::Link));
+            assert_eq!(header.uname().unwrap(), None);
+            assert_eq!(header.gname().unwrap(), None);
+        }
     }
 
     #[test]
