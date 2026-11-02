@@ -1221,7 +1221,10 @@ impl<R: AsyncRead> TarRegularFileReader<'_, R> {
             *core.as_mut().project().state = SkipEntry;
         }
         let wake = {
-            let mut slot = self.returned.lock().unwrap();
+            let mut slot = self
+                .returned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(slot.core.is_none());
             slot.core = Some(core);
             slot.waiter.take()
@@ -3430,7 +3433,10 @@ impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
         if local.is_none() {
             // A changed waker is cloned under the lock. The old waker drops
             // outside the lock.
-            let mut slot = this.returned.lock().unwrap();
+            let mut slot = this
+                .returned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match slot.core.take() {
                 Some(core) => *local = Some(core),
                 None => {

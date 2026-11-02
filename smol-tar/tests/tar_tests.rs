@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     io::{self, ErrorKind, Result},
+    panic::{catch_unwind, AssertUnwindSafe},
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -4986,6 +4987,36 @@ impl<R: AsyncBufRead + Unpin> AsyncBufRead for InterleavePending<R> {
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
         Pin::new(&mut self.inner).consume(amt)
     }
+}
+
+// A static gives the vtable one address.
+static PANIC_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(panic_clone, noop_wake, noop_wake, noop_wake);
+
+fn panic_clone(_: *const ()) -> RawWaker {
+    panic!("waker clone failure");
+}
+
+fn noop_wake(_: *const ()) {}
+
+#[test]
+fn file_drop_after_waker_clone_panic_does_not_panic() -> Result<()> {
+    let archive = two_file_archive(b"abcdef", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let file = next_file(&mut tar, "a").await?;
+        // SAFETY: The vtable functions ignore the data pointer and change
+        // no data, so the waker is valid on all threads for all time.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &PANIC_VTABLE)) };
+        // The archive reader clones the waker while it holds the lock of the
+        // returned source.
+        let poll = catch_unwind(AssertUnwindSafe(|| poll_with(tar.next(), &waker)));
+        assert!(poll.is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(file))).is_ok());
+        next_file(&mut tar, "b").await?;
+        assert!(tar.next().await.is_none());
+        Ok(())
+    })
 }
 
 #[test]
