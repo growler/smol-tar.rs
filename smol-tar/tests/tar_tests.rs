@@ -4568,6 +4568,132 @@ fn writer_errors_when_file_source_is_short() {
     });
 }
 
+/// Body that is shorter than the size of its entry.
+const SHORT_BODY: &[u8] = &[0xa5; 600];
+
+/// File entry `short` with `size` bytes and the body `SHORT_BODY`.
+fn short_file(size: u64) -> TarEntry<'static, Cursor<&'static [u8]>> {
+    TarRegularFile::new("short", size, Cursor::new(SHORT_BODY)).into()
+}
+
+/// File entry `next` with the body `abc`.
+fn next_file_entry() -> TarEntry<'static, Cursor<&'static [u8]>> {
+    TarRegularFile::new("next", 3, Cursor::new(b"abc".as_slice())).into()
+}
+
+/// Check that `archive` has the entry `short` with `size` bytes, then the
+/// entries with the paths `next`.
+async fn assert_short_file_archive(archive: Vec<u8>, size: u64, next: &[&str]) -> Result<()> {
+    let entries = collect_entries_async(Cursor::new(archive)).await?;
+    let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths[0], "short");
+    assert_eq!(&paths[1..], next);
+    let data = &entries[0].data;
+    assert_eq!(data.len() as u64, size);
+    assert_eq!(&data[..SHORT_BODY.len()], SHORT_BODY);
+    assert!(data[SHORT_BODY.len()..].iter().all(|&b| b == 0));
+    for entry in &entries[1..] {
+        assert_eq!(entry.data, b"abc");
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_fills_short_file_body_with_zeros() -> Result<()> {
+    // With the size 10000, the zero bytes do not fit in the internal buffer.
+    for size in [1000, 10_000] {
+        block_on_test(async {
+            let (sink, bytes) = VecAsyncWriter::new();
+            let mut writer = TarWriter::new(sink);
+            let err = writer.write(short_file(size)).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+            assert!(err.to_string().contains("reading file"));
+            writer.write(next_file_entry()).await?;
+            writer.finish().await?;
+
+            let archive = bytes.lock().unwrap().clone();
+            let padded = size.div_ceil(BLOCK_SIZE as u64) as usize * BLOCK_SIZE;
+            assert_eq!(archive.len(), padded + 5 * BLOCK_SIZE);
+            assert_short_file_archive(archive, size, &["next"]).await
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_returns_short_file_body_error_once_after_write_error() -> Result<()> {
+    // Writes: the header, the body and the zero fill of `short`, then the
+    // header, the body and the padding of `next`, then the end marker.
+    for fail_at in 1..=7 {
+        block_on_test(async {
+            let (sink, bytes) = VecAsyncWriter::new();
+            let mut writer = TarWriter::new(FailingWriter::new(sink, fail_at));
+            let entry = |i: usize| match i {
+                0 => short_file(1000),
+                _ => next_file_entry(),
+            };
+            let mut errors = Vec::new();
+            for i in 0..2 {
+                // A feed that fails did not accept the entry, so send it
+                // again.
+                let mut accepted = false;
+                for _ in 0..3 {
+                    match writer.feed(entry(i)).await {
+                        Ok(()) => {
+                            accepted = true;
+                            break;
+                        }
+                        Err(err) => errors.push(err),
+                    }
+                }
+                assert!(accepted, "fail_at {fail_at}: {errors:?}");
+            }
+            let mut finished = false;
+            for _ in 0..3 {
+                match writer.finish().await {
+                    Ok(()) => {
+                        finished = true;
+                        break;
+                    }
+                    Err(err) => errors.push(err),
+                }
+            }
+            assert!(finished, "fail_at {fail_at}: {errors:?}");
+            let (eof, other): (Vec<_>, Vec<_>) = errors
+                .iter()
+                .partition(|err| err.kind() == ErrorKind::UnexpectedEof);
+            assert_eq!(eof.len(), 1, "fail_at {fail_at}: {errors:?}");
+            assert_eq!(other.len(), 1, "fail_at {fail_at}: {errors:?}");
+            assert_eq!(other[0].to_string(), "destination failure");
+
+            let archive = bytes.lock().unwrap().clone();
+            assert_short_file_archive(archive, 1000, &["next"]).await
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_finish_returns_short_file_body_error_once() -> Result<()> {
+    block_on_test(async {
+        let (sink, bytes) = VecAsyncWriter::new();
+        let mut writer = TarWriter::new(sink);
+        // The writer accepts the entry and writes it on the next call.
+        writer.feed(short_file(1000)).await?;
+        assert!(bytes.lock().unwrap().is_empty());
+        let err = writer.finish().await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        // The first call does not write the end marker.
+        assert_eq!(bytes.lock().unwrap().len(), 3 * BLOCK_SIZE);
+        writer.finish().await?;
+
+        let archive = bytes.lock().unwrap().clone();
+        assert_eq!(archive.len(), 5 * BLOCK_SIZE);
+        assert!(archive[3 * BLOCK_SIZE..].iter().all(|&b| b == 0));
+        assert_short_file_archive(archive, 1000, &[]).await
+    })
+}
+
 #[test]
 fn writer_reads_only_size_bytes_when_file_source_is_long() -> Result<()> {
     block_on_test(async {
@@ -4587,6 +4713,25 @@ fn writer_reads_only_size_bytes_when_file_source_is_long() -> Result<()> {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "long.txt");
         assert_eq!(entries[0].data, b"abc");
+        Ok(())
+    })
+}
+
+#[test]
+fn writer_writes_first_size_bytes_of_long_file_body() -> Result<()> {
+    const BODY: &[u8] = b"0123456789abcdefghij";
+    block_on_test(async {
+        let (sink, bytes) = VecAsyncWriter::new();
+        let mut writer = TarWriter::new(sink);
+        writer
+            .write(TarRegularFile::new("long", 10, Cursor::new(BODY)).into())
+            .await?;
+        writer.finish().await?;
+
+        let archive = bytes.lock().unwrap().clone();
+        let entries = collect_entries_async(Cursor::new(archive)).await?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data, &BODY[..10]);
         Ok(())
     })
 }
@@ -4859,6 +5004,36 @@ fn pending_next_clones_same_waker_once() -> Result<()> {
     })
 }
 
+// A static gives the vtable one address.
+static PANIC_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(panic_clone, noop_wake, noop_wake, noop_wake);
+
+fn panic_clone(_: *const ()) -> RawWaker {
+    panic!("waker clone failure");
+}
+
+fn noop_wake(_: *const ()) {}
+
+#[test]
+fn file_drop_after_waker_clone_panic_does_not_panic() -> Result<()> {
+    let archive = two_file_archive(b"abcdef", b"b")?;
+    block_on_test(async {
+        let mut tar = TarReader::new(Cursor::new(archive));
+        let file = next_file(&mut tar, "a").await?;
+        // SAFETY: The vtable functions ignore the data pointer and change
+        // no data, so the waker is valid on all threads for all time.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &PANIC_VTABLE)) };
+        // The archive reader clones the waker while it holds the lock of the
+        // returned source.
+        let poll = catch_unwind(AssertUnwindSafe(|| poll_with(tar.next(), &waker)));
+        assert!(poll.is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(file))).is_ok());
+        next_file(&mut tar, "b").await?;
+        assert!(tar.next().await.is_none());
+        Ok(())
+    })
+}
+
 #[test]
 fn next_entry_wakes_when_consume_finishes_the_file() -> Result<()> {
     let a = body_data(3000);
@@ -4987,36 +5162,6 @@ impl<R: AsyncBufRead + Unpin> AsyncBufRead for InterleavePending<R> {
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
         Pin::new(&mut self.inner).consume(amt)
     }
-}
-
-// A static gives the vtable one address.
-static PANIC_VTABLE: RawWakerVTable =
-    RawWakerVTable::new(panic_clone, noop_wake, noop_wake, noop_wake);
-
-fn panic_clone(_: *const ()) -> RawWaker {
-    panic!("waker clone failure");
-}
-
-fn noop_wake(_: *const ()) {}
-
-#[test]
-fn file_drop_after_waker_clone_panic_does_not_panic() -> Result<()> {
-    let archive = two_file_archive(b"abcdef", b"b")?;
-    block_on_test(async {
-        let mut tar = TarReader::new(Cursor::new(archive));
-        let file = next_file(&mut tar, "a").await?;
-        // SAFETY: The vtable functions ignore the data pointer and change
-        // no data, so the waker is valid on all threads for all time.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &PANIC_VTABLE)) };
-        // The archive reader clones the waker while it holds the lock of the
-        // returned source.
-        let poll = catch_unwind(AssertUnwindSafe(|| poll_with(tar.next(), &waker)));
-        assert!(poll.is_err());
-        assert!(catch_unwind(AssertUnwindSafe(|| drop(file))).is_ok());
-        next_file(&mut tar, "b").await?;
-        assert!(tar.next().await.is_none());
-        Ok(())
-    })
 }
 
 #[test]

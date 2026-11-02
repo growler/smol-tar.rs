@@ -2386,11 +2386,12 @@ pin_project! {
 impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
     /// Build a regular-file entry with the provided body reader.
     ///
-    /// `size` must match the exact number of bytes that `inner` will yield.
-    /// When [`TarWriter`] writes the entry, it reads exactly `size` bytes from
-    /// `inner`. If `inner` ends before `size` bytes, the write fails with
-    /// [`ErrorKind::UnexpectedEof`]. If `inner` has more bytes, the writer
-    /// does not read them.
+    /// `size` is the number of bytes that `inner` yields. [`TarWriter`] always
+    /// writes `size` bytes of body for the entry, and it reads at most `size`
+    /// bytes from `inner`. When `inner` ends before `size` bytes, the writer
+    /// fills the rest of the entry with zero bytes and returns
+    /// [`ErrorKind::UnexpectedEof`]. The archive stays valid. When `inner` has
+    /// more than `size` bytes, the writer ignores the rest.
     ///
     /// The entry has mode `0o644`, uid and gid `0`, no user or group name,
     /// modification time [`UNIX_EPOCH`], and no extended attributes.
@@ -4033,6 +4034,9 @@ pin_project! {
         state: WriterState,
         // reader for the current file being written
         reader: Option<R>,
+        // the file body ended before its size: return UnexpectedEof after
+        // the zero bytes
+        short: bool,
         marker_: std::marker::PhantomData<&'b ()>,
         // the underlying writer
         #[pin]
@@ -4052,6 +4056,7 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
             eof: 0,
             state: WriterState::Open,
             reader: None,
+            short: false,
             marker_: std::marker::PhantomData,
             writer,
             marker: std::marker::PhantomData,
@@ -4061,7 +4066,9 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     /// Write a single tar entry and flush it to the underlying writer.
     ///
     /// For a [`TarEntry::File`] entry, the method also reads the file body and
-    /// writes it to the archive.
+    /// writes it to the archive. When the body has more than
+    /// [`TarRegularFile::size`] bytes, the writer writes the first `size`
+    /// bytes and ignores the rest.
     ///
     /// # Errors
     ///
@@ -4077,7 +4084,11 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     ///   two zero blocks. This error also occurs when that call did not
     ///   complete.
     /// - [`ErrorKind::UnexpectedEof`]: the file body ends before
-    ///   [`TarRegularFile::size`] bytes.
+    ///   [`TarRegularFile::size`] bytes. The writer fills the rest of the entry
+    ///   with zero bytes and then returns this error one time. The archive
+    ///   stays valid, and you can write more entries or finish the archive.
+    ///   The writer returns this error before it flushes the underlying
+    ///   writer.
     /// - [`ErrorKind::WriteZero`]: the underlying writer accepts zero bytes.
     /// - The file body reader or the underlying writer returns an error. The
     ///   method returns that error.
@@ -4142,6 +4153,9 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     /// after you give entries with [`Sink::start_send`] or [`SinkExt::feed`].
     /// [`SinkExt::flush`] does the same steps.
     ///
+    /// When the file body has more than [`TarRegularFile::size`] bytes, the
+    /// writer writes the first `size` bytes and ignores the rest.
+    ///
     /// If you drop the future before it completes, the writer keeps the data
     /// that it did not write. The next call continues to write it.
     ///
@@ -4150,7 +4164,11 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     /// The method returns an error in these conditions:
     ///
     /// - [`ErrorKind::UnexpectedEof`]: the file body ends before
-    ///   [`TarRegularFile::size`] bytes.
+    ///   [`TarRegularFile::size`] bytes. The writer fills the rest of the entry
+    ///   with zero bytes and then returns this error one time. The archive
+    ///   stays valid, and you can write more entries or finish the archive.
+    ///   The writer returns this error before it flushes the underlying
+    ///   writer.
     /// - [`ErrorKind::WriteZero`]: the underlying writer accepts zero bytes.
     /// - The file body reader or the underlying writer returns an error. The
     ///   method returns that error.
@@ -4184,6 +4202,12 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     /// In that case, the next call closes the underlying writer again. If you
     /// drop the future before it completes, the next call continues. It does
     /// not write the zero blocks again.
+    ///
+    /// When the file body of the accepted entry ends before
+    /// [`TarRegularFile::size`] bytes, the method fills the rest of the entry
+    /// with zero bytes and returns [`ErrorKind::UnexpectedEof`]. That call
+    /// does not write the zero blocks and does not close the underlying
+    /// writer. Call the method again to finish the archive.
     pub async fn finish(&mut self) -> std::io::Result<()> {
         poll_fn(|cx| {
             // SAFETY: the mutable borrow of `self` is held for the duration of
@@ -4197,7 +4221,9 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
     ///
     /// The method alternates between flushing buffered headers, consuming the
     /// reader for the active file, and emitting zero padding so the next entry
-    /// always starts on a block boundary.
+    /// always starts on a block boundary. When the reader ends before the
+    /// entry size, the zero bytes also fill the rest of the body, and the
+    /// method then returns `UnexpectedEof` one time.
     fn poll_drain(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
         loop {
@@ -4221,40 +4247,41 @@ impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncBufRead + Unpin + 'b> TarWriter<'a, 'b,
 
             if let Some(reader) = this.reader.as_mut() {
                 let remain = this.eof.saturating_sub(*this.total);
-                if remain == 0 {
-                    *this.reader = None;
-                    let padded = padded_size(*this.eof);
-                    let padding = padded.saturating_sub(*this.eof);
-                    if padding > 0 {
-                        *this.len = padding as usize;
-                        this.buf[..*this.len].fill(0);
-                        *this.eof = padded;
+                if remain > 0 {
+                    let data = task::ready!(Pin::new(&mut *reader).poll_fill_buf(cx))?;
+                    if !data.is_empty() {
+                        let len = std::cmp::min(data.len() as u64, remain) as usize;
+                        let n = task::ready!(this.writer.as_mut().poll_write(cx, &data[..len]))?;
+                        if n == 0 {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "error writing buffer",
+                            )));
+                        }
+                        Pin::new(reader).consume(n);
+                        *this.total += n as u64;
                         continue;
-                    } else {
-                        return Poll::Ready(Ok(()));
                     }
+                    *this.short = true;
                 }
-                let data = task::ready!(Pin::new(&mut *reader).poll_fill_buf(cx))?;
-                if data.is_empty() {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "unexpected EOF while reading file",
-                    )));
-                }
-                let len = std::cmp::min(data.len() as u64, remain) as usize;
-                let n = task::ready!(this.writer.as_mut().poll_write(cx, &data[..len]))?;
-                if n == 0 {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "error writing buffer",
-                    )));
-                }
-                Pin::new(reader).consume(n);
-                *this.total += n as u64;
-                continue;
-            } else {
-                return Poll::Ready(Ok(()));
+                *this.reader = None;
             }
+
+            // zero bytes to the end of the entry: the missing body bytes and
+            // the block padding
+            let zeros = padded_size(*this.eof).saturating_sub(*this.total);
+            if zeros > 0 {
+                *this.len = std::cmp::min(zeros, this.buf.len() as u64) as usize;
+                this.buf[..*this.len].fill(0);
+                continue;
+            }
+            if std::mem::take(this.short) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading file",
+                )));
+            }
+            return Poll::Ready(Ok(()));
         }
     }
 }
@@ -4545,33 +4572,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_numeric_accepts_octal_and_base256() {
-        assert_eq!(parse_numeric(b"0000644\0"), Ok(0o644));
-        assert_eq!(parse_numeric(b"77777777777\0"), Ok(0o77777777777));
-        assert_eq!(
-            parse_numeric(&[0x80, 0, 0, 0, 0, 0, 0, 0x03, 0x00, 0x26, 0x07, 0x5a]),
-            Ok(0x03_0026_075a)
-        );
-        assert_eq!(parse_numeric(&[0x80, 0, 0, 0, 0, 0, 0x10, 0x00]), Ok(4096));
-        assert_eq!(parse_numeric(&[0xbf, 0, 0, 0, 0, 0, 0, 0]), Ok(0x3f << 56));
-        assert_eq!(
-            parse_numeric(&[0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
-            Ok(u64::MAX)
-        );
-    }
-
-    #[test]
-    fn parse_numeric_skips_leading_spaces() {
-        assert_eq!(parse_numeric(b"    0002000\0"), Ok(0o2000));
-        assert_eq!(parse_numeric(b"  644 \0"), Ok(0o644));
-        assert_eq!(parse_numeric(b"  64 4\0"), Ok(0o64));
-        assert_eq!(parse_numeric(b"        "), Ok(0));
-        assert_eq!(parse_numeric(b"   \0\0\0\0"), Ok(0));
-        assert_eq!(parse_numeric(b"\0\0\0\0"), Ok(0));
-        assert_eq!(parse_numeric(b"  8\0"), Err(&b"  8\0"[..]));
-    }
-
-    #[test]
     fn write_header_omits_long_owner_names_of_hard_link() {
         let uname = "u".repeat(40);
         let gname = "g".repeat(40);
@@ -4612,6 +4612,33 @@ mod tests {
             assert_eq!(header.uname().unwrap(), None);
             assert_eq!(header.gname().unwrap(), None);
         }
+    }
+
+    #[test]
+    fn parse_numeric_accepts_octal_and_base256() {
+        assert_eq!(parse_numeric(b"0000644\0"), Ok(0o644));
+        assert_eq!(parse_numeric(b"77777777777\0"), Ok(0o77777777777));
+        assert_eq!(
+            parse_numeric(&[0x80, 0, 0, 0, 0, 0, 0, 0x03, 0x00, 0x26, 0x07, 0x5a]),
+            Ok(0x03_0026_075a)
+        );
+        assert_eq!(parse_numeric(&[0x80, 0, 0, 0, 0, 0, 0x10, 0x00]), Ok(4096));
+        assert_eq!(parse_numeric(&[0xbf, 0, 0, 0, 0, 0, 0, 0]), Ok(0x3f << 56));
+        assert_eq!(
+            parse_numeric(&[0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            Ok(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn parse_numeric_skips_leading_spaces() {
+        assert_eq!(parse_numeric(b"    0002000\0"), Ok(0o2000));
+        assert_eq!(parse_numeric(b"  644 \0"), Ok(0o644));
+        assert_eq!(parse_numeric(b"  64 4\0"), Ok(0o64));
+        assert_eq!(parse_numeric(b"        "), Ok(0));
+        assert_eq!(parse_numeric(b"   \0\0\0\0"), Ok(0));
+        assert_eq!(parse_numeric(b"\0\0\0\0"), Ok(0));
+        assert_eq!(parse_numeric(b"  8\0"), Err(&b"  8\0"[..]));
     }
 
     #[test]

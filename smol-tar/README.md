@@ -74,9 +74,14 @@ you enable both features, the crate uses the `tokio` traits.
 4. `TarWriter` writes the header, each part of the body, and the padding of
    each entry as separate writes. To decrease the number of writes to a file
    or a socket, wrap it in a `BufWriter`.
-5. Give `TarRegularFile::new` the exact size of the body. If the body is
-   shorter, the write fails with `ErrorKind::UnexpectedEof`. If the body is
-   longer, the writer does not read the remaining bytes.
+5. Give `TarRegularFile::new` the exact size of the body. The writer always
+   writes `size` bytes of body for the entry. If the body is shorter, the
+   writer fills the rest of the entry with zero bytes and returns
+   `ErrorKind::UnexpectedEof` one time. The archive stays valid, and you can
+   write more entries or finish the archive. If `TarWriter::finish` returns
+   this error, it does not write the end of the archive. Call
+   `TarWriter::finish` again. If the body is longer, the writer ignores the
+   rest.
 6. `TarWriter::write` and `SinkExt::send` are not cancel safe. If the call
    fails or you drop its future, the entry can be in the archive or not. If
    you write the entry again, the archive can contain it two times. To know
