@@ -97,6 +97,14 @@ TarWriter_CommitAmbiguity
   (`lib.rs:4130-4147`). After `start_send` accepts the entry, `poll_flush` can
   fail or the caller can drop the future. The caller cannot find out whether
   the entry was accepted. If the caller tries the entry again, the archive
-  contains the entry two times. The `write()` documentation describes this
-  behavior. A caller that must know the commit point calls `poll_ready` and
-  `start_send`, or `SinkExt::feed`, and gets the result of `start_send`.
+  contains the entry two times. If the caller skips the entry, the archive
+  can lose it.
+
+  This is known behavior, and the crate keeps it, because a cancel-safe
+  `write()` has a performance cost. The "Cancel safety" section of the
+  `write()` documentation and item 6 of "Usage rules" in the crate README
+  (`../README.md`) describe it. A caller that must know the commit point
+  uses the procedure in the crate README. The caller calls `poll_ready` and
+  then `start_send`, or `SinkExt::feed`. An `Ok` from `start_send` means that
+  the writer accepted the entry. The caller then calls `TarWriter::flush`
+  after each accepted entry.
